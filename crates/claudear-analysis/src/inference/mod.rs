@@ -1080,8 +1080,28 @@ impl RepoInferrer {
             }
         }
 
-        // LLM classifier signal
-        if let Some(ref classifier) = self.classifier {
+        // Check if heuristics alone give a high-confidence result.
+        // If so, skip LLM classification entirely (saves significant time on CPU).
+        let best_heuristic_score = candidates
+            .values()
+            .filter(|c| excluded_repos.is_empty() || !excluded_repos.contains(&c.repo.name))
+            .map(|c| c.total_score)
+            .fold(f32::NEG_INFINITY, f32::max);
+
+        if best_heuristic_score >= THRESHOLD_HIGH {
+            tracing::debug!(
+                issue_id = %issue.short_id,
+                best_heuristic_score = best_heuristic_score,
+                "Heuristic confidence high, skipping LLM classification"
+            );
+        } else if let Some(ref classifier) = self.classifier {
+            // LLM classifier signal — only invoked when heuristics are not high-confidence
+            tracing::debug!(
+                issue_id = %issue.short_id,
+                best_heuristic_score = best_heuristic_score,
+                "Heuristic confidence below threshold, invoking LLM classifier"
+            );
+
             let metadata: HashMap<String, String> = issue
                 .metadata
                 .iter()
@@ -1109,30 +1129,41 @@ impl RepoInferrer {
                 };
 
                 let start = Instant::now();
-                if let Some((repo_name, confidence)) = classifier.classify(&request) {
-                    let elapsed = start.elapsed();
-                    tracing::debug!(
-                        repo = %repo_name,
-                        confidence = %confidence,
-                        elapsed_ms = elapsed.as_millis(),
-                        "LLM classifier result"
-                    );
-                    if let Some(repo) = index.get(&repo_name) {
-                        let score = WEIGHT_LLM_CLASSIFIER * confidence;
-                        let entry =
-                            candidates
-                                .entry(repo.name.clone())
-                                .or_insert_with(|| RepoCandidate {
-                                    repo: repo.clone(),
-                                    signals: Vec::new(),
-                                    total_score: 0.0,
-                                });
-                        entry.signals.push(ScoredSignal {
-                            weight: score,
-                            reason: format!("LLM classification: {:.0}%", confidence * 100.0),
-                            matched_file: None,
-                        });
-                        entry.total_score += score;
+                match classifier.classify(&request) {
+                    Some((repo_name, confidence)) => {
+                        let elapsed = start.elapsed();
+                        tracing::debug!(
+                            repo = %repo_name,
+                            confidence = %confidence,
+                            elapsed_ms = elapsed.as_millis(),
+                            "LLM classifier result"
+                        );
+                        if let Some(repo) = index.get(&repo_name) {
+                            let score = WEIGHT_LLM_CLASSIFIER * confidence;
+                            let entry =
+                                candidates
+                                    .entry(repo.name.clone())
+                                    .or_insert_with(|| RepoCandidate {
+                                        repo: repo.clone(),
+                                        signals: Vec::new(),
+                                        total_score: 0.0,
+                                    });
+                            entry.signals.push(ScoredSignal {
+                                weight: score,
+                                reason: format!(
+                                    "LLM classification: {:.0}%",
+                                    confidence * 100.0
+                                ),
+                                matched_file: None,
+                            });
+                            entry.total_score += score;
+                        }
+                    }
+                    None => {
+                        tracing::debug!(
+                            issue_id = %issue.short_id,
+                            "LLM classifier returned no result, using heuristics only"
+                        );
                     }
                 }
             }
