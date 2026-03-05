@@ -666,7 +666,7 @@ fn build_issue_embedding_service(
 struct WatcherDeps {
     sources: Vec<Arc<dyn IssueSource>>,
     scm_provider: Option<Arc<dyn ScmProvider>>,
-    github_client: Option<GitHubClient>,
+    github_client: Option<Arc<GitHubClient>>,
     relationships: Option<RepoRelationships>,
     inferrer: Option<claudear::inference::RepoInferrer>,
     embedding_client: Option<Arc<EmbeddingClient>>,
@@ -732,7 +732,7 @@ async fn build_watcher_deps(
 
     // GitHub client for PR merge checking
     let github_client_for_watcher = if config.is_github_enabled() {
-        Some(GitHubClient::new(config.github().clone()))
+        Some(Arc::new(GitHubClient::new(config.github().clone())))
     } else {
         None
     };
@@ -3826,7 +3826,7 @@ async fn async_main() -> anyhow::Result<()> {
                 code_search_service,
                 relationships: None,
                 github_client: if config.is_github_enabled() {
-                    Some(GitHubClient::new(config.github().clone()))
+                    Some(Arc::new(GitHubClient::new(config.github().clone())))
                 } else {
                     None
                 },

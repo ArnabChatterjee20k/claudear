@@ -111,6 +111,17 @@ async fn run_inner(ctx: &ScenarioContext<'_>, cleanup: &mut CleanupTracker) -> R
         _ => {}
     }
 
+    // Configure notifiers based on available env vars
+    if let Ok(webhook_url) = std::env::var("CLAUDEAR_E2E_DISCORD_WEBHOOK_URL") {
+        builder = builder.discord_notifier(&webhook_url);
+    }
+    if let (Ok(bot_token), Ok(channel_id)) = (
+        std::env::var("CLAUDEAR_E2E_SLACK_BOT_TOKEN"),
+        std::env::var("CLAUDEAR_E2E_SLACK_CHANNEL_ID"),
+    ) {
+        builder = builder.slack_notifier(&bot_token, &channel_id);
+    }
+
     let config_path = builder.write_to(tmp_dir.path(), "s3")?;
 
     let mut handle = if ctx.use_docker {

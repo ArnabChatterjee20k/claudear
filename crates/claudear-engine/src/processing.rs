@@ -1063,7 +1063,7 @@ impl IssueProcessor {
             if let Some(ref pr_url) = effective_pr_url {
                 tracing::info!(short_id = %issue.short_id, pr_url = %pr_url, "Success! PR created");
                 self.tracker.mark_success(source_name, &issue.id, pr_url)?;
-                if existing_pr_branch.is_some() {
+                if existing_pr_branch.is_some() || review_feedback.is_some() {
                     issue.set_metadata("is_pr_update", true);
                 }
                 if let Some(ref changelog) = claude_result.changelog {

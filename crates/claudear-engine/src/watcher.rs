@@ -153,7 +153,7 @@ pub struct WatcherOptions {
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub code_search_service: Option<Arc<claudear_analysis::repo::code_index::CodeSearchService>>,
     pub relationships: Option<RepoRelationships>,
-    pub github_client: Option<GitHubClient>,
+    pub github_client: Option<Arc<GitHubClient>>,
     /// Generic SCM provider for PR status checking (GitLab, etc.).
     /// When set, this is used for merge detection instead of github_client.
     pub scm_provider: Option<Arc<dyn ScmProvider>>,
@@ -176,7 +176,7 @@ pub struct Watcher {
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<claudear_analysis::repo::code_index::CodeSearchService>>,
     relationships: Option<RepoRelationships>,
-    github_client: Option<GitHubClient>,
+    github_client: Option<Arc<GitHubClient>>,
     scm_provider: Option<Arc<dyn ScmProvider>>,
     user_registry: UserRegistry,
     agent: Arc<dyn AgentRunner>,
@@ -3351,7 +3351,7 @@ Create a PR with your changes.{custom_instructions}"#,
             )),
             review_watcher: self.review_watcher.clone(),
             user_registry: self.user_registry.clone(),
-            github_client: None,
+            github_client: self.github_client.clone(),
             llm_analyzer: self.llm_analyzer.clone(),
         };
 
