@@ -4127,4 +4127,108 @@ mod tests {
         assert!(profile.contains("src"));
         assert!(profile.contains("Sample files:"));
     }
+
+    // --- Stacktrace-based inference tests ---
+
+    fn create_index_with_vendor_repos() -> RepoIndex {
+        let mut index = RepoIndex::new();
+
+        let mut repo1 = IndexedRepo::new("utopia-php/database", "/path/utopia-database");
+        repo1.files = vec![
+            "src/Database.php".to_string(),
+            "src/Database/Adapter/SQL.php".to_string(),
+        ];
+        index.add_repo(repo1);
+
+        let mut repo2 = IndexedRepo::new("utopia-php/dsn", "/path/utopia-dsn");
+        repo2.files = vec!["src/DSN.php".to_string()];
+        index.add_repo(repo2);
+
+        let mut repo3 = IndexedRepo::new("appwrite/cloud", "/path/appwrite-cloud");
+        repo3.files = vec![
+            "src/Controller.php".to_string(),
+            "src/Services/Database.php".to_string(),
+        ];
+        index.add_repo(repo3);
+
+        index
+    }
+
+    #[test]
+    fn test_infer_from_stacktrace_vendor_package() {
+        let index = create_index_with_vendor_repos();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "getDocument(null)", "");
+        issue.metadata.insert(
+            "stacktrace".to_string(),
+            json!("  /vendor/utopia-php/database/src/Database.php(123): getDocument()\n  at getDocument (/vendor/utopia-php/database/src/Database.php:123:0)"),
+        );
+
+        let result = inferrer.infer(&issue);
+
+        assert!(result.is_some(), "Should infer repo from stacktrace");
+        let inferred = result.unwrap();
+        assert_eq!(
+            inferred.repo.name, "utopia-php/database",
+            "Should match utopia-php/database, not utopia-php/dsn"
+        );
+    }
+
+    #[test]
+    fn test_infer_from_stacktrace_multiple_vendor_packages() {
+        let index = create_index_with_vendor_repos();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue = create_test_issue("sentry", "Connection error", "");
+        // More frames from database than dsn
+        issue.metadata.insert(
+            "stacktrace".to_string(),
+            json!(concat!(
+                "  /vendor/utopia-php/database/src/Database.php(123): getDocument()\n",
+                "  at getDocument (/vendor/utopia-php/database/src/Database.php:123:0)\n",
+                "  /vendor/utopia-php/database/src/Database/Adapter/SQL.php(45): query()\n",
+                "  at query (/vendor/utopia-php/database/src/Database/Adapter/SQL.php:45:0)\n",
+                "  /vendor/utopia-php/dsn/src/DSN.php(10): parse()\n",
+                "  at parse (/vendor/utopia-php/dsn/src/DSN.php:10:0)"
+            )),
+        );
+
+        let result = inferrer.infer(&issue);
+
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        assert_eq!(
+            inferred.repo.name, "utopia-php/database",
+            "Repo with more stacktrace frames should win"
+        );
+    }
+
+    #[test]
+    fn test_infer_stacktrace_plus_fqcn_combined_signal() {
+        let index = create_index_with_vendor_repos();
+        let inferrer = RepoInferrer::new(index);
+
+        let mut issue =
+            create_test_issue("sentry", r"Utopia\Database\Database::getDocument(null)", "");
+        issue.metadata.insert(
+            "stacktrace".to_string(),
+            json!("  /vendor/utopia-php/database/src/Database.php(123): getDocument()\n  at getDocument (/vendor/utopia-php/database/src/Database.php:123:0)"),
+        );
+
+        let result = inferrer.infer(&issue);
+
+        assert!(result.is_some());
+        let inferred = result.unwrap();
+        assert_eq!(
+            inferred.repo.name, "utopia-php/database",
+            "Combined FQCN + stacktrace signals should resolve correctly"
+        );
+        // Combined signals should give high confidence
+        assert!(
+            inferred.confidence == Confidence::High || inferred.confidence == Confidence::Medium,
+            "Combined signals should give at least Medium confidence, got {:?}",
+            inferred.confidence
+        );
+    }
 }

@@ -477,9 +477,18 @@ fn extract_from_text(context: &mut IssueContext, text: &str) {
                             .push(format!("{}.php", path_segments.join("/")));
                     }
 
-                    // Convert first namespace segment to lowercase for repo matching
-                    // e.g., Utopia -> "utopia" as keyword for repo search
+                    // Generate repo refs from FQCN segments (strong signal, weight=30)
+                    // e.g., Utopia\Database\Database -> "utopia/database" and "utopia-php/database"
                     let first_lower = segments[0].to_lowercase();
+                    let second_lower = segments[1].to_lowercase();
+                    context
+                        .repos
+                        .push(format!("{}/{}", first_lower, second_lower));
+                    context
+                        .repos
+                        .push(format!("{}-php/{}", first_lower, second_lower));
+
+                    // Keep keyword as fallback signal
                     context.keywords.push(format!("repo:{}", first_lower));
                 }
             }
@@ -2567,6 +2576,77 @@ mod tests {
                 .any(|f| f == "Database/Adapter/MariaDB.php"),
             "Should produce partial namespace path, got: {:?}",
             context.filenames
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_generates_repo_refs() {
+        let issue = create_test_issue("sentry", r"Utopia\Database\Database::getDocument(null)", "");
+
+        let context = IssueContext::from_sentry(&issue);
+
+        assert!(
+            context.repos.iter().any(|r| r == "utopia/database"),
+            "Should generate vendor/package repo ref, got repos: {:?}",
+            context.repos
+        );
+        assert!(
+            context.repos.iter().any(|r| r == "utopia-php/database"),
+            "Should generate vendor-php/package repo ref, got repos: {:?}",
+            context.repos
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_two_segment_namespace() {
+        let issue = create_test_issue("sentry", r"Utopia\Request::getHeader() failed", "");
+
+        let context = IssueContext::from_sentry(&issue);
+
+        assert!(
+            context.repos.iter().any(|r| r == "utopia/request"),
+            "Two-segment FQCN should generate repo ref, got repos: {:?}",
+            context.repos
+        );
+        assert!(
+            context.repos.iter().any(|r| r == "utopia-php/request"),
+            "Two-segment FQCN should generate -php repo ref, got repos: {:?}",
+            context.repos
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_deep_namespace_generates_repo_refs() {
+        let issue = create_test_issue(
+            "sentry",
+            r"Appwrite\Utopia\Http\Response::setStatusCode() failed",
+            "",
+        );
+
+        let context = IssueContext::from_sentry(&issue);
+
+        assert!(
+            context.repos.iter().any(|r| r == "appwrite/utopia"),
+            "Deep FQCN should use first two segments, got repos: {:?}",
+            context.repos
+        );
+        assert!(
+            context.repos.iter().any(|r| r == "appwrite-php/utopia"),
+            "Deep FQCN should generate -php variant, got repos: {:?}",
+            context.repos
+        );
+    }
+
+    #[test]
+    fn test_php_fqcn_still_generates_keyword() {
+        let issue = create_test_issue("sentry", r"Utopia\Database\Database::getDocument(null)", "");
+
+        let context = IssueContext::from_sentry(&issue);
+
+        assert!(
+            context.keywords.iter().any(|k| k == "repo:utopia"),
+            "Should still generate keyword as fallback, got keywords: {:?}",
+            context.keywords
         );
     }
 }

@@ -6,6 +6,7 @@ use claudear_config::config::SentryConfig;
 use claudear_core::error::{Error, Result};
 use claudear_core::http::HttpResponse;
 use claudear_core::types::{Issue, IssuePriority, IssueStatus, MatchPriority, MatchResult};
+use futures::future::join_all;
 use serde::Deserialize;
 use std::collections::HashSet;
 
@@ -382,6 +383,67 @@ fn format_sentry_context(issue: &Issue) -> String {
     context
 }
 
+/// Extract stacktrace frames from a Sentry event for storage in issue metadata.
+///
+/// Produces both Node.js-style and PHP-style frame formats depending on the filename.
+/// Unlike `format_sentry_event_context`, this takes ALL frames (no limit).
+fn extract_stacktrace_for_metadata(event: &SentryEvent) -> String {
+    let mut output = String::new();
+
+    let entries = match event.entries {
+        Some(ref entries) => entries,
+        None => return output,
+    };
+
+    let exception_entry = match entries.iter().find(|e| e.entry_type == "exception") {
+        Some(entry) => entry,
+        None => return output,
+    };
+
+    let values = match exception_entry
+        .data
+        .get("values")
+        .and_then(|v| v.as_array())
+    {
+        Some(arr) => arr,
+        None => return output,
+    };
+
+    for exc in values {
+        let stacktrace = match exc.get("stacktrace") {
+            Some(st) => st,
+            None => continue,
+        };
+        let frames = match stacktrace.get("frames").and_then(|f| f.as_array()) {
+            Some(arr) => arr,
+            None => continue,
+        };
+
+        for frame in frames.iter().rev() {
+            let func = frame
+                .get("function")
+                .and_then(|v| v.as_str())
+                .unwrap_or("<anonymous>");
+            let file = frame
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let line = frame.get("lineNo").and_then(|v| v.as_i64()).unwrap_or(0);
+            let col = frame.get("colNo").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            // Node.js style
+            output.push_str(&format!("  at {} ({}:{}:{})\n", func, file, line, col));
+
+            // PHP style when filename ends in .php
+            if file.ends_with(".php") {
+                output.push_str(&format!("  {}({}): {}()\n", file, line, func));
+            }
+        }
+    }
+
+    output
+}
+
 /// Format event data (stack traces + tags) from a Sentry event into a context string.
 /// This is a pure function extracted from the async trait method for testability.
 fn format_sentry_event_context(event: &SentryEvent) -> String {
@@ -511,6 +573,29 @@ impl<H: SentryHttpClient + 'static> IssueSource for SentrySource<H> {
             if !seen.contains(&issue.id) {
                 seen.insert(issue.id.clone());
                 all_issues.push(self.map_issue(issue));
+            }
+        }
+
+        // Enrich issues with stacktrace data from latest events
+        let fetch_futs = all_issues.iter().map(|i| self.fetch_latest_event(&i.id));
+        let events: Vec<Result<SentryEvent>> = join_all(fetch_futs).await;
+
+        for (issue, event_result) in all_issues.iter_mut().zip(events) {
+            match event_result {
+                Ok(event) => {
+                    let stacktrace = extract_stacktrace_for_metadata(&event);
+                    if !stacktrace.is_empty() {
+                        issue.set_metadata("stacktrace", &stacktrace);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        source = "sentry",
+                        issue_id = %issue.id,
+                        error = %e,
+                        "Failed to fetch latest event for stacktrace enrichment"
+                    );
+                }
             }
         }
 
@@ -4427,5 +4512,253 @@ mod tests {
         assert_eq!(issues[0].id, "dup-1");
         // The issue should be marked as escalating
         assert_eq!(issues[0].get_metadata::<bool>("is_escalating"), Some(true));
+    }
+
+    #[test]
+    fn test_extract_stacktrace_for_metadata_format() {
+        let event: SentryEvent = serde_json::from_str(r#"{
+            "entries": [{
+                "type": "exception",
+                "data": {
+                    "values": [{
+                        "type": "TypeError",
+                        "value": "null",
+                        "stacktrace": {
+                            "frames": [
+                                {"function": "getDocument", "filename": "/vendor/utopia-php/database/src/Database.php", "lineNo": 123, "colNo": 0},
+                                {"function": "handleRequest", "filename": "/app/src/Controller.php", "lineNo": 45, "colNo": 0},
+                                {"function": "main", "filename": "app.js", "lineNo": 10, "colNo": 5}
+                            ]
+                        }
+                    }]
+                }
+            }]
+        }"#).unwrap();
+
+        let result = extract_stacktrace_for_metadata(&event);
+
+        // Frames should be reversed (most recent first)
+        // Node.js style for all frames
+        assert!(result.contains("at main (app.js:10:5)"));
+        assert!(result.contains("at handleRequest (/app/src/Controller.php:45:0)"));
+        assert!(
+            result.contains("at getDocument (/vendor/utopia-php/database/src/Database.php:123:0)")
+        );
+
+        // PHP style only for .php files
+        assert!(result.contains("/app/src/Controller.php(45): handleRequest()"));
+        assert!(result.contains("/vendor/utopia-php/database/src/Database.php(123): getDocument()"));
+        // Should NOT have PHP style for .js file
+        assert!(!result.contains("app.js(10): main()"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_stores_stacktrace_in_metadata() {
+        let mock = MockSentryClient::new();
+        // Mock escalating issues (empty)
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved%20is%3Aescalating&sort=date&limit=100",
+            200,
+            "[]",
+        );
+        // Mock top issues with one issue
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            200,
+            r#"[{
+                "id": "st-1",
+                "shortId": "SENTRY-ST1",
+                "title": "getDocument(null)",
+                "permalink": "https://sentry.io/issue/st-1",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "100",
+                "project": {"id": "1", "name": "Test", "slug": "test"},
+                "status": "unresolved",
+                "level": "error"
+            }]"#,
+        );
+        // Mock the latest event for this issue
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/st-1/events/latest/",
+            200,
+            r#"{
+                "entries": [{
+                    "type": "exception",
+                    "data": {
+                        "values": [{
+                            "type": "TypeError",
+                            "value": "null",
+                            "stacktrace": {
+                                "frames": [
+                                    {"function": "getDocument", "filename": "/vendor/utopia-php/database/src/Database.php", "lineNo": 42}
+                                ]
+                            }
+                        }]
+                    }
+                }]
+            }"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+
+        assert_eq!(issues.len(), 1);
+        let stacktrace: Option<String> = issues[0].get_metadata("stacktrace");
+        assert!(stacktrace.is_some(), "stacktrace metadata should be set");
+        let st = stacktrace.unwrap();
+        assert!(
+            st.contains("getDocument"),
+            "stacktrace should contain function name"
+        );
+        assert!(
+            st.contains("Database.php"),
+            "stacktrace should contain filename"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_stacktrace_empty_when_no_exception() {
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved%20is%3Aescalating&sort=date&limit=100",
+            200,
+            "[]",
+        );
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            200,
+            r#"[{
+                "id": "st-2",
+                "shortId": "SENTRY-ST2",
+                "title": "Warning",
+                "permalink": "https://sentry.io/issue/st-2",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "50",
+                "project": {"id": "1", "name": "Test", "slug": "test"},
+                "status": "unresolved",
+                "level": "warning"
+            }]"#,
+        );
+        // Event with no exception entry
+        mock.mock_get(
+            "https://sentry.io/api/0/issues/st-2/events/latest/",
+            200,
+            r#"{"tags": [{"key": "env", "value": "prod"}]}"#,
+        );
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+
+        assert_eq!(issues.len(), 1);
+        let stacktrace: Option<String> = issues[0].get_metadata("stacktrace");
+        assert!(
+            stacktrace.is_none(),
+            "stacktrace should be absent when no exception"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_issues_stacktrace_event_fetch_failure_still_returns_issues() {
+        let mock = MockSentryClient::new();
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved%20is%3Aescalating&sort=date&limit=100",
+            200,
+            "[]",
+        );
+        mock.mock_get(
+            "https://sentry.io/api/0/organizations/test-org/issues/?query=is%3Aunresolved&sort=freq&limit=100&statsPeriod=24h",
+            200,
+            r#"[{
+                "id": "st-3",
+                "shortId": "SENTRY-ST3",
+                "title": "Error",
+                "permalink": "https://sentry.io/issue/st-3",
+                "firstSeen": "2024-01-01T00:00:00Z",
+                "lastSeen": "2024-01-02T00:00:00Z",
+                "count": "200",
+                "project": {"id": "1", "name": "Test", "slug": "test"},
+                "status": "unresolved",
+                "level": "error"
+            }]"#,
+        );
+        // No mock for the event endpoint -> will get 404 default
+
+        let config = test_config();
+        let source = SentrySource::with_http_client(config, mock);
+        let issues = source.fetch_issues().await.unwrap();
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].short_id, "SENTRY-ST3");
+        // stacktrace should be absent since event fetch failed
+        let stacktrace: Option<String> = issues[0].get_metadata("stacktrace");
+        assert!(stacktrace.is_none());
+    }
+
+    #[test]
+    fn test_extract_stacktrace_for_metadata_missing_fields() {
+        let event: SentryEvent = serde_json::from_str(
+            r#"{
+            "entries": [{
+                "type": "exception",
+                "data": {
+                    "values": [{
+                        "type": "Error",
+                        "value": "test",
+                        "stacktrace": {
+                            "frames": [
+                                {},
+                                {"function": "doThing"}
+                            ]
+                        }
+                    }]
+                }
+            }]
+        }"#,
+        )
+        .unwrap();
+
+        let result = extract_stacktrace_for_metadata(&event);
+
+        // Frame with no fields should use defaults
+        assert!(result.contains("at <anonymous> (?:0:0)"));
+        // Frame with only function should have default file
+        assert!(result.contains("at doThing (?:0:0)"));
+    }
+
+    #[test]
+    fn test_extract_stacktrace_for_metadata_multiple_exceptions() {
+        let event: SentryEvent = serde_json::from_str(r#"{
+            "entries": [{
+                "type": "exception",
+                "data": {
+                    "values": [
+                        {
+                            "type": "CauseError",
+                            "stacktrace": {
+                                "frames": [{"function": "innerFunc", "filename": "inner.php", "lineNo": 10}]
+                            }
+                        },
+                        {
+                            "type": "OuterError",
+                            "stacktrace": {
+                                "frames": [{"function": "outerFunc", "filename": "outer.php", "lineNo": 20}]
+                            }
+                        }
+                    ]
+                }
+            }]
+        }"#).unwrap();
+
+        let result = extract_stacktrace_for_metadata(&event);
+
+        // Both exceptions' frames should be included
+        assert!(result.contains("innerFunc"));
+        assert!(result.contains("outerFunc"));
+        assert!(result.contains("inner.php"));
+        assert!(result.contains("outer.php"));
     }
 }
