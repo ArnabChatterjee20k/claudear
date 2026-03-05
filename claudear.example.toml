@@ -103,6 +103,11 @@ skip_permissions = true
 # CLI binary name/path (default: auto-detected, e.g., "claude", "codex")
 binary = "claude"
 
+# Extra environment variables for the agent process.
+# Useful when the daemon runs as a service and the CLI needs PATH or other vars.
+# [agent.providers.claude.env]
+# PATH = "/home/user/.local/bin:/home/user/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin"
+
 # API key for API-based providers (alternative to CLI-based execution)
 api_key = ""
 

@@ -146,6 +146,10 @@ pub struct ProviderConfig {
     pub api_url: Option<String>,
     /// Sandbox mode (e.g., "network-off" for Codex).
     pub sandbox: Option<String>,
+    /// Extra environment variables to set when spawning the agent process.
+    /// Useful when the agent binary needs PATH or other vars not in the daemon env.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
     /// Provider-specific extra configuration.
     #[serde(default)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,

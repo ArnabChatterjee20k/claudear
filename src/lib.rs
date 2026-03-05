@@ -210,6 +210,11 @@ pub async fn build_app(
                     .default_provider_config()
                     .and_then(|p| p.binary.clone())
                     .unwrap_or_else(|| "claude".to_string()),
+                env: config
+                    .agent
+                    .default_provider_config()
+                    .map(|p| p.env.clone())
+                    .unwrap_or_default(),
             },
             tracker.clone(),
         )));

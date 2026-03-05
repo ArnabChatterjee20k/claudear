@@ -870,6 +870,13 @@ permissions = ["Bash(git *)", "Read", "Edit"]
 
 # Skip all permission prompts (default: true)
 skip_permissions = true
+
+# CLI binary path (set when daemon can't find it via PATH)
+# binary = "/home/user/.local/bin/claude"
+
+# Extra env vars for the agent process (useful for systemd services)
+# [agent.providers.claude.env]
+# PATH = "/home/user/.local/bin:/home/user/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin"
 ```
 
 ### A/B Experiments

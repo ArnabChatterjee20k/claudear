@@ -152,6 +152,8 @@
             <li><code>instructions_file</code>: path to a file with additional instructions. If both <code>instructions</code> and <code>instructions_file</code> are set, the file content comes first.</li>
             <li><code>permissions</code>: tool permissions granted without prompting (e.g. <code>["Bash(git *)", "Read", "Edit"]</code>).</li>
             <li><code>skip_permissions</code>: skip all interactive permission prompts (default: <code>true</code>).</li>
+            <li><code>binary</code>: CLI binary name or absolute path (default: <code>"claude"</code>). Set the full path when the daemon cannot find the binary via PATH.</li>
+            <li><code>env</code>: extra environment variables for the agent process. Useful when running as a systemd service where PATH is limited (e.g. <code>env = { PATH = "/home/user/.local/bin:..." }</code>).</li>
             </ul>
           </div>
         </details>

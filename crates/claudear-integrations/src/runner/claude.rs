@@ -228,6 +228,8 @@ pub struct ClaudeRunnerConfig {
     pub skip_permissions: bool,
     /// CLI binary name or absolute path (default: "claude").
     pub binary: String,
+    /// Extra environment variables to set when spawning the agent process.
+    pub env: HashMap<String, String>,
 }
 
 impl Default for ClaudeRunnerConfig {
@@ -239,6 +241,7 @@ impl Default for ClaudeRunnerConfig {
             permissions: Vec::new(),
             skip_permissions: false,
             binary: "claude".to_string(),
+            env: HashMap::new(),
         }
     }
 }
@@ -257,9 +260,13 @@ impl ClaudeAgentRunner {
     /// Create a new Claude runner.
     pub fn new(config: ClaudeRunnerConfig, tracker: Arc<dyn FixAttemptTracker>) -> Self {
         let template_renderer = TemplateRenderer::new();
-        let base_env: HashMap<String, String> = std::env::vars()
+        let mut base_env: HashMap<String, String> = std::env::vars()
             .filter(|(k, _)| k != "CLAUDECODE")
             .collect();
+        // Merge config-level env vars (overrides process env).
+        for (k, v) in &config.env {
+            base_env.insert(k.clone(), v.clone());
+        }
         Self {
             config,
             template_renderer,
