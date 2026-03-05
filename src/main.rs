@@ -787,6 +787,11 @@ async fn build_watcher_deps(
                 .default_provider_config()
                 .map(|p| p.skip_permissions)
                 .unwrap_or(false),
+            binary: config
+                .agent
+                .default_provider_config()
+                .and_then(|p| p.binary.clone())
+                .unwrap_or_else(|| "claude".to_string()),
         },
         tracker.clone(),
     )));
@@ -3434,6 +3439,11 @@ async fn async_main() -> anyhow::Result<()> {
                         .default_provider_config()
                         .map(|p| p.skip_permissions)
                         .unwrap_or(false),
+                    binary: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.binary.clone())
+                        .unwrap_or_else(|| "claude".to_string()),
                 },
                 tracker.clone(),
             )));
@@ -3755,6 +3765,11 @@ async fn async_main() -> anyhow::Result<()> {
                             .default_provider_config()
                             .map(|p| p.skip_permissions)
                             .unwrap_or(false),
+                        binary: config
+                            .agent
+                            .default_provider_config()
+                            .and_then(|p| p.binary.clone())
+                            .unwrap_or_else(|| "claude".to_string()),
                     },
                     tracker.clone(),
                 )));

@@ -205,6 +205,11 @@ pub async fn build_app(
                     .default_provider_config()
                     .map(|p| p.skip_permissions)
                     .unwrap_or(false),
+                binary: config
+                    .agent
+                    .default_provider_config()
+                    .and_then(|p| p.binary.clone())
+                    .unwrap_or_else(|| "claude".to_string()),
             },
             tracker.clone(),
         )));

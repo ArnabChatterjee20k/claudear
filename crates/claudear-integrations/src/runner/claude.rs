@@ -226,6 +226,8 @@ pub struct ClaudeRunnerConfig {
     pub permissions: Vec<String>,
     /// Skip all permission prompts (default: false).
     pub skip_permissions: bool,
+    /// CLI binary name or absolute path (default: "claude").
+    pub binary: String,
 }
 
 impl Default for ClaudeRunnerConfig {
@@ -236,6 +238,7 @@ impl Default for ClaudeRunnerConfig {
             instructions: None,
             permissions: Vec::new(),
             skip_permissions: false,
+            binary: "claude".to_string(),
         }
     }
 }
@@ -710,7 +713,7 @@ The PR title should include the issue ID: {}
         )
         .await;
 
-        let mut child = match Command::new("claude")
+        let mut child = match Command::new(&self.config.binary)
             .args(&args)
             .current_dir(project_dir)
             .envs(env)
@@ -730,7 +733,10 @@ The PR title should include the issue ID: {}
                     }),
                 )
                 .await;
-                return Err(Error::runner(format!("Failed to spawn claude: {}", e)));
+                return Err(Error::runner(format!(
+                    "Failed to spawn {}: {}",
+                    self.config.binary, e
+                )));
             }
         };
 
@@ -3764,6 +3770,7 @@ mod tests {
             instructions: Some("Be concise.".to_string()),
             permissions: vec!["Bash".to_string(), "Read".to_string(), "Write".to_string()],
             skip_permissions: true,
+            ..Default::default()
         };
         assert_eq!(config.timeout_secs, 300);
         assert_eq!(config.model.as_deref(), Some("claude-3-opus"));
@@ -3788,6 +3795,7 @@ mod tests {
             instructions: Some("test".to_string()),
             permissions: vec!["Bash".to_string()],
             skip_permissions: true,
+            ..Default::default()
         };
         let runner = ClaudeAgentRunner::new_simple(config);
         // Verify the runner works by calling methods that depend on proper initialization
@@ -4962,6 +4970,7 @@ mod tests {
             instructions: Some("Be concise".to_string()),
             permissions: vec!["Bash".to_string()],
             skip_permissions: true,
+            ..Default::default()
         };
         let debug = format!("{:?}", config);
         assert!(debug.contains("300"));
