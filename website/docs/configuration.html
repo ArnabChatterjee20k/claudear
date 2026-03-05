@@ -143,6 +143,7 @@
             <ul>
             <li><code>default_provider</code>: which provider to use (default: <code>"claude"</code>).</li>
             <li><code>timeout_secs</code>: maximum time an agent run can take before being stopped.</li>
+            <li><code>use_llm</code>: use the local LLM model as the agent runner instead of an external provider. Requires <code>[llm]</code> to be enabled. Fully offline but much slower and cannot create PRs (default: <code>false</code>).</li>
             </ul>
             <h3 id="claude-provider"><a class="anchor-link" href="#claude-provider" aria-label="Link to Claude provider settings">#</a>Claude provider settings (<code>[agent.providers.claude]</code>)</h3>
             <ul>
@@ -454,6 +455,23 @@
           </div>
         </details>
 
+        <details id="llm-config">
+          <summary>Local LLM (<code>[llm]</code>) <span class="summary-desc">offline repo classification and code chat</span></summary>
+          <div class="details-content">
+            <p>Optional local model for offline repo classification and code chat. Uses a GGUF model via llama-cpp-2.</p>
+            <ul>
+            <li><code>enabled</code>: enable the local LLM (default: <code>false</code>).</li>
+            <li><code>model_path</code>: path to the GGUF model file.</li>
+            <li><code>model_url</code>: download URL for auto-download on startup if model is missing.</li>
+            <li><code>context_length</code>: context window in tokens (default: <code>16384</code>).</li>
+            <li><code>gpu_layers</code>: layers to offload to GPU, <code>0</code> = CPU only, <code>99</code> = all (default: <code>99</code>).</li>
+            <li><code>threads</code>: inference threads, <code>0</code> = auto-detect (default: <code>0</code>).</li>
+            <li><code>inference_timeout_secs</code>: max seconds per inference call, <code>0</code> = no limit (default: <code>120</code>).</li>
+            <li><code>use_agent</code>: use the configured agent (claude/codex) for repo classification instead of the local model. Much faster but costs API credits (default: <code>false</code>).</li>
+            </ul>
+          </div>
+        </details>
+
         <details id="dashboard-config">
           <summary>Dashboard (<code>[dashboard]</code>) <span class="summary-desc">display and cost settings</span></summary>
           <div class="details-content">
@@ -572,6 +590,10 @@ default_provider = &quot;claude&quot;
 
 # Agent process execution timeout in seconds (default: 21600 = 6 hours)
 timeout_secs = 21600
+
+# Use the local LLM as the agent runner instead of an external provider (default: false)
+# Requires [llm] to be enabled. Fully offline but much slower and cannot create PRs.
+use_llm = false
 
 [agent.providers.claude]
 # Model to use (default: Claude CLI default)
@@ -1233,6 +1255,31 @@ fail_on_regression = false
 # custom_coverage_cmd = &quot;npm run coverage&quot;
 
 # ============================================
+# Local LLM
+# ============================================
+# Optional local model for offline repo classification and code chat.
+
+[llm]
+# Enable the local LLM (default: false)
+enabled = false
+
+# Path to the GGUF model file
+model_path = &quot;~/.cache/claudear/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf&quot;
+
+# Context window length in tokens (default: 16384)
+context_length = 16384
+
+# Number of layers to offload to GPU (0 = CPU only, 99 = all; default: 99)
+gpu_layers = 99
+
+# Maximum time in seconds for a single LLM inference call (0 = no limit; default: 120)
+inference_timeout_secs = 120
+
+# Use the configured agent (claude/codex) for repo classification instead of
+# the local model. Much faster but costs API credits. (default: false)
+use_agent = false
+
+# ============================================
 # Dashboard
 # ============================================
 # Display and cost estimation settings for the web dashboard.
@@ -1329,6 +1376,7 @@ enabled = false
         <li class="toc-item" data-toc-text="prioritisation ([prioritisation])"><a class="toc-link" data-toc-link href="#prioritisation" data-target-id="prioritisation"><span class="toc-link-label">Prioritisation</span></a></li>
         <li class="toc-item" data-toc-text="code indexing ([code_index])"><a class="toc-link" data-toc-link href="#code-index" data-target-id="code-index"><span class="toc-link-label">Code indexing</span></a></li>
         <li class="toc-item" data-toc-text="self-evaluation ([evaluation])"><a class="toc-link" data-toc-link href="#evaluation" data-target-id="evaluation"><span class="toc-link-label">Self-evaluation</span></a></li>
+        <li class="toc-item" data-toc-text="local llm ([llm])"><a class="toc-link" data-toc-link href="#llm-config" data-target-id="llm-config"><span class="toc-link-label">Local LLM</span></a></li>
         <li class="toc-item" data-toc-text="dashboard ([dashboard])"><a class="toc-link" data-toc-link href="#dashboard-config" data-target-id="dashboard-config"><span class="toc-link-label">Dashboard</span></a></li>
         <li class="toc-item" data-toc-text="tls auto-provisioning ([tls])"><a class="toc-link" data-toc-link href="#tls-config" data-target-id="tls-config"><span class="toc-link-label">TLS auto-provisioning</span></a></li>
         <li class="toc-item" data-toc-text="minimal config"><a class="toc-link" data-toc-link href="#minimal-config" data-target-id="minimal-config"><span class="toc-link-label">Minimal config</span></a></li>

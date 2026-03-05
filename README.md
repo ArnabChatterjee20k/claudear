@@ -851,6 +851,10 @@ default_provider = "claude"
 # Agent process execution timeout in seconds (default: 21600 = 6 hours)
 timeout_secs = 21600
 
+# Use the local LLM as the agent runner instead of an external provider (default: false)
+# Requires [llm] to be enabled. Fully offline but much slower and cannot create PRs.
+use_llm = false
+
 [agent.providers.claude]
 # Model selection
 model = "sonnet"   # sonnet, opus, haiku, or full model ID
@@ -885,6 +889,22 @@ weight = 0.8
 [[agent.experiments.providers]]
 name = "codex"
 weight = 0.2
+```
+
+### Local LLM
+
+Optional local model for offline repo classification and code chat:
+
+```toml
+[llm]
+enabled = false
+model_path = "~/.cache/claudear/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+gpu_layers = 99          # 0 = CPU only, 99 = all layers on GPU
+inference_timeout_secs = 120
+
+# Use the configured agent (claude/codex) for repo classification instead of
+# the local model. Much faster but costs API credits. (default: false)
+use_agent = false
 ```
 
 ---
