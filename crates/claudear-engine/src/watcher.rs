@@ -159,6 +159,9 @@ pub struct WatcherOptions {
     pub scm_provider: Option<Arc<dyn ScmProvider>>,
     pub user_registry: UserRegistry,
     pub agent: Arc<dyn AgentRunner>,
+    /// Optional separate agent runner for repo classification (uses a cheaper/faster model).
+    /// Falls back to `agent` if not set.
+    pub classification_agent: Option<Arc<dyn AgentRunner>>,
     pub dry_run: bool,
     /// Optional pre-loaded LLM engine for repo classification.
     pub llm_engine: Option<Arc<claudear_integrations::chat::llm::LlmEngine>>,
@@ -203,8 +206,12 @@ impl Watcher {
         let mut inferrer = options.inferrer;
         if options.config.llm.use_agent {
             if let Some(ref mut inf) = inferrer {
+                let classifier_runner = options
+                    .classification_agent
+                    .clone()
+                    .unwrap_or_else(|| options.agent.clone());
                 let agent_classifier =
-                    crate::agent_classifier::AgentRepoClassifier::new(options.agent.clone());
+                    crate::agent_classifier::AgentRepoClassifier::new(classifier_runner);
                 inf.set_classifier(Arc::new(agent_classifier));
                 tracing::info!("Agent-based repo classifier enabled (using configured agent)");
             }
@@ -1025,8 +1032,8 @@ impl Watcher {
     pub async fn stop_and_drain(&self) {
         self.stop();
 
-        // Wait for any active processing to complete (up to 5 minutes)
-        let max_wait = std::time::Duration::from_secs(300);
+        // Wait for any active processing to complete (up to 30 seconds)
+        let max_wait = std::time::Duration::from_secs(30);
         let start = std::time::Instant::now();
 
         while self.active_processing.load(Ordering::SeqCst) > 0 {
@@ -4423,6 +4430,7 @@ mod tests {
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
             agent,
+            classification_agent: None,
             dry_run,
             llm_engine: None,
         })
@@ -4727,6 +4735,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: true,
             llm_engine: None,
         };
@@ -5309,6 +5318,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -5363,6 +5373,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -5435,6 +5446,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -5499,6 +5511,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -5916,6 +5929,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -6002,6 +6016,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: true,
             llm_engine: None,
         });
@@ -6048,6 +6063,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -6667,6 +6683,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -7030,6 +7047,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -7140,6 +7158,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -7204,6 +7223,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -7263,6 +7283,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -7327,6 +7348,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -7505,6 +7527,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: true,
             llm_engine: None,
         });
@@ -7637,6 +7660,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -7729,6 +7753,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: true,
             llm_engine: None,
         });
@@ -7812,6 +7837,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -7926,6 +7952,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: true,
             llm_engine: None,
         });
@@ -7969,6 +7996,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8179,6 +8207,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8217,6 +8246,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8269,6 +8299,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8308,6 +8339,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8346,6 +8378,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8383,6 +8416,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8419,6 +8453,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8476,6 +8511,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8534,6 +8570,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8592,6 +8629,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8650,6 +8688,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8702,6 +8741,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8755,6 +8795,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -8883,6 +8924,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: true,
             llm_engine: None,
         });
@@ -9111,6 +9153,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: true,
             llm_engine: None,
         });
@@ -9160,6 +9203,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -9228,6 +9272,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -9343,6 +9388,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -9520,6 +9566,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: true,
             llm_engine: None,
         });
@@ -9596,6 +9643,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -9658,6 +9706,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -9767,6 +9816,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -9799,6 +9849,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -9973,6 +10024,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -10018,6 +10070,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -10079,6 +10132,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         })
@@ -10439,6 +10493,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 sqlite.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -10563,6 +10618,7 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            classification_agent: None,
             dry_run: true,
             llm_engine: None,
             agent: mock_agent,
@@ -10642,6 +10698,7 @@ mod tests {
             github_client: None,
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
+            classification_agent: None,
             dry_run: true,
             llm_engine: None,
             agent,
@@ -10879,6 +10936,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -10912,6 +10970,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -10945,6 +11004,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -10978,6 +11038,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -11012,6 +11073,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -11393,6 +11455,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -11434,6 +11497,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -11493,6 +11557,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -11528,6 +11593,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -11711,6 +11777,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -12277,6 +12344,7 @@ mod tests {
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             )),
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         })

@@ -148,6 +148,7 @@ pub struct AppComponents {
     pub review_watcher: Option<Arc<ReviewWatcher>>,
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub agent: Arc<dyn runner::AgentRunner>,
+    pub classification_agent: Option<Arc<dyn runner::AgentRunner>>,
 }
 
 /// Build all non-storage components.
@@ -219,6 +220,46 @@ pub async fn build_app(
             tracker.clone(),
         )));
 
+    // Build a separate agent runner for classification if configured
+    let classification_agent: Option<Arc<dyn runner::AgentRunner>> = config
+        .agent
+        .default_provider_config()
+        .and_then(|p| p.classification_model.clone())
+        .map(|model| {
+            let r = runner::ClaudeAgentRunner::new(
+                runner::ClaudeRunnerConfig {
+                    timeout_secs: config.agent.timeout_secs,
+                    model: Some(model),
+                    instructions: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.instructions.clone()),
+                    permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.permissions.clone())
+                        .unwrap_or_default(),
+                    skip_permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.skip_permissions)
+                        .unwrap_or(false),
+                    binary: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.binary.clone())
+                        .unwrap_or_else(|| "claude".to_string()),
+                    env: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.env.clone())
+                        .unwrap_or_default(),
+                },
+                tracker.clone(),
+            );
+            telemetry::InstrumentedRunner::wrap(Arc::new(r)) as Arc<dyn runner::AgentRunner>
+        });
+
     Ok(AppComponents {
         config,
         tracker,
@@ -230,6 +271,7 @@ pub async fn build_app(
         review_watcher,
         issue_embedding_service,
         agent,
+        classification_agent,
     })
 }
 

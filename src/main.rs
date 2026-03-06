@@ -674,6 +674,7 @@ struct WatcherDeps {
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<claudear::repo::code_index::CodeSearchService>>,
     agent: Arc<dyn AgentRunner>,
+    classification_agent: Option<Arc<dyn AgentRunner>>,
     llm_engine: Option<Arc<claudear::chat::llm::LlmEngine>>,
 }
 
@@ -888,6 +889,47 @@ async fn build_watcher_deps(
         agent
     };
 
+    // Build a separate agent runner for classification if a classification_model is configured
+    let classification_agent: Option<Arc<dyn AgentRunner>> = config
+        .agent
+        .default_provider_config()
+        .and_then(|p| p.classification_model.clone())
+        .map(|model| {
+            tracing::info!(model = %model, "Building separate agent runner for classification");
+            let runner = ClaudeAgentRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.agent.timeout_secs,
+                    model: Some(model),
+                    instructions: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.instructions.clone()),
+                    permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.permissions.clone())
+                        .unwrap_or_default(),
+                    skip_permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.skip_permissions)
+                        .unwrap_or(false),
+                    binary: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.binary.clone())
+                        .unwrap_or_else(|| "claude".to_string()),
+                    env: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.env.clone())
+                        .unwrap_or_default(),
+                },
+                tracker.clone(),
+            );
+            InstrumentedRunner::wrap(Arc::new(runner)) as Arc<dyn AgentRunner>
+        });
+
     Ok(WatcherDeps {
         sources,
         scm_provider,
@@ -899,6 +941,7 @@ async fn build_watcher_deps(
         issue_embedding_service,
         code_search_service,
         agent,
+        classification_agent,
         llm_engine,
     })
 }
@@ -2983,6 +3026,7 @@ async fn async_main() -> anyhow::Result<()> {
             scm_provider: deps.scm_provider,
             user_registry: user_registry.clone(),
             agent: deps.agent.clone(),
+            classification_agent: deps.classification_agent.clone(),
             dry_run: false,
             llm_engine: deps.llm_engine.clone(),
         }));
@@ -3059,13 +3103,21 @@ async fn async_main() -> anyhow::Result<()> {
         let shutdown = async move {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("\nReceived shutdown signal, initiating graceful shutdown...");
+                    tracing::info!("\nReceived shutdown signal, press Ctrl+C again to force quit...");
                 }
                 _ = shutdown_rx.recv() => {
                     tracing::info!("\nReceived IPC shutdown command, initiating graceful shutdown...");
                 }
             }
-            watcher_for_shutdown.stop_and_drain().await;
+
+            // Race graceful drain against a second Ctrl+C for force quit
+            tokio::select! {
+                _ = watcher_for_shutdown.stop_and_drain() => {}
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("\nForce shutdown requested, exiting immediately");
+                    std::process::exit(130);
+                }
+            }
 
             // Log watcher_stopped activity
             let activity = ActivityLogEntry::new("watcher_stopped", "Watcher daemon stopped")
@@ -3518,6 +3570,7 @@ async fn async_main() -> anyhow::Result<()> {
             scm_provider: None,
             user_registry: user_registry.clone(),
             agent,
+            classification_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -3701,6 +3754,7 @@ async fn async_main() -> anyhow::Result<()> {
                 scm_provider: deps.scm_provider,
                 user_registry: user_registry.clone(),
                 agent: deps.agent.clone(),
+                classification_agent: deps.classification_agent.clone(),
                 dry_run: false,
                 llm_engine: deps.llm_engine.clone(),
             }));
@@ -3739,8 +3793,14 @@ async fn async_main() -> anyhow::Result<()> {
                 tokio::signal::ctrl_c()
                     .await
                     .expect("Failed to install signal handler");
-                tracing::info!("\nReceived shutdown signal...");
-                watcher_for_shutdown.stop_and_drain().await;
+                tracing::info!("\nReceived shutdown signal, press Ctrl+C again to force quit...");
+                tokio::select! {
+                    _ = watcher_for_shutdown.stop_and_drain() => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::warn!("\nForce shutdown requested, exiting immediately");
+                        std::process::exit(130);
+                    }
+                }
                 if let Some(h) = regression_handle {
                     h.abort();
                 }
@@ -3905,6 +3965,47 @@ async fn async_main() -> anyhow::Result<()> {
                 None
             };
 
+            // Build a separate agent runner for classification if configured
+            let classification_agent: Option<Arc<dyn AgentRunner>> = config
+                .agent
+                .default_provider_config()
+                .and_then(|p| p.classification_model.clone())
+                .map(|model| {
+                    tracing::info!(model = %model, "Building separate agent runner for classification");
+                    let runner = ClaudeAgentRunner::new(
+                        ClaudeRunnerConfig {
+                            timeout_secs: config.agent.timeout_secs,
+                            model: Some(model),
+                            instructions: config
+                                .agent
+                                .default_provider_config()
+                                .and_then(|p| p.instructions.clone()),
+                            permissions: config
+                                .agent
+                                .default_provider_config()
+                                .map(|p| p.permissions.clone())
+                                .unwrap_or_default(),
+                            skip_permissions: config
+                                .agent
+                                .default_provider_config()
+                                .map(|p| p.skip_permissions)
+                                .unwrap_or(false),
+                            binary: config
+                                .agent
+                                .default_provider_config()
+                                .and_then(|p| p.binary.clone())
+                                .unwrap_or_else(|| "claude".to_string()),
+                            env: config
+                                .agent
+                                .default_provider_config()
+                                .map(|p| p.env.clone())
+                                .unwrap_or_default(),
+                        },
+                        tracker.clone(),
+                    );
+                    InstrumentedRunner::wrap(Arc::new(runner)) as Arc<dyn AgentRunner>
+                });
+
             let tracker_for_api = tracker.clone();
             let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
@@ -3925,6 +4026,7 @@ async fn async_main() -> anyhow::Result<()> {
                 scm_provider: None,
                 user_registry: user_registry.clone(),
                 agent,
+                classification_agent,
                 dry_run,
                 llm_engine,
             }));

@@ -128,6 +128,8 @@ impl AgentConfig {
 pub struct ProviderConfig {
     /// Model to use (e.g., sonnet, opus, haiku, or full model ID).
     pub model: Option<String>,
+    /// Model to use for repo classification (optional, falls back to `model`).
+    pub classification_model: Option<String>,
     /// Custom instructions appended to the agent's system prompt.
     pub instructions: Option<String>,
     /// Path to a file containing custom instructions.
@@ -1970,6 +1972,13 @@ impl Config {
                 self.agent.default_provider_config_mut().model = Some(v);
             }
         }
+        if let Ok(v) = env::var("CLAUDEAR_CLAUDE_CLASSIFICATION_MODEL") {
+            if !v.is_empty() {
+                self.agent
+                    .default_provider_config_mut()
+                    .classification_model = Some(v);
+            }
+        }
         if let Ok(v) = env::var("CLAUDEAR_CLAUDE_INSTRUCTIONS") {
             if !v.is_empty() {
                 self.agent.default_provider_config_mut().instructions = Some(v);
@@ -3192,6 +3201,7 @@ mod tests {
         "CLAUDEAR_RETRY_BASE_DELAY_MS",
         "CLAUDEAR_RETRY_MAX_DELAY_MS",
         "CLAUDEAR_CLAUDE_MODEL",
+        "CLAUDEAR_CLAUDE_CLASSIFICATION_MODEL",
         "CLAUDEAR_CLAUDE_INSTRUCTIONS",
         "CLAUDEAR_CLAUDE_INSTRUCTIONS_FILE",
         "CLAUDEAR_CLAUDE_PERMISSIONS",
