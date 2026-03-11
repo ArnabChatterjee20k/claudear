@@ -3723,7 +3723,7 @@ impl UserStore for SqliteTracker {
         let token = generate_session_token();
         let conn = self.acquire_lock()?;
         conn.execute(
-            "INSERT INTO sessions (id, user_id, expires_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO sessions (id, user_id, expires_at, last_active_at) VALUES (?1, ?2, ?3, datetime('now'))",
             params![token, user_id, expires_at],
         )?;
         Ok(token)
