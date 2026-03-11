@@ -3173,6 +3173,9 @@ async fn async_main() -> anyhow::Result<()> {
                 server.set_issue_embedding_service(issue_embedding_service_clone);
                 server.set_code_search_service(code_search_service_clone);
                 server.set_review_watcher(review_watcher_clone);
+                if enable_dashboard {
+                    server.set_dashboard(std::path::PathBuf::from(config_path.clone()));
+                }
                 server.start().await?;
             } else if enable_dashboard {
                 // Dashboard only (no webhooks)

@@ -86,6 +86,8 @@ pub struct WebhookServer {
     github_handler: Option<GitHubWebhookHandler>,
     agent: Arc<dyn AgentRunner>,
     port: u16,
+    /// When set, the dashboard API routes are merged into the webhook server.
+    dashboard_config_path: Option<std::path::PathBuf>,
 }
 
 impl WebhookServer {
@@ -138,6 +140,7 @@ impl WebhookServer {
             github_handler,
             agent,
             port,
+            dashboard_config_path: None,
         }
     }
 
@@ -162,6 +165,11 @@ impl WebhookServer {
     /// Set the embedding client (shared across the application).
     pub fn set_embedding_client(&mut self, client: Option<Arc<crate::feedback::EmbeddingClient>>) {
         self.embedding_client = client;
+    }
+
+    /// Enable the dashboard API routes alongside the webhook routes.
+    pub fn set_dashboard(&mut self, config_path: std::path::PathBuf) {
+        self.dashboard_config_path = Some(config_path);
     }
 
     /// Build a repository inferrer from config.
@@ -231,7 +239,7 @@ impl WebhookServer {
         // Combined with the processing set, this provides effective rate control
         let concurrency_layer = ConcurrencyLimitLayer::new(10);
 
-        let app = Router::new()
+        let webhook_routes = Router::new()
             .route("/health", get(health_handler))
             .route(
                 "/webhook/{source}",
@@ -240,10 +248,29 @@ impl WebhookServer {
                     .layer(concurrency_layer),
             )
             .layer(DefaultBodyLimit::max(512 * 1024)) // 512 KB body size limit
+            .with_state(state.clone());
+
+        // If dashboard is enabled, merge the dashboard API routes into the
+        // same server so both webhooks and the dashboard share a single port.
+        let dashboard_enabled = self.dashboard_config_path.is_some();
+        let app = if let Some(config_path) = self.dashboard_config_path {
+            let indexing_rx = state.tracker.subscribe_indexing_progress();
+            let dashboard_routes = claudear_engine::api::create_api_router_with_dashboard(
+                state.config.clone(),
+                state.tracker.clone(),
+                config_path,
+                indexing_rx,
+                None,
+            );
+            webhook_routes.merge(dashboard_routes)
+        } else {
+            webhook_routes
+        };
+
+        let app = app
             // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
             .layer(SentryHttpLayer::new().enable_transaction())
-            .layer(NewSentryLayer::new_from_top())
-            .with_state(state.clone());
+            .layer(NewSentryLayer::new_from_top());
 
         let tls_enabled = state.config.tls.enabled;
         let scheme = if tls_enabled { "https" } else { "http" };
@@ -285,6 +312,9 @@ impl WebhookServer {
                 display_port,
                 handler.source_name()
             );
+        }
+        if dashboard_enabled {
+            tracing::info!("  Dashboard {}://localhost:{}", scheme, display_port);
         }
 
         if tls_enabled {
