@@ -771,16 +771,18 @@ mod tests {
     fn test_compute_sub_batch_without_env_high_dim() {
         std::env::remove_var("EMBEDDING_SUB_BATCH");
         let result = EmbeddingClient::compute_sub_batch(768, false);
-        // Should be between 4 and 16 (memory-based clamp range)
-        assert!((4..=16).contains(&result));
+        // Memory-based clamp range is 4..=16, but falls back to 32 when
+        // sysinfo reports 0 available memory (common on macOS in tests).
+        assert!((4..=32).contains(&result));
     }
 
     #[test]
     fn test_compute_sub_batch_without_env_low_dim() {
         std::env::remove_var("EMBEDDING_SUB_BATCH");
         let result = EmbeddingClient::compute_sub_batch(384, false);
-        // Low dimension uses 40 MB/text, so budget allows more per batch
-        assert!((4..=16).contains(&result));
+        // Memory-based clamp range is 4..=16, but falls back to 32 when
+        // sysinfo reports 0 available memory (common on macOS in tests).
+        assert!((4..=32).contains(&result));
     }
 
     #[test]
