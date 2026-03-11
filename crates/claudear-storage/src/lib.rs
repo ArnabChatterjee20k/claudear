@@ -1247,9 +1247,14 @@ pub trait UserStore: Send + Sync {
         Ok(())
     }
 
-    /// Cleanup expired sessions, returning how many were removed.
+    /// Cleanup expired and idle sessions, returning how many were removed.
     fn cleanup_expired_sessions(&self) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Update the last_active_at timestamp for a session (idle timeout tracking).
+    fn touch_session(&self, _token: &str) -> Result<()> {
+        Ok(())
     }
 
     /// Delete all sessions for a user.
@@ -2561,6 +2566,12 @@ mod tests {
         fn test_default_cleanup_expired_sessions_returns_zero() {
             let t = MockUserExt;
             assert_eq!(t.cleanup_expired_sessions().unwrap(), 0);
+        }
+
+        #[test]
+        fn test_default_touch_session_succeeds() {
+            let t = MockUserExt;
+            assert!(t.touch_session("token123").is_ok());
         }
 
         #[test]

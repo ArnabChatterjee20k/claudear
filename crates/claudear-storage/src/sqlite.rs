@@ -3735,7 +3735,7 @@ impl UserStore for SqliteTracker {
             "SELECT u.id, u.email, u.password_hash, u.name, u.role, u.avatar_url, u.created_at, u.updated_at
              FROM sessions s
              JOIN users u ON s.user_id = u.id
-             WHERE s.id = ?1 AND s.expires_at > datetime('now')",
+             WHERE s.id = ?1 AND s.expires_at > datetime('now') AND s.last_active_at > datetime('now', '-30 minutes')",
         )?;
         let user = stmt
             .query_row(params![token], UserRow::from_row)
@@ -3752,10 +3752,19 @@ impl UserStore for SqliteTracker {
     fn cleanup_expired_sessions(&self) -> Result<usize> {
         let conn = self.acquire_lock()?;
         let deleted = conn.execute(
-            "DELETE FROM sessions WHERE expires_at <= datetime('now')",
+            "DELETE FROM sessions WHERE expires_at <= datetime('now') OR last_active_at <= datetime('now', '-30 minutes')",
             [],
         )?;
         Ok(deleted)
+    }
+
+    fn touch_session(&self, token: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE sessions SET last_active_at = datetime('now') WHERE id = ?1",
+            params![token],
+        )?;
+        Ok(())
     }
 
     fn delete_user_sessions(&self, user_id: i64) -> Result<()> {
@@ -10078,6 +10087,21 @@ mod tests {
             .unwrap();
         let deleted = tracker.cleanup_expired_sessions().unwrap();
         assert_eq!(deleted, 2);
+    }
+
+    #[test]
+    fn test_touch_session_updates_last_active() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let user_id = tracker
+            .create_user("touch@test.com", "hash", "Touch", "admin")
+            .unwrap();
+        let token = tracker
+            .create_session(user_id, "2099-12-31T23:59:59")
+            .unwrap();
+        // Touch should succeed and session should still be valid
+        tracker.touch_session(&token).unwrap();
+        let user = tracker.get_session_user(&token).unwrap();
+        assert!(user.is_some());
     }
 
     #[test]
