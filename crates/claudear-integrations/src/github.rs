@@ -90,6 +90,11 @@ impl<H: HttpClient> GitHubClient<H> {
         &self.config.review_trigger
     }
 
+    /// Get the list of bot handles whose review comments should be processed.
+    pub fn allowed_bots(&self) -> &[String] {
+        &self.config.allowed_bots
+    }
+
     /// Build standard GitHub API headers.
     fn build_headers(&self, token: &str) -> Vec<(&'static str, String)> {
         vec![
@@ -850,6 +855,10 @@ impl<H: HttpClient> ScmProvider for GitHubClient<H> {
 
     fn review_trigger(&self) -> &str {
         self.review_trigger()
+    }
+
+    fn allowed_bots(&self) -> &[String] {
+        self.allowed_bots()
     }
 
     async fn get_pr_status(&self, project: &str, number: i64) -> Result<PrStatus> {

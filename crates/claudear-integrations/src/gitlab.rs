@@ -131,6 +131,11 @@ impl<H: HttpClient> GitLabClient<H> {
         &self.config.review_trigger
     }
 
+    /// Get the list of bot handles whose review comments should be processed.
+    pub fn allowed_bots(&self) -> &[String] {
+        &self.config.allowed_bots
+    }
+
     /// Get the GitLab API base URL.
     fn api_base(&self) -> &str {
         &self.config.base_url
@@ -537,6 +542,10 @@ impl<H: HttpClient> ScmProvider for GitLabClient<H> {
 
     fn review_trigger(&self) -> &str {
         self.review_trigger()
+    }
+
+    fn allowed_bots(&self) -> &[String] {
+        self.allowed_bots()
     }
 
     async fn get_pr_status(&self, project: &str, number: i64) -> Result<PrStatus> {

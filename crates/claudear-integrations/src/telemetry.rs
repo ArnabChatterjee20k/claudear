@@ -299,6 +299,9 @@ impl ScmProvider for InstrumentedScm {
     delegate!(fn name(&self) -> &str);
     delegate!(fn is_enabled(&self) -> bool);
     delegate!(fn review_trigger(&self) -> &str);
+    fn allowed_bots(&self) -> &[String] {
+        self.inner.allowed_bots()
+    }
     delegate!(fn pr_url_pattern(&self) -> &str);
     delegate!(fn parse_pr_number(&self, url: &str) -> Option<i64>);
 

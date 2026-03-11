@@ -14,6 +14,24 @@ use std::sync::Arc;
 
 pub use claudear_core::types::{PrReviewState, ReviewComment, ReviewUser};
 
+/// Check whether a bot user should be skipped based on the allowed-bots list.
+///
+/// Returns `true` if the user is a bot and its login does NOT match any entry in
+/// `allowed_bots`. Matching is case-insensitive and also strips a trailing
+/// `[bot]` suffix from the login before comparing (e.g. `"copilot"` in the
+/// allow list matches a login of `"copilot[bot]"`).
+pub fn is_skippable_bot(user: &ReviewUser, allowed_bots: &[String]) -> bool {
+    if user.user_type.as_deref() != Some("Bot") {
+        return false;
+    }
+    let login_lower = user.login.to_lowercase();
+    let login_stripped = login_lower.strip_suffix("[bot]").unwrap_or(&login_lower);
+    !allowed_bots.iter().any(|b| {
+        let b_lower = b.to_lowercase();
+        b_lower == login_lower || b_lower == login_stripped
+    })
+}
+
 // ScmProvider trait
 
 /// Trait abstracting a source-control management provider (GitHub, GitLab, ...).
@@ -29,6 +47,11 @@ pub trait ScmProvider: Send + Sync {
 
     /// The review trigger tag (e.g. `"@claudear"`).
     fn review_trigger(&self) -> &str;
+
+    /// Bot handles whose review comments should be processed instead of skipped.
+    fn allowed_bots(&self) -> &[String] {
+        &[]
+    }
 
     /// Get the merge/close status of a PR/MR.
     async fn get_pr_status(&self, project: &str, number: i64) -> Result<PrStatus>;
@@ -941,8 +964,8 @@ impl ReviewWatcher {
                 }
             }
 
-            // Skip bot reviews
-            if review.user.user_type.as_deref() == Some("Bot") {
+            // Skip bot reviews (unless the bot is in the allowed list)
+            if is_skippable_bot(&review.user, self.provider.allowed_bots()) {
                 continue;
             }
 
@@ -1027,10 +1050,11 @@ impl ReviewWatcher {
         // Get the review trigger (e.g. "@claudear")
         let trigger = self.provider.review_trigger();
 
-        // Cursor comments are all non-bot comments after the current cursor.
+        // Cursor comments: skip bots unless they are in the allowed list.
+        let allowed_bots = self.provider.allowed_bots();
         let cursor_comments: Vec<_> = comments
             .into_iter()
-            .filter(|c| c.user.user_type.as_deref() != Some("Bot"))
+            .filter(|c| !is_skippable_bot(&c.user, allowed_bots))
             .filter(|c| {
                 Self::comment_is_after_cursor(
                     c,
@@ -1199,6 +1223,66 @@ pub type OrgRepo = RemoteRepo;
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    #[test]
+    fn is_skippable_bot_skips_unlisted_bot() {
+        let user = ReviewUser {
+            id: 1,
+            login: "dependabot[bot]".to_string(),
+            user_type: Some("Bot".to_string()),
+        };
+        assert!(is_skippable_bot(&user, &[]));
+    }
+
+    #[test]
+    fn is_skippable_bot_allows_listed_bot_exact() {
+        let user = ReviewUser {
+            id: 1,
+            login: "dependabot[bot]".to_string(),
+            user_type: Some("Bot".to_string()),
+        };
+        assert!(!is_skippable_bot(&user, &["dependabot[bot]".to_string()]));
+    }
+
+    #[test]
+    fn is_skippable_bot_allows_listed_bot_without_suffix() {
+        let user = ReviewUser {
+            id: 1,
+            login: "dependabot[bot]".to_string(),
+            user_type: Some("Bot".to_string()),
+        };
+        assert!(!is_skippable_bot(&user, &["dependabot".to_string()]));
+    }
+
+    #[test]
+    fn is_skippable_bot_case_insensitive() {
+        let user = ReviewUser {
+            id: 1,
+            login: "Copilot[bot]".to_string(),
+            user_type: Some("Bot".to_string()),
+        };
+        assert!(!is_skippable_bot(&user, &["copilot".to_string()]));
+    }
+
+    #[test]
+    fn is_skippable_bot_ignores_non_bot_users() {
+        let user = ReviewUser {
+            id: 1,
+            login: "human-reviewer".to_string(),
+            user_type: Some("User".to_string()),
+        };
+        assert!(!is_skippable_bot(&user, &[]));
+    }
+
+    #[test]
+    fn is_skippable_bot_none_user_type_not_skipped() {
+        let user = ReviewUser {
+            id: 1,
+            login: "mystery".to_string(),
+            user_type: None,
+        };
+        assert!(!is_skippable_bot(&user, &[]));
+    }
 
     #[test]
     fn compare_timestamps_equal() {
@@ -2666,6 +2750,7 @@ mod tests {
             name: String,
             enabled: bool,
             trigger: String,
+            allowed_bots: Vec<String>,
             reviews: Arc<Mutex<Vec<CodeReview>>>,
             comments: Arc<Mutex<Vec<ReviewComment>>>,
             /// When true, get_review_comments returns an error.
@@ -2678,10 +2763,16 @@ mod tests {
                     name: name.to_string(),
                     enabled,
                     trigger: trigger.to_string(),
+                    allowed_bots: Vec::new(),
                     reviews: Arc::new(Mutex::new(Vec::new())),
                     comments: Arc::new(Mutex::new(Vec::new())),
                     comments_error: Arc::new(Mutex::new(false)),
                 }
+            }
+
+            fn with_allowed_bots(mut self, bots: Vec<String>) -> Self {
+                self.allowed_bots = bots;
+                self
             }
 
             fn set_reviews(&self, reviews: Vec<CodeReview>) {
@@ -2709,6 +2800,10 @@ mod tests {
 
             fn review_trigger(&self) -> &str {
                 &self.trigger
+            }
+
+            fn allowed_bots(&self) -> &[String] {
+                &self.allowed_bots
             }
 
             async fn get_pr_status(&self, _project: &str, _number: i64) -> Result<PrStatus> {
@@ -3098,6 +3193,84 @@ mod tests {
                 .filter(|e| matches!(e, ReviewEvent::ReviewSubmitted { .. }))
                 .count();
             assert_eq!(review_submitted_count, 0);
+        }
+
+        #[tokio::test]
+        async fn test_allowed_bot_review_is_processed() {
+            let mock = MockScmProvider::new("github", true, "@claudear")
+                .with_allowed_bots(vec!["dependabot".to_string()]);
+            mock.set_reviews(vec![make_bot_review(
+                1,
+                "COMMENTED",
+                "2025-01-01T00:00:00Z",
+            )]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let review_submitted_count = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::ReviewSubmitted { .. }))
+                .count();
+            assert_eq!(review_submitted_count, 1);
+        }
+
+        #[tokio::test]
+        async fn test_allowed_bot_comment_is_processed() {
+            let mock = MockScmProvider::new("github", true, "@claudear")
+                .with_allowed_bots(vec!["mybot".to_string()]);
+            let mut bot_comment =
+                make_comment(1, "@claudear please fix", "2025-01-01T00:00:00Z", None);
+            bot_comment.user.login = "mybot[bot]".to_string();
+            bot_comment.user.user_type = Some("Bot".to_string());
+            mock.set_comments(vec![bot_comment]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let comments_events: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
+                .collect();
+            assert_eq!(comments_events.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_non_allowed_bot_comment_is_still_filtered() {
+            let mock = MockScmProvider::new("github", true, "@claudear")
+                .with_allowed_bots(vec!["otherbot".to_string()]);
+            let mut bot_comment =
+                make_comment(1, "@claudear please fix", "2025-01-01T00:00:00Z", None);
+            bot_comment.user.login = "dependabot[bot]".to_string();
+            bot_comment.user.user_type = Some("Bot".to_string());
+            mock.set_comments(vec![bot_comment]);
+            let provider: Arc<dyn ScmProvider> = Arc::new(mock);
+            let watcher = ReviewWatcher::new(provider);
+
+            watcher.watch_pr(make_state(
+                "https://github.com/org/repo/pull/1",
+                "org/repo",
+                1,
+            ));
+
+            let events = watcher.check_for_reviews().await.unwrap();
+            let comments_events: Vec<_> = events
+                .iter()
+                .filter(|e| matches!(e, ReviewEvent::CommentsAdded { .. }))
+                .collect();
+            assert!(comments_events.is_empty());
         }
 
         #[tokio::test]

@@ -4,7 +4,7 @@
 //! events from GitHub webhooks to trigger review processing in real-time instead
 //! of relying solely on polling.
 
-use crate::scm::{CodeReview, ReviewComment, ReviewUser, ReviewWatcher};
+use crate::scm::{is_skippable_bot, CodeReview, ReviewComment, ReviewUser, ReviewWatcher};
 use claudear_config::config::GitHubConfig;
 use claudear_core::error::Result;
 use hmac::{Hmac, Mac};
@@ -225,8 +225,8 @@ impl GitHubWebhookHandler {
         // Parse the review
         let pr_review = self.parse_review(review)?;
 
-        // Skip bot reviews
-        if pr_review.user.user_type.as_deref() == Some("Bot") {
+        // Skip bot reviews (unless the bot is in the allowed list)
+        if is_skippable_bot(&pr_review.user, &self.config.allowed_bots) {
             tracing::debug!(
                 source = "github",
                 pr_url = %pr_url,
@@ -328,8 +328,8 @@ impl GitHubWebhookHandler {
         // Parse the comment
         let pr_comment = self.parse_comment(comment)?;
 
-        // Skip bot comments
-        if pr_comment.user.user_type.as_deref() == Some("Bot") {
+        // Skip bot comments (unless the bot is in the allowed list)
+        if is_skippable_bot(&pr_comment.user, &self.config.allowed_bots) {
             tracing::debug!(
                 source = "github",
                 pr_url = %pr_url,

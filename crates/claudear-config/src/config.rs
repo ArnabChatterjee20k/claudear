@@ -1255,6 +1255,10 @@ pub struct GitLabConfig {
     pub webhook_secret: Option<SecretValue>,
     /// Trigger tag for review comments (e.g., "@claudear").
     pub review_trigger: String,
+    /// Bot handles whose review comments should be processed instead of skipped.
+    /// Matches against the bot's login (e.g., "copilot" matches "copilot[bot]").
+    #[serde(default)]
+    pub allowed_bots: Vec<String>,
     /// Use SSH URLs for cloning instead of HTTPS.
     #[serde(default)]
     pub use_ssh: bool,
@@ -1277,6 +1281,7 @@ impl Default for GitLabConfig {
             auto_resolve_on_merge: false,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
+            allowed_bots: Vec::new(),
             use_ssh: false,
             max_issues_per_cycle: None,
             max_concurrent: None,
@@ -1298,6 +1303,7 @@ impl GitLabConfig {
             auto_resolve_on_merge: true,
             webhook_secret: Some(SecretValue::new("test_secret")),
             review_trigger: "@claudear".to_string(),
+            allowed_bots: Vec::new(),
             use_ssh: false,
             max_issues_per_cycle: None,
             max_concurrent: None,
@@ -1321,6 +1327,10 @@ pub struct GitHubConfig {
     /// Comments must contain this tag to trigger Claude.
     /// Set to empty string to respond to all comments.
     pub review_trigger: String,
+    /// Bot handles whose review comments should be processed instead of skipped.
+    /// Matches against the bot's login (e.g., "copilot" matches "copilot[bot]").
+    #[serde(default)]
+    pub allowed_bots: Vec<String>,
     /// Use SSH URLs for cloning instead of HTTPS.
     /// Set to true if you have SSH keys configured for GitHub.
     #[serde(default)]
@@ -1347,6 +1357,7 @@ impl Default for GitHubConfig {
             auto_resolve_on_merge: false,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
+            allowed_bots: Vec::new(),
             use_ssh: false,
             repos: Vec::new(),
             trigger_labels: Vec::new(),
@@ -1365,6 +1376,7 @@ impl GitHubConfig {
             auto_resolve_on_merge: false,
             webhook_secret: None,
             review_trigger: "@claudear".to_string(),
+            allowed_bots: Vec::new(),
             use_ssh: false,
             repos: Vec::new(),
             trigger_labels: vec!["auto-implement".to_string(), "claude".to_string()],
