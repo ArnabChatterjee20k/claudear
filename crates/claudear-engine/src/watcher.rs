@@ -195,6 +195,8 @@ pub struct Watcher {
     rate_limit_pause_until: RwLock<Option<DateTime<Utc>>>,
     /// Optional LLM analyzer for enhanced analysis across the pipeline.
     llm_analyzer: Option<Arc<crate::llm_analyzer::LlmAnalyzerImpl>>,
+    /// Join handles for spawned issue-processing tasks (used by tests to drain).
+    spawn_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Watcher {
@@ -250,6 +252,21 @@ impl Watcher {
             last_seen_releases: RwLock::new(HashMap::new()),
             rate_limit_pause_until: RwLock::new(None),
             llm_analyzer,
+            spawn_handles: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Wait for all spawned issue-processing tasks to complete.
+    ///
+    /// Primarily useful in tests that need to assert on processing outcomes
+    /// after a non-blocking `poll_source` call.
+    pub async fn drain_spawned_tasks(&self) {
+        let handles: Vec<_> = {
+            let mut guard = self.spawn_handles.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for handle in handles {
+            let _ = handle.await;
         }
     }
 
@@ -953,7 +970,7 @@ impl Watcher {
     ///
     /// Polls each source at its configured interval. Housekeeping is handled
     /// separately by [`HousekeepingWorker`].
-    async fn run_source_poll_loop(&self, poll_interval: u64) -> Result<()> {
+    async fn run_source_poll_loop(self: &Arc<Self>, poll_interval: u64) -> Result<()> {
         // Build per-source timer state: (source index, interval_ms, last_poll)
         let now = std::time::Instant::now();
         let mut source_timers: Vec<(usize, u64, std::time::Instant)> = self
@@ -2051,7 +2068,7 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Run a single poll cycle.
-    async fn poll(&self) -> Result<()> {
+    async fn poll(self: &Arc<Self>) -> Result<()> {
         if self.is_rate_limit_paused().await {
             return Ok(());
         }
@@ -2675,7 +2692,7 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Poll a single source.
-    async fn poll_source(&self, source: &Arc<dyn IssueSource>) -> Result<()> {
+    async fn poll_source(self: &Arc<Self>, source: &Arc<dyn IssueSource>) -> Result<()> {
         if self.is_rate_limit_paused().await {
             return Ok(());
         }
@@ -3021,12 +3038,17 @@ Create a PR with your changes.{custom_instructions}"#,
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
 
-            // Process the issue
+            // Spawn processing as a background task so poll_source returns
+            // promptly and the housekeeping loop (review checks, auto-close,
+            // retries) is not starved.
+            let watcher = Arc::clone(self);
             let source_clone = Arc::clone(source);
-            let this = self;
-            let _ = this
-                .process_issue(source_clone, issue, match_result, None, None)
-                .await;
+            let handle = tokio::spawn(async move {
+                watcher
+                    .process_issue(source_clone, issue, match_result, None, None)
+                    .await;
+            });
+            self.spawn_handles.lock().await.push(handle);
 
             // Add delay between starting new issues (skip trailing delay after the last item)
             if i + 1 < to_process_count && self.config.processing_delay_ms > 0 {
@@ -3034,7 +3056,7 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
-        // Record processing metrics (don't fail main operation if this fails)
+        // Record how many issues were spawned (don't fail main operation if this fails)
         let metric = ProcessingMetric::new("batch_processed", to_process_count as f64)
             .with_source(source.name().to_string());
         if let Err(e) = self.tracker.record_metric(&metric) {
@@ -4409,13 +4431,13 @@ mod tests {
         tracker: Arc<dyn FixAttemptTracker>,
         sources: Vec<Arc<dyn IssueSource>>,
         dry_run: bool,
-    ) -> Watcher {
+    ) -> Arc<Watcher> {
         let agent: Arc<dyn claudear_integrations::runner::AgentRunner> =
             Arc::new(claudear_integrations::runner::ClaudeAgentRunner::new(
                 claudear_integrations::runner::ClaudeRunnerConfig::default(),
                 tracker.clone(),
             ));
-        Watcher::new(WatcherOptions {
+        Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources,
             notifier,
@@ -4433,7 +4455,7 @@ mod tests {
             classification_agent: None,
             dry_run,
             llm_engine: None,
-        })
+        }))
     }
 
     #[test]
@@ -5275,6 +5297,7 @@ mod tests {
 
         let result = watcher.poll_source(&source).await;
         assert!(result.is_ok());
+        watcher.drain_spawned_tasks().await;
 
         let attempt = tracker.get_attempt("urgent", "1").unwrap().unwrap();
         assert_eq!(
@@ -5300,7 +5323,7 @@ mod tests {
         config.max_issues_per_cycle = 5;
         config.processing_delay_ms = 250;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source.clone()],
             notifier,
@@ -5321,7 +5344,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
         watcher.is_running.store(true, Ordering::SeqCst);
 
         let started = std::time::Instant::now();
@@ -5355,7 +5378,7 @@ mod tests {
         config.max_concurrent = 1;
         config.processing_delay_ms = 0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source.clone()],
             notifier,
@@ -5376,7 +5399,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
         watcher.is_running.store(true, Ordering::SeqCst);
 
         // Simulate unrelated in-flight work from another source.
@@ -5393,6 +5416,7 @@ mod tests {
         .await;
         assert!(result.is_ok(), "poll_source timed out unexpectedly");
         assert!(result.unwrap().is_ok());
+        watcher.drain_spawned_tasks().await;
 
         let attempt = tracker.get_attempt("target", "1").unwrap().unwrap();
         assert_eq!(
@@ -5428,7 +5452,7 @@ mod tests {
         config.max_concurrent = 0;
         config.processing_delay_ms = 0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source.clone()],
             notifier,
@@ -5449,7 +5473,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
         watcher.is_running.store(true, Ordering::SeqCst);
 
         let result = tokio::time::timeout(
@@ -5462,6 +5486,7 @@ mod tests {
             "poll_source timed out with max_concurrent=0"
         );
         assert!(result.unwrap().is_ok());
+        watcher.drain_spawned_tasks().await;
 
         let attempt = tracker
             .get_attempt("zero-concurrency", "1")
@@ -5493,7 +5518,7 @@ mod tests {
         config.retry.base_delay_ms = 0;
         config.retry.max_delay_ms = 0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source],
             notifier,
@@ -5514,7 +5539,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
         watcher.is_running.store(true, Ordering::SeqCst);
 
         let result = tokio::time::timeout(
@@ -5911,7 +5936,7 @@ mod tests {
         config.max_concurrent = 3;
         config.processing_delay_ms = 500;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources,
             notifier,
@@ -5932,7 +5957,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         assert_eq!(watcher.config.max_issues_per_cycle, 10);
         assert_eq!(watcher.config.max_concurrent, 3);
@@ -5998,7 +6023,7 @@ mod tests {
         let mut config = test_config();
         config.max_issues_per_cycle = 5;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source.clone()],
             notifier,
@@ -6019,7 +6044,7 @@ mod tests {
             classification_agent: None,
             dry_run: true,
             llm_engine: None,
-        });
+        }));
 
         // Poll should complete successfully
         let result = watcher.poll().await;
@@ -6045,7 +6070,7 @@ mod tests {
         config.retry.max_delay_ms = 0;
         config.processing_delay_ms = 0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source],
             notifier,
@@ -6066,7 +6091,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
         watcher.is_running.store(true, Ordering::SeqCst);
 
         watcher.process_ready_retries().await.unwrap();
@@ -6104,6 +6129,7 @@ mod tests {
         watcher.is_running.store(true, Ordering::SeqCst);
 
         watcher.poll_source(&source).await.unwrap();
+        watcher.drain_spawned_tasks().await;
 
         let attempt = tracker.get_attempt("mock", "issue-1").unwrap().unwrap();
         assert_eq!(
@@ -6665,7 +6691,7 @@ mod tests {
         let tracker = sqlite.clone() as Arc<dyn FixAttemptTracker>;
         let sources: Vec<Arc<dyn IssueSource>> = vec![];
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources,
             notifier,
@@ -6686,7 +6712,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         assert!(!watcher.dry_run);
     }
@@ -7029,7 +7055,7 @@ mod tests {
         config.poll_interval_ms = 30000;
         config.agent.timeout_secs = 999;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -7050,7 +7076,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         assert_eq!(watcher.config.max_issues_per_cycle, 42);
         assert_eq!(watcher.config.max_concurrent, 7);
@@ -7140,7 +7166,7 @@ mod tests {
             )
             .unwrap();
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources,
             notifier,
@@ -7161,7 +7187,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = FixAttempt {
             id: 1,
@@ -7205,7 +7231,7 @@ mod tests {
         let mut config = test_config();
         config.cascade.enabled = true;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources,
             notifier,
@@ -7226,7 +7252,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = FixAttempt {
             id: 1,
@@ -7265,7 +7291,7 @@ mod tests {
         let mut config = test_config();
         config.cascade.enabled = true;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources,
             notifier,
@@ -7286,7 +7312,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = FixAttempt {
             id: 1,
@@ -7330,7 +7356,7 @@ mod tests {
         config.cascade.enabled = true;
 
         // Empty relationships (no dependants)
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources,
             notifier,
@@ -7351,7 +7377,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = FixAttempt {
             id: 1,
@@ -7509,7 +7535,7 @@ mod tests {
         config.retry.base_delay_ms = 0;
         config.retry.max_delay_ms = 0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source],
             notifier,
@@ -7530,7 +7556,7 @@ mod tests {
             classification_agent: None,
             dry_run: true,
             llm_engine: None,
-        });
+        }));
 
         watcher.poll().await.unwrap();
 
@@ -7642,7 +7668,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![],
             notifier,
@@ -7663,7 +7689,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         // Verify initial state
         assert!(!watcher.is_running());
@@ -7735,7 +7761,7 @@ mod tests {
         let mut config = test_config();
         config.max_issues_per_cycle = 3;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source.clone()],
             notifier,
@@ -7756,7 +7782,7 @@ mod tests {
             classification_agent: None,
             dry_run: true,
             llm_engine: None,
-        });
+        }));
 
         watcher.poll_source(&source).await.unwrap();
 
@@ -7819,7 +7845,7 @@ mod tests {
             )
             .unwrap();
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources,
             notifier,
@@ -7840,7 +7866,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         // Record a root attempt and a child attempt so depth = 1
         sqlite
@@ -7934,7 +7960,7 @@ mod tests {
             ..Default::default()
         };
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source.clone()],
             notifier,
@@ -7955,7 +7981,7 @@ mod tests {
             classification_agent: None,
             dry_run: true,
             llm_engine: None,
-        });
+        }));
 
         watcher.poll_source(&source).await.unwrap();
 
@@ -7978,7 +8004,7 @@ mod tests {
         config.learning.cluster_detection = true;
         config.learning.cross_repo_correlation = true;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -7999,7 +8025,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let base = "Fix the authentication bug";
         let issue = test_issue();
@@ -8189,7 +8215,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = sqlite.clone() as Arc<dyn FixAttemptTracker>;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![],
             notifier,
@@ -8210,7 +8236,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         // Record an attempt so we can reconstruct it
         sqlite.record_attempt("test", "ISSUE-1", "ISSUE-1").unwrap();
@@ -8228,7 +8254,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = sqlite.clone() as Arc<dyn FixAttemptTracker>;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![],
             notifier,
@@ -8249,7 +8275,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         sqlite.record_attempt("test", "1", "T-1").unwrap();
         let attempt = sqlite.get_attempt("test", "1").unwrap().unwrap();
@@ -8281,7 +8307,7 @@ mod tests {
         config.learning.cluster_detection = false;
         config.learning.cross_repo_correlation = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -8302,7 +8328,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         // Should complete without panicking
         watcher.run_periodic_learning().await;
@@ -8321,7 +8347,7 @@ mod tests {
         config.learning.cluster_detection = true;
         config.learning.cross_repo_correlation = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source],
             notifier,
@@ -8342,7 +8368,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         // Should complete without panicking even with no data
         watcher.run_periodic_learning().await;
@@ -8360,7 +8386,7 @@ mod tests {
         config.learning.cross_repo_correlation = true;
         config.learning.cross_repo_window_hours = 24;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -8381,7 +8407,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         watcher.run_periodic_learning().await;
     }
@@ -8398,7 +8424,7 @@ mod tests {
         config.learning.cluster_detection = false;
         config.learning.cross_repo_correlation = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -8419,7 +8445,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         watcher.run_periodic_learning().await;
     }
@@ -8435,7 +8461,7 @@ mod tests {
         config.learning.quality_scoring = false;
         config.learning.auto_agent_md = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -8456,7 +8482,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = claudear_core::types::FixAttempt {
             id: 1,
@@ -8493,7 +8519,7 @@ mod tests {
         config.learning.quality_scoring = false;
         config.learning.auto_agent_md = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -8514,7 +8540,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = claudear_core::types::FixAttempt {
             id: 1,
@@ -8552,7 +8578,7 @@ mod tests {
         config.learning.quality_scoring = false;
         config.learning.auto_agent_md = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -8573,7 +8599,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = claudear_core::types::FixAttempt {
             id: 1,
@@ -8611,7 +8637,7 @@ mod tests {
         config.learning.quality_scoring = true;
         config.learning.auto_agent_md = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -8632,7 +8658,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = claudear_core::types::FixAttempt {
             id: 1,
@@ -8670,7 +8696,7 @@ mod tests {
         config.learning.quality_scoring = false;
         config.learning.auto_agent_md = true;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -8691,7 +8717,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = claudear_core::types::FixAttempt {
             id: 1,
@@ -8723,7 +8749,7 @@ mod tests {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = sqlite.clone() as Arc<dyn FixAttemptTracker>;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![],
             notifier,
@@ -8744,7 +8770,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         // Create a chain: root -> child -> grandchild
         sqlite.record_attempt("test", "root", "ROOT").unwrap();
@@ -8777,7 +8803,7 @@ mod tests {
         config.cascade.enabled = true;
         config.cascade.max_depth = 0; // Unlimited
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -8798,7 +8824,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         sqlite.record_attempt("test", "root", "ROOT").unwrap();
         let root = sqlite.get_attempt("test", "root").unwrap().unwrap();
@@ -8906,7 +8932,7 @@ mod tests {
         let mut config = test_config();
         config.prioritisation.enabled = true;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source.clone()],
             notifier,
@@ -8927,7 +8953,7 @@ mod tests {
             classification_agent: None,
             dry_run: true,
             llm_engine: None,
-        });
+        }));
 
         let result = watcher.poll_source(&source).await;
         assert!(result.is_ok());
@@ -9132,7 +9158,7 @@ mod tests {
 
         let relationships = RepoRelationships::new();
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![
                 Arc::new(MockSource::new("s1")) as Arc<dyn IssueSource>,
@@ -9156,7 +9182,7 @@ mod tests {
             classification_agent: None,
             dry_run: true,
             llm_engine: None,
-        });
+        }));
 
         assert!(watcher.dry_run);
         assert!(watcher.relationships.is_some());
@@ -9185,7 +9211,7 @@ mod tests {
         config.retry.max_delay_ms = 0;
         config.processing_delay_ms = 0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source],
             notifier,
@@ -9206,7 +9232,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
         watcher.is_running.store(true, Ordering::SeqCst);
 
         // Mark the issue as currently processing
@@ -9254,7 +9280,7 @@ mod tests {
         config.retry.base_delay_ms = 0;
         config.retry.max_delay_ms = 0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source],
             notifier,
@@ -9275,7 +9301,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
         // NOT setting is_running - should break the retry loop early
         watcher.is_running.store(false, Ordering::SeqCst);
 
@@ -9370,7 +9396,7 @@ mod tests {
             .add_dependency("upstream-lib", "downstream-app", DependencyType::Npm, None)
             .unwrap();
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -9391,7 +9417,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = FixAttempt {
             id: 1,
@@ -9548,7 +9574,7 @@ mod tests {
         // Global limit is 10 but we want to verify it applies
         config.max_issues_per_cycle = 2;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source.clone()],
             notifier,
@@ -9569,7 +9595,7 @@ mod tests {
             classification_agent: None,
             dry_run: true,
             llm_engine: None,
-        });
+        }));
 
         watcher.poll_source(&source).await.unwrap();
 
@@ -9625,7 +9651,7 @@ mod tests {
             )
             .unwrap();
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -9646,7 +9672,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let attempt = FixAttempt {
             id: 1,
@@ -9688,7 +9714,7 @@ mod tests {
         let mut config = test_config();
         config.learning.cluster_detection = true;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -9709,7 +9735,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let base = "Fix the auth bug";
         let issue = test_issue();
@@ -9798,7 +9824,7 @@ mod tests {
         let tracker = sqlite.clone() as Arc<dyn FixAttemptTracker>;
 
         // This tests the branch where tracker is a real SqliteTracker
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![],
             notifier,
@@ -9819,7 +9845,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         // Just verify the watcher was created successfully with feedback_analyzer initialized
         assert!(!watcher.is_running());
@@ -9831,7 +9857,7 @@ mod tests {
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
 
         // This tests the branch where tracker has default impl
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![],
             notifier,
@@ -9852,7 +9878,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         assert!(!watcher.is_running());
     }
@@ -10006,7 +10032,7 @@ mod tests {
         config.retry.max_delay_ms = 0;
         config.processing_delay_ms = 50; // Small delay
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source],
             notifier,
@@ -10027,7 +10053,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
         watcher.is_running.store(true, Ordering::SeqCst);
 
         let result = watcher.process_ready_retries().await;
@@ -10052,7 +10078,7 @@ mod tests {
         config.learning.quality_scoring = false;
         config.learning.auto_agent_md = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -10073,7 +10099,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         sqlite.record_attempt("test", "1", "T-1").unwrap();
         let attempt = sqlite.get_attempt("test", "1").unwrap().unwrap();
@@ -10113,8 +10139,8 @@ mod tests {
         notifier: Arc<dyn Notifier>,
         tracker: Arc<SqliteTracker>,
         sources: Vec<Arc<dyn IssueSource>>,
-    ) -> Watcher {
-        Watcher::new(WatcherOptions {
+    ) -> Arc<Watcher> {
+        Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources,
             notifier,
@@ -10135,7 +10161,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        })
+        }))
     }
 
     #[tokio::test]
@@ -10475,7 +10501,7 @@ mod tests {
         config.learning.cluster_detection = false;
         config.learning.cross_repo_correlation = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -10496,7 +10522,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         // Should complete instantly with all learning disabled
         watcher.run_periodic_learning().await;
@@ -10604,7 +10630,7 @@ mod tests {
             Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
         let mock_agent: Arc<dyn AgentRunner> = Arc::new(MockAgent);
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![],
             notifier: Arc::new(claudear_integrations::notifier::ConsoleNotifier),
@@ -10622,7 +10648,7 @@ mod tests {
             dry_run: true,
             llm_engine: None,
             agent: mock_agent,
-        });
+        }));
 
         // Verify the watcher was created successfully with a non-Claude agent
         assert!(watcher.config.workspace.to_str().is_some());
@@ -10684,7 +10710,7 @@ mod tests {
 
         let agent: Arc<dyn AgentRunner> = Arc::new(orchestrator);
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config: test_config(),
             sources: vec![],
             notifier: Arc::new(claudear_integrations::notifier::ConsoleNotifier),
@@ -10702,7 +10728,7 @@ mod tests {
             dry_run: true,
             llm_engine: None,
             agent,
-        });
+        }));
 
         assert!(watcher.config.workspace.to_str().is_some());
     }
@@ -10918,7 +10944,7 @@ mod tests {
         config.code_index.enabled = false;
         config.code_index.reindex_interval_hours = 6.0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -10939,7 +10965,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         assert!(watcher.reindex_interval().is_none());
     }
@@ -10952,7 +10978,7 @@ mod tests {
         config.code_index.enabled = true;
         config.code_index.reindex_interval_hours = 0.0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -10973,7 +10999,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         assert!(watcher.reindex_interval().is_none());
     }
@@ -10986,7 +11012,7 @@ mod tests {
         config.code_index.enabled = true;
         config.code_index.reindex_interval_hours = -1.0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -11007,7 +11033,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         assert!(watcher.reindex_interval().is_none());
     }
@@ -11020,7 +11046,7 @@ mod tests {
         config.code_index.enabled = true;
         config.code_index.reindex_interval_hours = 2.0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -11041,7 +11067,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let interval = watcher.reindex_interval().unwrap();
         assert_eq!(interval, std::time::Duration::from_secs(7200));
@@ -11055,7 +11081,7 @@ mod tests {
         config.code_index.enabled = true;
         config.code_index.reindex_interval_hours = 0.5; // 30 minutes
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -11076,7 +11102,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let interval = watcher.reindex_interval().unwrap();
         assert_eq!(interval, std::time::Duration::from_secs(1800));
@@ -11437,7 +11463,7 @@ mod tests {
         let mut config = test_config();
         config.cascade.enabled = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -11458,7 +11484,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let result = watcher.check_releases_and_cascade().await;
         assert!(result.is_ok());
@@ -11479,7 +11505,7 @@ mod tests {
             instructions: None,
         }];
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -11500,7 +11526,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         let result = watcher.check_releases_and_cascade().await;
         assert!(result.is_ok());
@@ -11539,7 +11565,7 @@ mod tests {
         let mut config = test_config();
         config.code_index.enabled = false;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -11560,7 +11586,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         // Should return early without panicking
         watcher
@@ -11575,7 +11601,7 @@ mod tests {
         let mut config = test_config();
         config.code_index.enabled = true;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![],
             notifier,
@@ -11596,7 +11622,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
 
         // Should return early without panicking
         watcher
@@ -11759,7 +11785,7 @@ mod tests {
         config.retry.max_delay_ms = 0;
         config.processing_delay_ms = 0;
 
-        let watcher = Watcher::new(WatcherOptions {
+        let watcher = Arc::new(Watcher::new(WatcherOptions {
             config,
             sources: vec![source],
             notifier,
@@ -11780,7 +11806,7 @@ mod tests {
             classification_agent: None,
             dry_run: false,
             llm_engine: None,
-        });
+        }));
         watcher.is_running.store(true, Ordering::SeqCst);
 
         let result = watcher.process_ready_retries().await;
