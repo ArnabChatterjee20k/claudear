@@ -5,6 +5,7 @@
 pub mod auth;
 pub(crate) mod embedded;
 mod routes;
+mod security;
 
 pub use routes::{create_api_router, create_api_router_full, create_api_router_with_dashboard};
 
@@ -100,12 +101,14 @@ impl ApiServer {
                 http::header::CONTENT_TYPE,
                 http::header::AUTHORIZATION,
                 http::header::COOKIE,
+                http::HeaderName::from_static("x-csrf-token"),
             ])
             .allow_credentials(true);
 
         // Subscribe to indexing progress from the tracker's watch channel
         let indexing_rx = self.tracker.subscribe_indexing_progress();
 
+        let tls_enabled_for_csrf = self.config.tls.enabled;
         let app = create_api_router_with_dashboard(
             self.config.clone(),
             self.tracker.clone(),
@@ -113,6 +116,10 @@ impl ApiServer {
             indexing_rx,
             self.dashboard_dir.clone(),
         )
+        .layer(axum::middleware::from_fn(security::security_headers))
+        .layer(axum::middleware::from_fn(move |req, next| {
+            security::csrf_protection(req, next, tls_enabled_for_csrf)
+        }))
         .layer(cors)
         .layer(CookieManagerLayer::new())
         // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
@@ -158,8 +165,8 @@ impl ApiServer {
             );
         }
 
-        // Spawn background task to periodically clean up expired sessions.
-        // Runs every hour, cleaning up sessions past their expires_at timestamp.
+        // Spawn background task to periodically clean up expired and idle sessions.
+        // Runs every hour, cleaning up sessions past their expires_at or idle for 30+ minutes.
         let tracker_for_cleanup = self.tracker.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600));

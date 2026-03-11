@@ -45,6 +45,17 @@ static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant
 static IP_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Maximum number of API requests per user within the rate limit window.
+/// Applies to sensitive endpoints (profile, avatar, config, user management).
+const API_RATE_LIMIT_MAX_REQUESTS: usize = 30;
+
+/// Duration of the API rate limit window in seconds.
+const API_RATE_LIMIT_WINDOW_SECS: u64 = 60; // 1 minute
+
+/// In-memory rate limiter for sensitive API endpoints, keyed by user ID.
+static API_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<String, Vec<Instant>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Check if a login attempt is allowed for the given key (email).
 /// Returns true if the attempt is within rate limits, false if it should be rejected.
 fn check_login_rate_limit(key: &str) -> bool {
@@ -134,6 +145,43 @@ fn check_ip_rate_limit(ip: &str) -> bool {
     true
 }
 
+/// Reset the API rate limiter. Only for use in tests.
+#[cfg(test)]
+pub(crate) fn reset_api_rate_limiter() {
+    let mut limiter = API_RATE_LIMITER.lock().unwrap();
+    limiter.clear();
+}
+
+/// Check if an API request is allowed for the given user ID.
+/// Applied to sensitive endpoints like profile, avatar, config, and user management.
+pub(crate) fn check_api_rate_limit(user_id: i64) -> bool {
+    let key = user_id.to_string();
+    let mut limiter = match API_RATE_LIMITER.lock() {
+        Ok(l) => l,
+        Err(poisoned) => {
+            tracing::warn!("API rate limiter mutex was poisoned, recovering");
+            poisoned.into_inner()
+        }
+    };
+
+    let now = Instant::now();
+    let window = std::time::Duration::from_secs(API_RATE_LIMIT_WINDOW_SECS);
+
+    let attempts = limiter.entry(key).or_default();
+    attempts.retain(|t| now.duration_since(*t) < window);
+
+    if attempts.len() >= API_RATE_LIMIT_MAX_REQUESTS {
+        return false;
+    }
+
+    attempts.push(now);
+
+    // Sweep expired entries
+    limiter.retain(|_, v| !v.is_empty() && v.iter().any(|t| now.duration_since(*t) < window));
+
+    true
+}
+
 /// Extract the client IP address from request headers.
 /// Checks `x-forwarded-for` first, then `x-real-ip`, then falls back to "unknown".
 fn extract_client_ip(headers: &HeaderMap) -> String {
@@ -193,6 +241,9 @@ impl FromRequestParts<ApiState> for AuthUser {
             .get_session_user(&token)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .ok_or(StatusCode::UNAUTHORIZED)?;
+
+        // Refresh the idle session timeout on every authenticated request
+        let _ = state.tracker.touch_session(&token);
 
         let auth_user = AuthUser {
             id: user.id,
@@ -442,6 +493,10 @@ pub async fn update_profile_handler(
     State(state): State<ApiState>,
     Json(body): Json<UpdateProfileRequest>,
 ) -> Result<Json<UserResponse>, StatusCode> {
+    if !check_api_rate_limit(user.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     // Validate name if provided
     if let Some(ref name) = body.name {
         if name.trim().is_empty() {
@@ -532,6 +587,9 @@ pub async fn upload_avatar_handler(
     State(state): State<ApiState>,
     mut multipart: axum::extract::Multipart,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !check_api_rate_limit(user.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     const MAX_SIZE: usize = 5 * 1024 * 1024; // 5MB
     const ALLOWED_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
@@ -667,6 +725,10 @@ pub async fn create_user_handler(
     State(state): State<ApiState>,
     Json(body): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<UserResponse>), StatusCode> {
+    if !check_api_rate_limit(_admin.0.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     // Validate role
     if body.role != "admin" && body.role != "viewer" {
         return Err(StatusCode::BAD_REQUEST);
@@ -737,6 +799,10 @@ pub async fn update_user_handler(
     Path(id): Path<i64>,
     Json(body): Json<UpdateUserRequest>,
 ) -> Result<Json<UserResponse>, StatusCode> {
+    if !check_api_rate_limit(_admin.0.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     // Validate role if provided
     if let Some(ref role) = body.role {
         if role != "admin" && role != "viewer" {
@@ -804,6 +870,10 @@ pub async fn delete_user_handler(
     State(state): State<ApiState>,
     Path(id): Path<i64>,
 ) -> Result<Json<MessageResponse>, StatusCode> {
+    if !check_api_rate_limit(admin.0.id) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+
     // Can't delete yourself
     if admin.0.id == id {
         return Err(StatusCode::BAD_REQUEST);
@@ -883,6 +953,9 @@ mod tests {
         axum::Router,
         std::sync::Arc<dyn claudear_storage::FixAttemptTracker>,
     ) {
+        // Reset API rate limiter to prevent cross-test interference
+        reset_api_rate_limiter();
+
         let tracker: std::sync::Arc<dyn claudear_storage::FixAttemptTracker> =
             std::sync::Arc::new(SqliteTracker::in_memory().unwrap());
         let indexing_rx = tracker.subscribe_indexing_progress();
@@ -2355,6 +2428,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_with_valid_png() {
+        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2423,6 +2497,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_invalid_content_type() {
+        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2476,6 +2551,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_wrong_magic_bytes() {
+        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2535,6 +2611,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_no_avatar_field() {
+        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");
@@ -2589,6 +2666,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_upload_avatar_valid_jpeg() {
+        reset_api_rate_limiter();
         let temp_dir = tempfile::TempDir::new().unwrap();
         let storage_dir = temp_dir.path().to_path_buf();
         let avatars_dir = storage_dir.join("avatars");

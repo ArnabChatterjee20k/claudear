@@ -2459,6 +2459,13 @@ async fn put_config_handler(
     State(state): State<ApiState>,
     Json(body): Json<ConfigUpdateRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !check_api_rate_limit(_user.0.id) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "Rate limit exceeded" })),
+        ));
+    }
+
     let parsed = toml::from_str::<Config>(&body.content).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
