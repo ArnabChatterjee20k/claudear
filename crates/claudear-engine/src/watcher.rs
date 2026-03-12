@@ -30,7 +30,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::time::{interval, Duration};
 
 /// Extracts the source name from a processing key of the form "source:issue_id".
@@ -191,8 +191,10 @@ pub struct Watcher {
     feedback_analyzer: tokio::sync::Mutex<FeedbackAnalyzer>,
     /// Last seen release tag per upstream repo (for release-triggered cascades).
     last_seen_releases: RwLock<HashMap<String, String>>,
-    /// Transient watcher pause for provider rate limits (clears on restart).
-    rate_limit_pause_until: RwLock<Option<DateTime<Utc>>>,
+    /// Per-provider rate-limit pause times (clears on restart).
+    rate_limit_pause_until: RwLock<HashMap<String, DateTime<Utc>>>,
+    /// Notifies waiters when a processing slot becomes available.
+    slot_available: Notify,
     /// Optional LLM analyzer for enhanced analysis across the pipeline.
     llm_analyzer: Option<Arc<crate::llm_analyzer::LlmAnalyzerImpl>>,
     /// Join handles for spawned issue-processing tasks (used by tests to drain).
@@ -250,7 +252,8 @@ impl Watcher {
             active_processing: AtomicUsize::new(0),
             feedback_analyzer: tokio::sync::Mutex::new(feedback_analyzer),
             last_seen_releases: RwLock::new(HashMap::new()),
-            rate_limit_pause_until: RwLock::new(None),
+            rate_limit_pause_until: RwLock::new(HashMap::new()),
+            slot_available: Notify::new(),
             llm_analyzer,
             spawn_handles: tokio::sync::Mutex::new(Vec::new()),
         }
@@ -2160,10 +2163,6 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Run housekeeping tasks: retries, cascades, and metrics.
     /// Called on the global timer, separate from per-source polling.
     pub async fn run_housekeeping_cycle(&self) -> Result<()> {
-        if self.is_rate_limit_paused().await {
-            return Ok(());
-        }
-
         let housekeeping_started_at = std::time::Instant::now();
 
         // Run retries, PR merge cascades, and release cascades concurrently
@@ -2325,7 +2324,7 @@ Create a PR with your changes.{custom_instructions}"#,
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                self.slot_available.notified().await;
             }
 
             tracing::info!(
@@ -3028,14 +3027,14 @@ Create a PR with your changes.{custom_instructions}"#,
                 if !self.is_running.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                if self.is_rate_limit_paused().await {
+                if self.is_provider_rate_limited().await {
                     tracing::info!(
                         source = source.name(),
-                        "Stopping source batch while waiting for slot due to Claude rate-limit pause"
+                        "Stopping source batch while waiting for slot due to provider rate-limit pause"
                     );
                     return Ok(());
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                self.slot_available.notified().await;
             }
 
             // Spawn processing as a background task so poll_source returns
@@ -3418,6 +3417,7 @@ Create a PR with your changes.{custom_instructions}"#,
             processing.remove(&processing_key);
         }
         self.active_processing.fetch_sub(1, Ordering::SeqCst);
+        self.slot_available.notify_waiters();
 
         // Return false for semantic duplicate skips (don't count as processed),
         // true for everything else
@@ -3426,47 +3426,64 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     async fn clear_rate_limit_pause(&self) {
-        let mut pause_until = self.rate_limit_pause_until.write().await;
-        if pause_until.take().is_some() {
+        let mut pauses = self.rate_limit_pause_until.write().await;
+        if !pauses.is_empty() {
             tracing::info!(
                 component = "watcher",
-                "Cleared transient rate-limit pause on watcher start"
+                providers = ?pauses.keys().collect::<Vec<_>>(),
+                "Cleared transient rate-limit pauses on watcher start"
             );
+            pauses.clear();
         }
     }
 
+    /// Check if the default agent provider is rate-limited.
+    ///
+    /// This is used for top-level poll/housekeeping guards where we don't know the
+    /// specific provider yet. Returns `true` only if the default provider is paused.
     pub async fn is_rate_limit_paused(&self) -> bool {
-        let now = Utc::now();
-        let mut pause_until = self.rate_limit_pause_until.write().await;
-        let expired_until = match *pause_until {
-            Some(until) if until > now => return true,
-            Some(until) => {
-                *pause_until = None;
-                Some(until)
-            }
-            None => None,
-        };
-        drop(pause_until);
+        self.is_provider_rate_limited_for(&self.config.agent.default_provider)
+            .await
+    }
 
-        if let Some(until) = expired_until {
+    /// Check if ANY provider is rate-limited (used for poll-level guards).
+    async fn is_provider_rate_limited(&self) -> bool {
+        let now = Utc::now();
+        let pauses = self.rate_limit_pause_until.read().await;
+        pauses.values().any(|until| *until > now)
+    }
+
+    /// Check if a specific provider is rate-limited. Cleans up expired entries.
+    async fn is_provider_rate_limited_for(&self, provider: &str) -> bool {
+        let now = Utc::now();
+        let mut pauses = self.rate_limit_pause_until.write().await;
+        if let Some(&until) = pauses.get(provider) {
+            if until > now {
+                return true;
+            }
+            // Expired — remove and log
+            pauses.remove(provider);
+            drop(pauses);
+
             tracing::info!(
                 component = "watcher",
+                provider = provider,
                 reset_at = %until.to_rfc3339(),
-                "Claude rate-limit pause expired; resuming watcher"
+                "Provider rate-limit pause expired; resuming"
             );
             let activity = ActivityLogEntry::new(
                 "watcher_resumed",
-                "Watcher resumed after Claude rate-limit pause",
+                format!("Watcher resumed after {} rate-limit pause", provider),
             )
             .with_source("watcher".to_string())
             .with_metadata(json!({
-                "reason": "claude_rate_limit",
+                "reason": "provider_rate_limit",
+                "provider": provider,
                 "resumed_at": now.to_rfc3339(),
                 "previous_pause_until": until.to_rfc3339(),
             }));
             self.tracker.record_activity(&activity).ok();
         }
-
         false
     }
 
@@ -3475,23 +3492,24 @@ Create a PR with your changes.{custom_instructions}"#,
         issue: &Issue,
         error: &str,
     ) -> Option<DateTime<Utc>> {
+        let provider = self.agent.name().to_string();
         let now = Utc::now();
         let parsed_reset = Self::extract_rate_limit_reset_time(error, now);
         let fallback_reset = now + chrono::Duration::minutes(15);
         let pause_target = parsed_reset.unwrap_or(fallback_reset) + chrono::Duration::minutes(1);
         let reset_time_parsed = parsed_reset.is_some();
 
-        let mut pause_until = self.rate_limit_pause_until.write().await;
-        let previous = *pause_until;
+        let mut pauses = self.rate_limit_pause_until.write().await;
+        let previous = pauses.get(&provider).copied();
         let effective_until = match previous {
             Some(current) if current >= pause_target => current,
             _ => {
-                *pause_until = Some(pause_target);
+                pauses.insert(provider.clone(), pause_target);
                 pause_target
             }
         };
         let changed = previous != Some(effective_until);
-        drop(pause_until);
+        drop(pauses);
 
         if changed {
             tracing::warn!(
@@ -3499,17 +3517,18 @@ Create a PR with your changes.{custom_instructions}"#,
                 short_id = %issue.short_id,
                 pause_until = %effective_until.to_rfc3339(),
                 reset_time_parsed,
-                "Pausing watcher after Claude rate limit"
+                "Pausing provider after rate limit"
             );
 
             self.record_issue_decision(
                 issue,
                 "watcher_rate_limit_pause",
                 format!(
-                    "Pausing watcher due to Claude rate limit for {}",
-                    issue.short_id
+                    "Pausing provider {} due to rate limit for {}",
+                    provider, issue.short_id
                 ),
                 json!({
+                    "provider": provider,
                     "pause_until": effective_until.to_rfc3339(),
                     "reset_time_parsed": reset_time_parsed,
                     "error": crate::processing::truncate_error_for_activity(error),
@@ -3519,14 +3538,16 @@ Create a PR with your changes.{custom_instructions}"#,
             let activity = ActivityLogEntry::new(
                 "watcher_paused",
                 format!(
-                    "Watcher paused due to Claude rate limit until {}",
+                    "Provider {} paused due to rate limit until {}",
+                    provider,
                     effective_until.to_rfc3339()
                 ),
             )
             .with_source("watcher".to_string())
             .with_issue(issue.id.clone(), issue.short_id.clone())
             .with_metadata(json!({
-                "reason": "claude_rate_limit",
+                "reason": "provider_rate_limit",
+                "provider": provider,
                 "pause_until": effective_until.to_rfc3339(),
                 "reset_time_parsed": reset_time_parsed,
                 "fallback_minutes": if reset_time_parsed { None::<u32> } else { Some(15) },
@@ -11338,8 +11359,11 @@ mod tests {
 
         // Set pause until far in the future
         {
-            let mut pause_until = watcher.rate_limit_pause_until.write().await;
-            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+            let mut pauses = watcher.rate_limit_pause_until.write().await;
+            pauses.insert(
+                "claude".to_string(),
+                Utc::now() + chrono::Duration::hours(1),
+            );
         }
 
         assert!(watcher.is_rate_limit_paused().await);
@@ -11353,16 +11377,19 @@ mod tests {
 
         // Set pause until the past
         {
-            let mut pause_until = watcher.rate_limit_pause_until.write().await;
-            *pause_until = Some(Utc::now() - chrono::Duration::seconds(10));
+            let mut pauses = watcher.rate_limit_pause_until.write().await;
+            pauses.insert(
+                "claude".to_string(),
+                Utc::now() - chrono::Duration::seconds(10),
+            );
         }
 
         // Should return false and clear the expired pause
         assert!(!watcher.is_rate_limit_paused().await);
 
         // Verify it was cleared
-        let pause = watcher.rate_limit_pause_until.read().await;
-        assert!(pause.is_none());
+        let pauses = watcher.rate_limit_pause_until.read().await;
+        assert!(pauses.is_empty());
     }
 
     #[tokio::test]
@@ -11372,14 +11399,17 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, vec![], false);
 
         {
-            let mut pause_until = watcher.rate_limit_pause_until.write().await;
-            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+            let mut pauses = watcher.rate_limit_pause_until.write().await;
+            pauses.insert(
+                "claude".to_string(),
+                Utc::now() + chrono::Duration::hours(1),
+            );
         }
 
         watcher.clear_rate_limit_pause().await;
 
-        let pause = watcher.rate_limit_pause_until.read().await;
-        assert!(pause.is_none());
+        let pauses = watcher.rate_limit_pause_until.read().await;
+        assert!(pauses.is_empty());
     }
 
     #[tokio::test]
@@ -11391,8 +11421,8 @@ mod tests {
         // Should not panic when nothing to clear
         watcher.clear_rate_limit_pause().await;
 
-        let pause = watcher.rate_limit_pause_until.read().await;
-        assert!(pause.is_none());
+        let pauses = watcher.rate_limit_pause_until.read().await;
+        assert!(pauses.is_empty());
     }
 
     // --- pause_until_rate_limit_reset ---
@@ -11409,8 +11439,8 @@ mod tests {
         let result = watcher.pause_until_rate_limit_reset(&issue, error).await;
         assert!(result.is_some());
 
-        let pause = watcher.rate_limit_pause_until.read().await;
-        assert!(pause.is_some());
+        let pauses = watcher.rate_limit_pause_until.read().await;
+        assert!(pauses.contains_key("claude"));
     }
 
     #[tokio::test]
@@ -11427,8 +11457,8 @@ mod tests {
         assert!(result.is_some());
 
         // Fallback is 15 minutes + 1 minute buffer
-        let pause = watcher.rate_limit_pause_until.read().await;
-        assert!(pause.is_some());
+        let pauses = watcher.rate_limit_pause_until.read().await;
+        assert!(pauses.contains_key("claude"));
     }
 
     #[tokio::test]
@@ -11440,8 +11470,8 @@ mod tests {
         // Set a pause until far in the future
         let far_future = Utc::now() + chrono::Duration::hours(24);
         {
-            let mut pause_until = watcher.rate_limit_pause_until.write().await;
-            *pause_until = Some(far_future);
+            let mut pauses = watcher.rate_limit_pause_until.write().await;
+            pauses.insert("claude".to_string(), far_future);
         }
 
         let issue = test_issue();
@@ -11450,8 +11480,8 @@ mod tests {
         watcher.pause_until_rate_limit_reset(&issue, error).await;
 
         // The pause should NOT be lowered below the existing far_future value
-        let pause = watcher.rate_limit_pause_until.read().await;
-        assert!(pause.unwrap() >= far_future);
+        let pauses = watcher.rate_limit_pause_until.read().await;
+        assert!(*pauses.get("claude").unwrap() >= far_future);
     }
 
     // --- check_releases_and_cascade early returns ---
@@ -11667,8 +11697,11 @@ mod tests {
 
         // Set pause until the future
         {
-            let mut pause_until = watcher.rate_limit_pause_until.write().await;
-            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+            let mut pauses = watcher.rate_limit_pause_until.write().await;
+            pauses.insert(
+                "claude".to_string(),
+                Utc::now() + chrono::Duration::hours(1),
+            );
         }
 
         let result = watcher.poll().await;
@@ -11684,24 +11717,27 @@ mod tests {
     // --- run_housekeeping_cycle when rate limited ---
 
     #[tokio::test]
-    async fn test_run_housekeeping_cycle_returns_early_when_rate_limited() {
+    async fn test_run_housekeeping_cycle_runs_even_when_provider_rate_limited() {
         let notifier = Arc::new(MockNotifier::new(true));
         let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
         let watcher = create_test_watcher(notifier, tracker.clone(), vec![], false);
 
         {
-            let mut pause_until = watcher.rate_limit_pause_until.write().await;
-            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+            let mut pauses = watcher.rate_limit_pause_until.write().await;
+            pauses.insert(
+                "claude".to_string(),
+                Utc::now() + chrono::Duration::hours(1),
+            );
         }
 
         let result = watcher.run_housekeeping_cycle().await;
         assert!(result.is_ok());
 
-        // No housekeeping metrics recorded
+        // Housekeeping metrics SHOULD be recorded (housekeeping is not blocked by provider rate limits)
         let duration = tracker
             .get_metrics("housekeeping_cycle_duration_secs", None, 10)
             .unwrap();
-        assert!(duration.is_empty());
+        assert!(!duration.is_empty());
     }
 
     // --- poll_source when rate limited ---
@@ -11723,8 +11759,11 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker.clone(), vec![source.clone()], false);
 
         {
-            let mut pause_until = watcher.rate_limit_pause_until.write().await;
-            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+            let mut pauses = watcher.rate_limit_pause_until.write().await;
+            pauses.insert(
+                "claude".to_string(),
+                Utc::now() + chrono::Duration::hours(1),
+            );
         }
 
         let result = watcher.poll_source(&source).await;
@@ -11748,8 +11787,11 @@ mod tests {
         let watcher = create_test_watcher(notifier, tracker, vec![source.clone()], false);
 
         {
-            let mut pause_until = watcher.rate_limit_pause_until.write().await;
-            *pause_until = Some(Utc::now() + chrono::Duration::hours(1));
+            let mut pauses = watcher.rate_limit_pause_until.write().await;
+            pauses.insert(
+                "claude".to_string(),
+                Utc::now() + chrono::Duration::hours(1),
+            );
         }
 
         let match_result = MatchResult::matched("Test", MatchPriority::Normal);
