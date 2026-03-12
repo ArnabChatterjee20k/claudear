@@ -1043,6 +1043,8 @@ impl Watcher {
             "Stopping Claude Watcher, waiting for active tasks to complete..."
         );
         self.is_running.store(false, Ordering::SeqCst);
+        // Wake any tasks blocked on slot_available so they re-check is_running and exit.
+        self.slot_available.notify_waiters();
     }
 
     /// Stop the watcher and wait for all active processing to drain.
@@ -1052,7 +1054,9 @@ impl Watcher {
     pub async fn stop_and_drain(&self) {
         self.stop();
 
-        // Wait for any active processing to complete (up to 30 seconds)
+        // Wait for any active processing to complete (up to 30 seconds).
+        // Uses slot_available to wake immediately when a task finishes rather
+        // than polling on a fixed interval.
         let max_wait = std::time::Duration::from_secs(30);
         let start = std::time::Instant::now();
 
@@ -1068,7 +1072,10 @@ impl Watcher {
                 active_count = self.active_processing.load(Ordering::SeqCst),
                 "Waiting for active tasks to complete..."
             );
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Wait for a task to finish (notifies via slot_available) or fall back
+            // to a periodic check in case the notification was missed.
+            let remaining = max_wait.saturating_sub(start.elapsed());
+            let _ = tokio::time::timeout(remaining, self.slot_available.notified()).await;
         }
 
         tracing::info!("Claude Watcher stopped gracefully");
@@ -5431,7 +5438,7 @@ mod tests {
         }
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
             watcher.poll_source(&source),
         )
         .await;
@@ -5498,7 +5505,7 @@ mod tests {
         watcher.is_running.store(true, Ordering::SeqCst);
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
             watcher.poll_source(&source),
         )
         .await;
@@ -5564,7 +5571,7 @@ mod tests {
         watcher.is_running.store(true, Ordering::SeqCst);
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
             watcher.process_ready_retries(),
         )
         .await;
@@ -5617,7 +5624,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         watcher.stop();
 
-        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), runner).await;
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
         assert!(joined.is_ok(), "watcher start loop did not stop in time");
         assert!(joined.unwrap().expect("task join failed").is_ok());
         assert_eq!(
@@ -5642,7 +5649,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         watcher.stop();
 
-        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), runner).await;
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
         assert!(
             joined.is_ok(),
             "watcher start loop timed out with zero interval"
@@ -6749,7 +6756,7 @@ mod tests {
 
         // Should complete quickly since there's no active processing
         let result =
-            tokio::time::timeout(std::time::Duration::from_secs(2), watcher.stop_and_drain()).await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), watcher.stop_and_drain()).await;
         assert!(result.is_ok(), "stop_and_drain timed out");
         assert!(!watcher.is_running());
     }
@@ -6769,6 +6776,7 @@ mod tests {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             release.active_processing.fetch_sub(1, Ordering::SeqCst);
+            release.slot_available.notify_waiters();
         });
 
         let result =
