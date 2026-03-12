@@ -91,6 +91,10 @@ enum Commands {
         /// Disable dashboard API
         #[arg(long)]
         no_dashboard: bool,
+
+        /// Run in the foreground instead of daemonizing (useful for systemd/launchd)
+        #[arg(long)]
+        foreground: bool,
     },
 
     /// Stop the running watcher daemon
@@ -575,7 +579,7 @@ fn print_startup_banner_and_status(
 ) {
     println!();
     println!("    ╔═╗ ╦   ╔═╗ ╦ ╦ ╔╦╗ ╔═╗ ╔═╗ ╦═╗");
-    println!("    ║   ║   ╠═╣ ║ ║ ║║║ ║╣  ╠═╣ ╠╦╝");
+    println!("    ║   ║   ╠═╣ ║ ║ ║ ║ ║╣  ╠═╣ ╠╦╝");
     println!("    ╚═╝ ╩═╝ ╩ ╩ ╚═╝ ╚╩╝ ╚═╝ ╩ ╩ ╩╚═");
     println!();
     println!("    v{}", env!("CARGO_PKG_VERSION"));
@@ -1516,10 +1520,91 @@ fn enrich_path_from_login_shell() {
     }
 }
 
+/// Daemonize the current process using the classic double-fork pattern.
+///
+/// 1. First fork: parent prints the daemon PID and exits, returning control to the shell.
+/// 2. Child calls `setsid()` to become a session leader (detach from terminal).
+/// 3. Second fork: ensures the daemon cannot reacquire a controlling terminal.
+/// 4. Grandchild redirects stdin/stdout/stderr to `/dev/null` and continues execution.
+///
+/// This must be called BEFORE the tokio runtime is created — forking after
+/// spawning threads leads to undefined behaviour.
+#[cfg(unix)]
+fn daemonize() -> anyhow::Result<()> {
+    use std::ffi::CString;
+
+    // First fork
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        anyhow::bail!("First fork failed: {}", std::io::Error::last_os_error());
+    }
+    if pid > 0 {
+        // Parent: wait briefly for the child to setsid + second-fork so we can
+        // report the final daemon PID. The child writes it to the PID file path
+        // as a temp signal file, then we read it.
+        //
+        // Simpler approach: the first child will print the PID and the parent just exits.
+        // We don't know the grandchild PID here, so the child will print it.
+        std::process::exit(0);
+    }
+
+    // First child: create a new session
+    if unsafe { libc::setsid() } < 0 {
+        anyhow::bail!("setsid failed: {}", std::io::Error::last_os_error());
+    }
+
+    // Second fork
+    let pid2 = unsafe { libc::fork() };
+    if pid2 < 0 {
+        anyhow::bail!("Second fork failed: {}", std::io::Error::last_os_error());
+    }
+    if pid2 > 0 {
+        // First child exits — grandchild is now fully detached
+        std::process::exit(0);
+    }
+
+    // Grandchild: this is the actual daemon process.
+    // Print the PID so users know what to expect (goes to original stdout before redirect).
+    eprintln!("Daemon started (PID: {})", std::process::id());
+
+    // Change working directory to / to avoid holding mount points
+    // (skip this — claudear needs its working dir for config and repos)
+
+    // Set umask
+    unsafe { libc::umask(0o027) };
+
+    // Redirect stdin/stdout/stderr to /dev/null
+    let devnull = CString::new("/dev/null").unwrap();
+    unsafe {
+        let fd = libc::open(devnull.as_ptr(), libc::O_RDWR);
+        if fd >= 0 {
+            libc::dup2(fd, libc::STDIN_FILENO);
+            libc::dup2(fd, libc::STDOUT_FILENO);
+            libc::dup2(fd, libc::STDERR_FILENO);
+            if fd > libc::STDERR_FILENO {
+                libc::close(fd);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     // Resolve the user's login shell PATH so that user-local binaries
     // (e.g. claude via nvm/node) are discoverable when started via systemd.
     enrich_path_from_login_shell();
+
+    // Parse CLI args early so we can daemonize before creating the tokio runtime.
+    // Forking after spawning threads is undefined behaviour.
+    let cli = Cli::parse();
+
+    #[cfg(unix)]
+    if let Commands::Start { foreground, .. } = &cli.command {
+        if !foreground {
+            daemonize()?;
+        }
+    }
 
     // Initialize Sentry before the async runtime to ensure proper flushing on shutdown
     let _sentry_guard = sentry::init((
@@ -1545,11 +1630,10 @@ fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(async_main())
+        .block_on(async_main(cli))
 }
 
-async fn async_main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let verbose = cli.verbose;
 
     // Initialize logging (must keep _guard alive for file logging to work)
@@ -2971,6 +3055,7 @@ async fn async_main() -> anyhow::Result<()> {
         poll_interval,
         no_webhooks,
         no_dashboard,
+        foreground: _,
     } = &cli.command
     {
         if is_daemon_running() {
