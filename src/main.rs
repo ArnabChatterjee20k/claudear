@@ -572,25 +572,27 @@ fn print_startup_banner_and_status(
     config_path: &str,
     port: u16,
     enable_dashboard: bool,
+    enable_webhooks: bool,
     enable_polling: bool,
     poll_interval_ms: u64,
     inferrer_embedding_count: Option<usize>,
     user_registry: &UserRegistry,
 ) {
     println!();
-    println!(r"       ________    ___   __  ______  _________    ____");
-    println!(r"      / ____/ /   /   | / / / / __ \/ ____/   |  / __ \");
-    println!(r"     / /   / /   / /| |/ / / / / / / __/ / /| | / /_/ /");
-    println!(r"    / /___/ /___/ ___ / /_/ / /_/ / /___/ ___ |/ _, _/");
-    println!(r"    \____/_____/_/  |_\____/_____/_____/_/  |_/_/ |_|");
+    println!(" ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗ █████╗ ██████╗ ");
+    println!("██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝██╔══██╗██╔══██╗");
+    println!("██║     ██║     ███████║██║   ██║██║  ██║█████╗  ███████║██████╔╝");
+    println!("██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  ██╔══██║██╔══██╗");
+    println!("╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██║  ██║");
+    println!(" ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝");
     println!();
     println!("    v{}", env!("CARGO_PKG_VERSION"));
+    let host = dashboard_host_for_display(&config.bind_address);
     if enable_dashboard {
-        println!(
-            "    Dashboard: http://{}:{}",
-            dashboard_host_for_display(&config.bind_address),
-            port
-        );
+        println!("    Dashboard: http://{}:{}", host, port);
+    }
+    if enable_webhooks {
+        println!("    Webhooks:  http://{}:{}/webhook/{{source}}", host, port);
     }
     println!();
 
@@ -1645,7 +1647,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     } else {
         Some(cli.log_dir.as_path())
     };
-    let suppress_console_info = !verbose && matches!(&cli.command, Commands::Start { .. });
+    let suppress_console_info = !verbose
+        && matches!(
+            &cli.command,
+            Commands::Start { .. } | Commands::Webhook { .. } | Commands::Poll { .. }
+        );
     let _log_guard = init_logging(log_dir, verbose, suppress_console_info);
 
     let config_path = cli.config.clone();
@@ -3177,6 +3183,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             &config_path,
             *port,
             enable_dashboard,
+            enable_webhooks,
             enable_polling,
             *poll_interval,
             vector_store_embeddings,
@@ -3821,12 +3828,25 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             // Build shared watcher dependencies (needed for housekeeping)
             let deps = build_watcher_deps(&config, &tracker).await?;
+            let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
             let github_webhook_handler =
                 create_github_webhook_handler(&config, deps.review_watcher.clone());
 
             if handlers.get_all().is_empty() && github_webhook_handler.is_none() {
                 anyhow::bail!("No webhook handlers were registered");
             }
+
+            print_startup_banner_and_status(
+                &config,
+                &config_path,
+                port,
+                false, // dashboard not available in standalone webhook mode
+                true,  // webhooks
+                false, // polling
+                0,
+                vector_store_embeddings,
+                &user_registry,
+            );
 
             // Create a Watcher for housekeeping (retries, cascades, auto-close, etc.)
             let watcher = Arc::new(Watcher::new(WatcherOptions {
@@ -4097,6 +4117,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 });
 
             let tracker_for_api = tracker.clone();
+            let vector_store_embeddings = inferrer.as_ref().map(|i| i.embedding_count());
             let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
                 sources,
@@ -4149,6 +4170,18 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     port,
                     no_dashboard,
                 } => {
+                    print_startup_banner_and_status(
+                        &config,
+                        &config_path,
+                        port,
+                        !no_dashboard, // dashboard
+                        false,         // webhooks
+                        true,          // polling
+                        interval,
+                        vector_store_embeddings,
+                        &user_registry,
+                    );
+
                     // Keep regression monitoring active in foreground poll mode so merged bug
                     // fixes complete the regression-final-check -> resolve flow.
                     let _regression_handle = start_regression_monitoring(
@@ -4172,7 +4205,6 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             _ = shutdown => {}
                         }
                     } else {
-                        tracing::info!("Dashboard API available at http://localhost:{}", port);
                         let api_server = ApiServer::with_port(
                             config.clone(),
                             tracker_for_api.clone(),
