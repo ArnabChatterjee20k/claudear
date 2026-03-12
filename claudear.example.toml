@@ -227,6 +227,11 @@ webhook_secret = ""
 # Set to empty string to respond to all comments.
 review_trigger = "@claudear"
 
+# Bot usernames whose review comments should be processed (default: [])
+# When set, comments from these bots are treated like @claudear-tagged comments.
+# Use the bot's login name without the [bot] suffix (e.g., "copilot" matches "copilot[bot]").
+allowed_bots = []
+
 # Use SSH URLs for cloning instead of HTTPS (default: false)
 # Set to true if SSH keys are configured for GitHub.
 use_ssh = false
@@ -303,6 +308,10 @@ webhook_secret = ""
 
 # Trigger tag for MR review comments (default: @claudear)
 review_trigger = "@claudear"
+
+# Bot usernames whose MR comments should be processed (default: [])
+# When set, comments from these bots are treated like @claudear-tagged comments.
+allowed_bots = []
 
 # Use SSH URLs for cloning instead of HTTPS (default: false)
 use_ssh = false

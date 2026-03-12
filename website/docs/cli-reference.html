@@ -764,6 +764,34 @@ Options:
   -h, --help                 Print help</code></pre></div>
           </section>
         </section>
+
+        <h3 id="chat"><a class="anchor-link" href="#chat" aria-label="Link to chat">#</a><code>claudear chat</code></h3>
+        <p>Ask questions about your indexed codebase using a local LLM with RAG-based retrieval. Requires <code>[llm]</code> and <code>[chat]</code> to be enabled.</p>
+        <pre><code class="language-bash"># Interactive REPL
+claudear chat
+
+# Single question
+claudear chat "Where is the auth middleware defined?"
+
+# Scope to a specific repo
+claudear chat --repo my-org/my-repo "How does retry work?"
+
+# Use a custom model file
+claudear chat --model ~/.cache/claudear/models/custom.gguf
+
+# Download the default model if missing
+claudear chat --download-model</code></pre>
+        <div class="overflow-x-auto">
+          <table>
+            <thead><tr><th>Flag</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>[question]</code></td><td>Question to ask (omit for interactive REPL mode)</td></tr>
+              <tr><td><code>--repo &lt;name&gt;</code></td><td>Scope search to a specific repository</td></tr>
+              <tr><td><code>--model &lt;path&gt;</code></td><td>Path to a GGUF model file (overrides config)</td></tr>
+              <tr><td><code>--download-model</code></td><td>Download the default model if not present</td></tr>
+            </tbody>
+          </table>
+        </div>
       </article>
       <div class="docs-page-nav grid grid-cols-2 gap-4 pt-12 max-w-[780px]">
         <a href="./configuration.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors no-underline">
@@ -865,6 +893,7 @@ Options:
             <li class="toc-item toc-item-child" data-toc-text="users seed"><a class="toc-link toc-link-deep" data-toc-link href="#claudear-users-seed" data-target-id="claudear-users-seed"><span class="toc-link-label">seed</span></a></li>
           </ul>
         </li>
+        <li class="toc-item" data-toc-text="chat"><a class="toc-link toc-link-sub" data-toc-link href="#chat" data-target-id="chat"><span class="toc-link-label">chat</span></a></li>
         </ul>
         <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
       </div>

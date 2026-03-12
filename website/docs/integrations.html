@@ -120,8 +120,34 @@ token = "glpat-..."
 groups = ["your-group"]
 trigger_labels = ["claudear"]</code></pre>
 
-        <h3 id="messaging-sources"><a class="anchor-link" href="#messaging-sources" aria-label="Link to Discord / Slack as sources">#</a>Discord / Slack as sources</h3>
-        <p>Treat messages in a channel as issues. Uses the same credentials as your notifier config &mdash; just enable the source flag. Useful for incident channels and ad-hoc operational queues.</p>
+        <h3 id="messaging-sources"><a class="anchor-link" href="#messaging-sources" aria-label="Link to Messaging sources">#</a>Discord / Slack / Telegram / WhatsApp as sources</h3>
+        <p>Treat messages in a channel as issues. Useful for incident channels and ad-hoc operational queues.</p>
+
+        <p><strong>Discord</strong> &mdash; uses the same credentials as your notifier config:</p>
+        <pre><code class="language-toml">[issues.discord]
+bot_token = "your_bot_token"    # inherited from notifiers.discord if omitted
+listen_channel_id = "123456789"
+guild_id = "987654321"</code></pre>
+
+        <p><strong>Slack</strong> &mdash; uses the same credentials as your notifier config:</p>
+        <pre><code class="language-toml">[issues.slack]
+bot_token = "xoxb-..."          # inherited from notifiers.slack if omitted
+listen_channel_id = "C0123456789"
+workspace = "mycompany"</code></pre>
+
+        <p><strong>Telegram</strong> &mdash; enable <code>source_enabled</code> on the notifier config:</p>
+        <pre><code class="language-toml">[notifiers.telegram]
+bot_token = "123456:ABC-DEF..."
+chat_id = "123456789"
+source_enabled = true
+listen_chat_id = "123456789"    # optional override</code></pre>
+
+        <p><strong>WhatsApp</strong> &mdash; enable <code>source_enabled</code> on the notifier config:</p>
+        <pre><code class="language-toml">[notifiers.whatsapp]
+phone_number_id = "123456789"
+access_token = "EAAx..."
+source_enabled = true
+listen_phone_number_id = ""     # optional override</code></pre>
 
         <!-- ─── Source control ─── -->
         <h2 id="source-control"><a class="anchor-link" href="#source-control" aria-label="Link to Source control">#</a>Source control</h2>
@@ -178,7 +204,8 @@ from_address = "claudear@company.com"
 to_addresses = ["team@company.com"]</code></pre>
 
         <h3 id="delivery-only"><a class="anchor-link" href="#delivery-only" aria-label="Link to Delivery-only">#</a>Delivery-only</h3>
-        <p>SMS (Twilio), Push (Pushover), WhatsApp, and Telegram send notifications but cannot receive replies. Use these alongside a reply-capable channel for full coverage.</p>
+        <p>SMS (Twilio) and Push (Pushover) send notifications but cannot receive replies. Use these alongside a reply-capable channel for full coverage.</p>
+        <p><strong>Telegram</strong> and <strong>WhatsApp</strong> are notification channels that can also double as issue sources (see <a href="#messaging-sources">Messaging sources</a> above).</p>
 
         <!-- ─── User mapping ─── -->
         <h2 id="user-mapping"><a class="anchor-link" href="#user-mapping" aria-label="Link to User mapping">#</a>User mapping</h2>
@@ -227,7 +254,7 @@ email = "jake@company.com"</code></pre>
           <li class="toc-item" data-toc-text="jira"><a class="toc-link toc-link-sub" data-toc-link href="#jira" data-target-id="jira"><span class="toc-link-label">Jira</span></a></li>
           <li class="toc-item" data-toc-text="github issues"><a class="toc-link toc-link-sub" data-toc-link href="#github-issues" data-target-id="github-issues"><span class="toc-link-label">GitHub Issues</span></a></li>
           <li class="toc-item" data-toc-text="gitlab issues"><a class="toc-link toc-link-sub" data-toc-link href="#gitlab-issues" data-target-id="gitlab-issues"><span class="toc-link-label">GitLab Issues</span></a></li>
-          <li class="toc-item" data-toc-text="discord / slack as sources"><a class="toc-link toc-link-sub" data-toc-link href="#messaging-sources" data-target-id="messaging-sources"><span class="toc-link-label">Discord / Slack as sources</span></a></li>
+          <li class="toc-item" data-toc-text="messaging sources"><a class="toc-link toc-link-sub" data-toc-link href="#messaging-sources" data-target-id="messaging-sources"><span class="toc-link-label">Messaging sources</span></a></li>
           <li class="toc-item" data-toc-text="source control"><a class="toc-link" data-toc-link href="#source-control" data-target-id="source-control"><span class="toc-link-label">Source control</span></a></li>
           <li class="toc-item" data-toc-text="github pat"><a class="toc-link toc-link-sub" data-toc-link href="#github-pat" data-target-id="github-pat"><span class="toc-link-label">GitHub (PAT)</span></a></li>
           <li class="toc-item" data-toc-text="github app"><a class="toc-link toc-link-sub" data-toc-link href="#github-app" data-target-id="github-app"><span class="toc-link-label">GitHub App</span></a></li>
