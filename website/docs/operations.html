@@ -248,6 +248,54 @@ docker compose down</code></pre>
                 <td><code>CLAUDEAR_TLS_PRODUCTION</code></td>
                 <td><code>tls.production</code></td>
               </tr>
+              <tr>
+                <td><code>CLAUDEAR_GITLAB_TOKEN</code></td>
+                <td><code>scm.gitlab.token</code></td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_GITLAB_WEBHOOK_SECRET</code></td>
+                <td><code>scm.gitlab.webhook_secret</code></td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_JIRA_API_TOKEN</code></td>
+                <td><code>issues.jira.api_token</code></td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_DISCORD_BOT_TOKEN</code></td>
+                <td><code>notifiers.discord.bot_token</code></td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_SLACK_BOT_TOKEN</code></td>
+                <td><code>notifiers.slack.bot_token</code></td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_EMBEDDING_MODEL</code></td>
+                <td>Embedding model (<code>nomic</code>, <code>minilm</code>, <code>bge</code>)</td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_EMBEDDING_CACHE_DIR</code></td>
+                <td>Embedding model cache directory</td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_VECTORLITE_PATH</code></td>
+                <td>Path to vectorlite SQLite extension</td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_SENTRY_DSN</code></td>
+                <td>Sentry DSN for backend error reporting</td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_TLS_CACHE_DIR</code></td>
+                <td><code>tls.cache_dir</code></td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_TLS_HTTPS_PORT</code></td>
+                <td><code>tls.https_port</code></td>
+              </tr>
+              <tr>
+                <td><code>CLAUDEAR_TLS_HTTP_REDIRECT_PORT</code></td>
+                <td><code>tls.http_redirect_port</code></td>
+              </tr>
             </tbody>
           </table>
         </div>
@@ -259,6 +307,8 @@ docker compose down</code></pre>
           <li><strong>Health monitoring</strong> &mdash; monitor the <code>/api/health</code> endpoint with your existing uptime checker or alerting tool</li>
           <li><strong>Concurrency</strong> &mdash; start with conservative <code>max_concurrent</code> (1&ndash;2) and increase as needed once you are confident in the pipeline</li>
           <li><strong>Native TLS</strong> &mdash; set <code>tls.enabled = true</code> with your domain in <code>tls.domains</code> to auto-provision Let&rsquo;s Encrypt certificates without a reverse proxy. Test with <code>tls.production = false</code> (staging) first, then switch to production once verified</li>
+          <li><strong>Security headers</strong> &mdash; the API server includes HSTS, X-Content-Type-Options, X-Frame-Options, and CSRF protection (double-submit cookie) by default. Idle sessions are automatically cleaned up</li>
+          <li><strong>Local LLM</strong> &mdash; enable <code>[llm]</code> for offline repo classification and code chat. Set <code>gpu_layers = 99</code> for GPU acceleration. The model auto-downloads on first use if <code>model_url</code> is configured</li>
         </ul>
 
       </article>

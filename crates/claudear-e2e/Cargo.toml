@@ -1,0 +1,48 @@
+[package]
+name = "claudear-e2e"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "claudear-e2e"
+path = "src/main.rs"
+
+[dependencies]
+claudear = { path = "../.." }
+
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Serialization
+serde_json = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Async utilities
+async-trait = { workspace = true }
+
+# Regex
+regex-lite = { workspace = true }
+
+# Configuration
+toml = { workspace = true }
+
+# Database (direct SQLite access for assertions)
+rusqlite = { workspace = true }
+
+# Temp files
+tempfile = { workspace = true }

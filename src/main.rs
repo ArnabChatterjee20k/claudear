@@ -18,7 +18,7 @@ use claudear::{
         SentryRegressionConfig,
     },
     release::{ReleaseTracker, ReleaseTrackerConfig},
-    repo::{DependencyType, RepoIndex, RepoRelationships},
+    repo::{build_repo_index, DependencyType, RepoRelationships},
     reports::{ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler},
     retry::RetryManager,
     runner::{AgentRunner, ClaudeAgentRunner, ClaudeRunnerConfig},
@@ -91,6 +91,10 @@ enum Commands {
         /// Disable dashboard API
         #[arg(long)]
         no_dashboard: bool,
+
+        /// Run in the foreground instead of daemonizing (useful for systemd/launchd)
+        #[arg(long)]
+        foreground: bool,
     },
 
     /// Stop the running watcher daemon
@@ -568,23 +572,27 @@ fn print_startup_banner_and_status(
     config_path: &str,
     port: u16,
     enable_dashboard: bool,
+    enable_webhooks: bool,
     enable_polling: bool,
     poll_interval_ms: u64,
     inferrer_embedding_count: Option<usize>,
     user_registry: &UserRegistry,
 ) {
     println!();
-    println!("    ╔═╗ ╦   ╔═╗ ╦ ╦ ╔╦╗ ╔═╗ ╔═╗ ╦═╗");
-    println!("    ║   ║   ╠═╣ ║ ║ ║║║ ║╣  ╠═╣ ╠╦╝");
-    println!("    ╚═╝ ╩═╝ ╩ ╩ ╚═╝ ╚╩╝ ╚═╝ ╩ ╩ ╩╚═");
+    println!(" ██████╗██╗      █████╗ ██╗   ██╗██████╗ ███████╗ █████╗ ██████╗ ");
+    println!("██╔════╝██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝██╔══██╗██╔══██╗");
+    println!("██║     ██║     ███████║██║   ██║██║  ██║█████╗  ███████║██████╔╝");
+    println!("██║     ██║     ██╔══██║██║   ██║██║  ██║██╔══╝  ██╔══██║██╔══██╗");
+    println!("╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██║  ██║");
+    println!(" ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝");
     println!();
     println!("    v{}", env!("CARGO_PKG_VERSION"));
+    let host = dashboard_host_for_display(&config.bind_address);
     if enable_dashboard {
-        println!(
-            "    Dashboard: http://{}:{}",
-            dashboard_host_for_display(&config.bind_address),
-            port
-        );
+        println!("    Dashboard: http://{}:{}", host, port);
+    }
+    if enable_webhooks {
+        println!("    Webhooks:  http://{}:{}/webhook/{{source}}", host, port);
     }
     println!();
 
@@ -666,7 +674,7 @@ fn build_issue_embedding_service(
 struct WatcherDeps {
     sources: Vec<Arc<dyn IssueSource>>,
     scm_provider: Option<Arc<dyn ScmProvider>>,
-    github_client: Option<GitHubClient>,
+    github_client: Option<Arc<GitHubClient>>,
     relationships: Option<RepoRelationships>,
     inferrer: Option<claudear::inference::RepoInferrer>,
     embedding_client: Option<Arc<EmbeddingClient>>,
@@ -674,6 +682,8 @@ struct WatcherDeps {
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<claudear::repo::code_index::CodeSearchService>>,
     agent: Arc<dyn AgentRunner>,
+    classification_agent: Option<Arc<dyn AgentRunner>>,
+    llm_engine: Option<Arc<claudear::chat::llm::LlmEngine>>,
 }
 
 /// Build the common watcher dependencies shared between `Commands::Start` and
@@ -688,8 +698,12 @@ async fn build_watcher_deps(
     let github_client = GitHubClient::new(config.github().clone());
 
     // Inferrer + embedding client
-    let (inferrer, embedding_client) =
-        Watcher::build_inferrer_with_embeddings(config, Some(&github_client)).await?;
+    let (inferrer, embedding_client) = Watcher::build_inferrer_with_embeddings(
+        config,
+        Some(&github_client),
+        Some(tracker.as_ref()),
+    )
+    .await?;
     if inferrer.is_some() {
         tracing::info!("Repository inference enabled");
     }
@@ -727,7 +741,7 @@ async fn build_watcher_deps(
 
     // GitHub client for PR merge checking
     let github_client_for_watcher = if config.is_github_enabled() {
-        Some(GitHubClient::new(config.github().clone()))
+        Some(Arc::new(GitHubClient::new(config.github().clone())))
     } else {
         None
     };
@@ -782,9 +796,147 @@ async fn build_watcher_deps(
                 .default_provider_config()
                 .map(|p| p.skip_permissions)
                 .unwrap_or(false),
+            binary: config
+                .agent
+                .default_provider_config()
+                .and_then(|p| p.binary.clone())
+                .unwrap_or_else(|| "claude".to_string()),
+            env: config
+                .agent
+                .default_provider_config()
+                .map(|p| p.env.clone())
+                .unwrap_or_default(),
         },
         tracker.clone(),
     )));
+
+    // Eagerly load LLM engine — download model if not present on disk
+    let llm_engine = if config.llm.enabled {
+        let model_path = claudear::chat::service::expand_tilde(&config.llm.model_path);
+        let model_ready = if model_path.exists() && model_path.is_file() {
+            true
+        } else if !config.llm.model_url.is_empty() {
+            tracing::info!(
+                url = %config.llm.model_url,
+                target = %model_path.display(),
+                "LLM model not found, downloading..."
+            );
+            let progress = Arc::new(claudear::chat::models::download::DownloadProgress::new());
+            match claudear::chat::models::download::download_gguf(
+                &config.llm.model_url,
+                &model_path,
+                progress.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        size_mb = progress
+                            .total_bytes
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            / 1_048_576,
+                        "LLM model downloaded successfully"
+                    );
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to download LLM model, classification disabled");
+                    false
+                }
+            }
+        } else {
+            tracing::debug!("LLM model not found and no download URL configured");
+            false
+        };
+
+        if model_ready {
+            let llm_config = claudear::chat::llm::LlmConfig {
+                model_path,
+                context_length: config.llm.context_length,
+                gpu_layers: config.llm.gpu_layers,
+                threads: config.llm.threads,
+                timeout: if config.llm.inference_timeout_secs > 0 {
+                    Some(std::time::Duration::from_secs(
+                        config.llm.inference_timeout_secs,
+                    ))
+                } else {
+                    None
+                },
+            };
+            match claudear::chat::llm::LlmEngine::load(&llm_config) {
+                Ok(engine) => {
+                    tracing::info!("LLM engine loaded for classification + chat");
+                    Some(Arc::new(engine))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to load LLM engine");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Optionally swap agent runner to use local LLM
+    let agent: Arc<dyn AgentRunner> = if config.agent.use_llm {
+        if let Some(ref engine) = llm_engine {
+            tracing::info!("Using local LLM as agent runner (agent.use_llm = true)");
+            Arc::new(claudear_engine::llm_agent_runner::LlmAgentRunner::new(
+                engine.clone(),
+            ))
+        } else {
+            tracing::warn!(
+                "agent.use_llm = true but LLM engine not available, using default agent"
+            );
+            agent
+        }
+    } else {
+        agent
+    };
+
+    // Build a separate agent runner for classification if a classification_model is configured
+    let classification_agent: Option<Arc<dyn AgentRunner>> = config
+        .agent
+        .default_provider_config()
+        .and_then(|p| p.classification_model.clone())
+        .map(|model| {
+            tracing::info!(model = %model, "Building separate agent runner for classification");
+            let runner = ClaudeAgentRunner::new(
+                ClaudeRunnerConfig {
+                    timeout_secs: config.agent.timeout_secs,
+                    model: Some(model),
+                    instructions: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.instructions.clone()),
+                    permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.permissions.clone())
+                        .unwrap_or_default(),
+                    skip_permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.skip_permissions)
+                        .unwrap_or(false),
+                    binary: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.binary.clone())
+                        .unwrap_or_else(|| "claude".to_string()),
+                    env: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.env.clone())
+                        .unwrap_or_default(),
+                },
+                tracker.clone(),
+            );
+            InstrumentedRunner::wrap(Arc::new(runner)) as Arc<dyn AgentRunner>
+        });
 
     Ok(WatcherDeps {
         sources,
@@ -797,6 +949,8 @@ async fn build_watcher_deps(
         issue_embedding_service,
         code_search_service,
         agent,
+        classification_agent,
+        llm_engine,
     })
 }
 
@@ -1329,9 +1483,135 @@ fn start_regression_monitoring(
     Some(handle)
 }
 
+/// Enrich the process PATH with entries from the user's login shell.
+///
+/// When started via systemd or cron, the PATH is minimal and won't include
+/// user-local directories like `~/.local/bin` or nvm/fnm node paths. This
+/// runs `$SHELL -l -c 'echo $PATH'` to capture the full login PATH and
+/// prepends any missing entries to the current PATH.
+fn enrich_path_from_login_shell() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let output = std::process::Command::new(&shell)
+        .args(["-l", "-c", "echo $PATH"])
+        .output();
+
+    let login_path = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return,
+    };
+
+    if login_path.is_empty() {
+        return;
+    }
+
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let current_entries: std::collections::HashSet<&str> = current_path.split(':').collect();
+
+    let mut new_entries: Vec<&str> = Vec::new();
+    for entry in login_path.split(':') {
+        if !entry.is_empty() && !current_entries.contains(entry) {
+            new_entries.push(entry);
+        }
+    }
+
+    if !new_entries.is_empty() {
+        let merged = if current_path.is_empty() {
+            new_entries.join(":")
+        } else {
+            format!("{}:{}", new_entries.join(":"), current_path)
+        };
+        std::env::set_var("PATH", &merged);
+    }
+}
+
+/// Daemonize the current process using the classic double-fork pattern.
+///
+/// 1. First fork: parent prints the daemon PID and exits, returning control to the shell.
+/// 2. Child calls `setsid()` to become a session leader (detach from terminal).
+/// 3. Second fork: ensures the daemon cannot reacquire a controlling terminal.
+/// 4. Grandchild redirects stdin/stdout/stderr to `/dev/null` and continues execution.
+///
+/// This must be called BEFORE the tokio runtime is created — forking after
+/// spawning threads leads to undefined behaviour.
+#[cfg(unix)]
+fn daemonize() -> anyhow::Result<()> {
+    use std::ffi::CString;
+
+    // First fork
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        anyhow::bail!("First fork failed: {}", std::io::Error::last_os_error());
+    }
+    if pid > 0 {
+        // Parent: wait briefly for the child to setsid + second-fork so we can
+        // report the final daemon PID. The child writes it to the PID file path
+        // as a temp signal file, then we read it.
+        //
+        // Simpler approach: the first child will print the PID and the parent just exits.
+        // We don't know the grandchild PID here, so the child will print it.
+        std::process::exit(0);
+    }
+
+    // First child: create a new session
+    if unsafe { libc::setsid() } < 0 {
+        anyhow::bail!("setsid failed: {}", std::io::Error::last_os_error());
+    }
+
+    // Second fork
+    let pid2 = unsafe { libc::fork() };
+    if pid2 < 0 {
+        anyhow::bail!("Second fork failed: {}", std::io::Error::last_os_error());
+    }
+    if pid2 > 0 {
+        // First child exits — grandchild is now fully detached
+        std::process::exit(0);
+    }
+
+    // Grandchild: this is the actual daemon process.
+    // Print the PID so users know what to expect (goes to original stdout before redirect).
+    eprintln!("Daemon started (PID: {})", std::process::id());
+
+    // Change working directory to / to avoid holding mount points
+    // (skip this — claudear needs its working dir for config and repos)
+
+    // Set umask
+    unsafe { libc::umask(0o027) };
+
+    // Redirect stdin/stdout/stderr to /dev/null
+    let devnull = CString::new("/dev/null").unwrap();
+    unsafe {
+        let fd = libc::open(devnull.as_ptr(), libc::O_RDWR);
+        if fd >= 0 {
+            libc::dup2(fd, libc::STDIN_FILENO);
+            libc::dup2(fd, libc::STDOUT_FILENO);
+            libc::dup2(fd, libc::STDERR_FILENO);
+            if fd > libc::STDERR_FILENO {
+                libc::close(fd);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     // Install ring as the global TLS crypto provider (must happen before any HTTPS calls)
     claudear::init_tls();
+
+    // Resolve the user's login shell PATH so that user-local binaries
+    // (e.g. claude via nvm/node) are discoverable when started via systemd.
+    enrich_path_from_login_shell();
+
+    // Parse CLI args early so we can daemonize before creating the tokio runtime.
+    // Forking after spawning threads is undefined behaviour.
+    let cli = Cli::parse();
+
+    #[cfg(unix)]
+    if let Commands::Start { foreground, .. } = &cli.command {
+        if !foreground {
+            daemonize()?;
+        }
+    }
 
     // Initialize Sentry before the async runtime to ensure proper flushing on shutdown
     let _sentry_guard = sentry::init((
@@ -1357,11 +1637,10 @@ fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(async_main())
+        .block_on(async_main(cli))
 }
 
-async fn async_main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let verbose = cli.verbose;
 
     // Initialize logging (must keep _guard alive for file logging to work)
@@ -1371,7 +1650,11 @@ async fn async_main() -> anyhow::Result<()> {
     } else {
         Some(cli.log_dir.as_path())
     };
-    let suppress_console_info = !verbose && matches!(&cli.command, Commands::Start { .. });
+    let suppress_console_info = !verbose
+        && matches!(
+            &cli.command,
+            Commands::Start { .. } | Commands::Webhook { .. } | Commands::Poll { .. }
+        );
     let _log_guard = init_logging(log_dir, verbose, suppress_console_info);
 
     let config_path = cli.config.clone();
@@ -1583,7 +1866,7 @@ async fn async_main() -> anyhow::Result<()> {
                     );
                 }
 
-                let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+                let index = build_repo_index(&config.known_orgs, &config.auto_discover_paths)?;
 
                 if index.is_empty() {
                     println!("\nNo repositories found from known orgs in the specified paths.");
@@ -1671,7 +1954,7 @@ async fn async_main() -> anyhow::Result<()> {
                     let files_with_types: Vec<(String, Option<String>)> = repo
                         .files
                         .iter()
-                        .map(|f| {
+                        .map(|f: &String| {
                             let file_type = std::path::Path::new(f)
                                 .extension()
                                 .map(|e| e.to_string_lossy().to_string());
@@ -1755,7 +2038,7 @@ async fn async_main() -> anyhow::Result<()> {
 
                 println!("\nSearching for '{}'...", query);
 
-                let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+                let index = build_repo_index(&config.known_orgs, &config.auto_discover_paths)?;
                 let matches = index.search_files(query);
 
                 if matches.is_empty() {
@@ -1953,8 +2236,8 @@ async fn async_main() -> anyhow::Result<()> {
 
             ReposCommands::Reindex { repo } => {
                 use claudear::feedback::{EmbeddingClient, EmbeddingConfig};
+                use claudear::repo::build_repo_index;
                 use claudear::repo::code_index::CodeIndexer;
-                use claudear::repo::RepoIndex;
 
                 if !config.code_index.enabled {
                     anyhow::bail!(
@@ -1962,7 +2245,45 @@ async fn async_main() -> anyhow::Result<()> {
                     );
                 }
 
-                let emb_client = Arc::new(EmbeddingClient::new(EmbeddingConfig::default())?);
+                // Build execution providers from config
+                #[allow(unused_mut)]
+                let mut execution_providers = Vec::new();
+                if config.embedding.gpu {
+                    #[cfg(feature = "cuda")]
+                    {
+                        let cuda_ep = ort::execution_providers::CUDA::default()
+                            .with_device_id(config.embedding.device_id)
+                            .build();
+                        execution_providers.push(cuda_ep);
+                        tracing::info!(
+                            device_id = config.embedding.device_id,
+                            "CUDA execution provider configured for embeddings"
+                        );
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        tracing::warn!(
+                            "embedding.gpu = true but binary was compiled without --features cuda; falling back to CPU"
+                        );
+                    }
+                }
+
+                let emb_pool_size = if config.embedding.pool_size > 0 {
+                    config.embedding.pool_size as usize
+                } else if config.embedding.gpu {
+                    1
+                } else {
+                    EmbeddingConfig::default().pool_size
+                };
+
+                let emb_config = EmbeddingConfig {
+                    pool_size: emb_pool_size,
+                    execution_providers,
+                    sub_batch_size: config.embedding.sub_batch_size as usize,
+                    ..EmbeddingConfig::default()
+                };
+
+                let emb_client = Arc::new(EmbeddingClient::new(emb_config)?);
                 let tracker: Arc<dyn claudear::storage::FixAttemptTracker> =
                     Arc::new(SqliteTracker::new(&config.db_path)?);
 
@@ -1975,7 +2296,7 @@ async fn async_main() -> anyhow::Result<()> {
                 .with_force_reindex(true);
 
                 // Collect repos to reindex
-                let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+                let index = build_repo_index(&config.known_orgs, &config.auto_discover_paths)?;
                 let repos: Vec<_> = index
                     .list()
                     .into_iter()
@@ -2017,7 +2338,7 @@ async fn async_main() -> anyhow::Result<()> {
             }
 
             ReposCommands::Sync { skip_files } => {
-                use claudear::repo::RepoIndex;
+                use claudear::repo::build_repo_index;
 
                 println!("\nSyncing repository index to database...");
 
@@ -2026,7 +2347,7 @@ async fn async_main() -> anyhow::Result<()> {
                 }
 
                 // Build in-memory index
-                let index = RepoIndex::build(&config.known_orgs, &config.auto_discover_paths)?;
+                let index = build_repo_index(&config.known_orgs, &config.auto_discover_paths)?;
                 if index.is_empty() {
                     println!("No repositories found.");
                     return Ok(());
@@ -2472,19 +2793,20 @@ async fn async_main() -> anyhow::Result<()> {
         let db_tracker = Arc::new(SqliteTracker::new(&config.db_path)?);
 
         // Apply model override if provided
-        let mut chat_config = config.chat.clone();
+        let chat_config = config.chat.clone();
+        let mut llm_config = config.llm.clone();
         if let Some(model_path) = model {
-            chat_config.model_path = model_path.clone();
+            llm_config.model_path = model_path.clone();
         }
 
         // Download model if requested and not present
         if download_model {
-            let target = claudear::chat::service::expand_tilde(&chat_config.model_path);
+            let target = claudear::chat::service::expand_tilde(&llm_config.model_path);
             if !target.exists() {
                 use std::sync::Arc as StdArc;
                 let progress = StdArc::new(claudear::chat::models::DownloadProgress::new());
                 let progress_clone = progress.clone();
-                let url = chat_config.model_url.clone();
+                let url = llm_config.model_url.clone();
                 let target_clone = target.clone();
 
                 println!("Downloading model to {}...", target.display());
@@ -2551,7 +2873,7 @@ async fn async_main() -> anyhow::Result<()> {
 
         // Build embedding client for code search
         let (_, embedding_client) =
-            claudear::watcher::Watcher::build_inferrer_with_embeddings(&config, None).await?;
+            claudear::watcher::Watcher::build_inferrer_with_embeddings(&config, None, None).await?;
 
         let embedding_client = embedding_client.ok_or_else(|| {
             anyhow::anyhow!("Embedding client required for chat. Ensure code_index is enabled.")
@@ -2562,8 +2884,12 @@ async fn async_main() -> anyhow::Result<()> {
             embedding_client,
         );
 
-        let chat_service =
-            claudear::chat::ChatService::new(chat_config, code_search, db_tracker.clone());
+        let chat_service = claudear::chat::ChatService::new(
+            chat_config,
+            llm_config,
+            code_search,
+            db_tracker.clone(),
+        );
 
         // Resolve repo_id if repo name given
         let repo_id = if let Some(repo_name) = repo {
@@ -2740,6 +3066,7 @@ async fn async_main() -> anyhow::Result<()> {
         poll_interval,
         no_webhooks,
         no_dashboard,
+        foreground: _,
     } = &cli.command
     {
         if is_daemon_running() {
@@ -2795,7 +3122,9 @@ async fn async_main() -> anyhow::Result<()> {
             scm_provider: deps.scm_provider,
             user_registry: user_registry.clone(),
             agent: deps.agent.clone(),
+            classification_agent: deps.classification_agent.clone(),
             dry_run: false,
+            llm_engine: deps.llm_engine.clone(),
         }));
 
         // Create IPC server
@@ -2857,6 +3186,7 @@ async fn async_main() -> anyhow::Result<()> {
             &config_path,
             *port,
             enable_dashboard,
+            enable_webhooks,
             enable_polling,
             *poll_interval,
             vector_store_embeddings,
@@ -2870,13 +3200,21 @@ async fn async_main() -> anyhow::Result<()> {
         let shutdown = async move {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("\nReceived shutdown signal, initiating graceful shutdown...");
+                    tracing::info!("\nReceived shutdown signal, press Ctrl+C again to force quit...");
                 }
                 _ = shutdown_rx.recv() => {
                     tracing::info!("\nReceived IPC shutdown command, initiating graceful shutdown...");
                 }
             }
-            watcher_for_shutdown.stop_and_drain().await;
+
+            // Race graceful drain against a second Ctrl+C for force quit
+            tokio::select! {
+                _ = watcher_for_shutdown.stop_and_drain() => {}
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("\nForce shutdown requested, exiting immediately");
+                    std::process::exit(130);
+                }
+            }
 
             // Log watcher_stopped activity
             let activity = ActivityLogEntry::new("watcher_stopped", "Watcher daemon stopped")
@@ -2932,6 +3270,9 @@ async fn async_main() -> anyhow::Result<()> {
                 server.set_issue_embedding_service(issue_embedding_service_clone);
                 server.set_code_search_service(code_search_service_clone);
                 server.set_review_watcher(review_watcher_clone);
+                if enable_dashboard {
+                    server.set_dashboard(std::path::PathBuf::from(config_path.clone()));
+                }
                 server.start().await?;
             } else if enable_dashboard {
                 // Dashboard only (no webhooks)
@@ -3254,8 +3595,12 @@ async fn async_main() -> anyhow::Result<()> {
         let github_client = GitHubClient::new(config.github().clone());
 
         // Build inferrer for retry processing (with embeddings for semantic matching)
-        let (inferrer, embedding_client) =
-            Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
+        let (inferrer, embedding_client) = Watcher::build_inferrer_with_embeddings(
+            &config,
+            Some(&github_client),
+            Some(tracker.as_ref()),
+        )
+        .await?;
 
         // Create ReviewWatcher for PR review tracking
         let review_watcher = create_review_watcher(&config, tracker.clone());
@@ -3296,6 +3641,16 @@ async fn async_main() -> anyhow::Result<()> {
                         .default_provider_config()
                         .map(|p| p.skip_permissions)
                         .unwrap_or(false),
+                    binary: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.binary.clone())
+                        .unwrap_or_else(|| "claude".to_string()),
+                    env: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.env.clone())
+                        .unwrap_or_default(),
                 },
                 tracker.clone(),
             )));
@@ -3315,7 +3670,9 @@ async fn async_main() -> anyhow::Result<()> {
             scm_provider: None,
             user_registry: user_registry.clone(),
             agent,
+            classification_agent: None,
             dry_run: false,
+            llm_engine: None,
         });
 
         for attempt in ready {
@@ -3474,12 +3831,25 @@ async fn async_main() -> anyhow::Result<()> {
 
             // Build shared watcher dependencies (needed for housekeeping)
             let deps = build_watcher_deps(&config, &tracker).await?;
+            let vector_store_embeddings = deps.inferrer.as_ref().map(|i| i.embedding_count());
             let github_webhook_handler =
                 create_github_webhook_handler(&config, deps.review_watcher.clone());
 
             if handlers.get_all().is_empty() && github_webhook_handler.is_none() {
                 anyhow::bail!("No webhook handlers were registered");
             }
+
+            print_startup_banner_and_status(
+                &config,
+                &config_path,
+                port,
+                false, // dashboard not available in standalone webhook mode
+                true,  // webhooks
+                false, // polling
+                0,
+                vector_store_embeddings,
+                &user_registry,
+            );
 
             // Create a Watcher for housekeeping (retries, cascades, auto-close, etc.)
             let watcher = Arc::new(Watcher::new(WatcherOptions {
@@ -3497,7 +3867,9 @@ async fn async_main() -> anyhow::Result<()> {
                 scm_provider: deps.scm_provider,
                 user_registry: user_registry.clone(),
                 agent: deps.agent.clone(),
+                classification_agent: deps.classification_agent.clone(),
                 dry_run: false,
+                llm_engine: deps.llm_engine.clone(),
             }));
 
             let worker = HousekeepingWorker::new(watcher.clone(), config.poll_interval_ms);
@@ -3534,8 +3906,14 @@ async fn async_main() -> anyhow::Result<()> {
                 tokio::signal::ctrl_c()
                     .await
                     .expect("Failed to install signal handler");
-                tracing::info!("\nReceived shutdown signal...");
-                watcher_for_shutdown.stop_and_drain().await;
+                tracing::info!("\nReceived shutdown signal, press Ctrl+C again to force quit...");
+                tokio::select! {
+                    _ = watcher_for_shutdown.stop_and_drain() => {}
+                    _ = tokio::signal::ctrl_c() => {
+                        tracing::warn!("\nForce shutdown requested, exiting immediately");
+                        std::process::exit(130);
+                    }
+                }
                 if let Some(h) = regression_handle {
                     h.abort();
                 }
@@ -3569,8 +3947,12 @@ async fn async_main() -> anyhow::Result<()> {
             let github_client = GitHubClient::new(config.github().clone());
 
             // Build inferrer for repo inference (with embeddings for semantic matching)
-            let (inferrer, embedding_client) =
-                Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
+            let (inferrer, embedding_client) = Watcher::build_inferrer_with_embeddings(
+                &config,
+                Some(&github_client),
+                Some(tracker.as_ref()),
+            )
+            .await?;
 
             // Create ReviewWatcher for PR review tracking
             let review_watcher = create_review_watcher(&config, tracker.clone());
@@ -3611,11 +3993,134 @@ async fn async_main() -> anyhow::Result<()> {
                             .default_provider_config()
                             .map(|p| p.skip_permissions)
                             .unwrap_or(false),
+                        binary: config
+                            .agent
+                            .default_provider_config()
+                            .and_then(|p| p.binary.clone())
+                            .unwrap_or_else(|| "claude".to_string()),
+                        env: config
+                            .agent
+                            .default_provider_config()
+                            .map(|p| p.env.clone())
+                            .unwrap_or_default(),
                     },
                     tracker.clone(),
                 )));
 
+            // Eagerly load LLM engine — download model if not present on disk
+            let llm_engine = if config.llm.enabled {
+                let model_path = claudear::chat::service::expand_tilde(&config.llm.model_path);
+                let model_ready = if model_path.exists() && model_path.is_file() {
+                    true
+                } else if !config.llm.model_url.is_empty() {
+                    tracing::info!(
+                        url = %config.llm.model_url,
+                        target = %model_path.display(),
+                        "LLM model not found, downloading..."
+                    );
+                    let progress =
+                        Arc::new(claudear::chat::models::download::DownloadProgress::new());
+                    match claudear::chat::models::download::download_gguf(
+                        &config.llm.model_url,
+                        &model_path,
+                        progress.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                size_mb = progress
+                                    .total_bytes
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    / 1_048_576,
+                                "LLM model downloaded successfully"
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to download LLM model, classification disabled");
+                            false
+                        }
+                    }
+                } else {
+                    tracing::debug!("LLM model not found and no download URL configured");
+                    false
+                };
+
+                if model_ready {
+                    let llm_config = claudear::chat::llm::LlmConfig {
+                        model_path,
+                        context_length: config.llm.context_length,
+                        gpu_layers: config.llm.gpu_layers,
+                        threads: config.llm.threads,
+                        timeout: if config.llm.inference_timeout_secs > 0 {
+                            Some(std::time::Duration::from_secs(
+                                config.llm.inference_timeout_secs,
+                            ))
+                        } else {
+                            None
+                        },
+                    };
+                    match claudear::chat::llm::LlmEngine::load(&llm_config) {
+                        Ok(engine) => {
+                            tracing::info!("LLM engine loaded for classification + chat");
+                            Some(Arc::new(engine))
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Failed to load LLM engine");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Build a separate agent runner for classification if configured
+            let classification_agent: Option<Arc<dyn AgentRunner>> = config
+                .agent
+                .default_provider_config()
+                .and_then(|p| p.classification_model.clone())
+                .map(|model| {
+                    tracing::info!(model = %model, "Building separate agent runner for classification");
+                    let runner = ClaudeAgentRunner::new(
+                        ClaudeRunnerConfig {
+                            timeout_secs: config.agent.timeout_secs,
+                            model: Some(model),
+                            instructions: config
+                                .agent
+                                .default_provider_config()
+                                .and_then(|p| p.instructions.clone()),
+                            permissions: config
+                                .agent
+                                .default_provider_config()
+                                .map(|p| p.permissions.clone())
+                                .unwrap_or_default(),
+                            skip_permissions: config
+                                .agent
+                                .default_provider_config()
+                                .map(|p| p.skip_permissions)
+                                .unwrap_or(false),
+                            binary: config
+                                .agent
+                                .default_provider_config()
+                                .and_then(|p| p.binary.clone())
+                                .unwrap_or_else(|| "claude".to_string()),
+                            env: config
+                                .agent
+                                .default_provider_config()
+                                .map(|p| p.env.clone())
+                                .unwrap_or_default(),
+                        },
+                        tracker.clone(),
+                    );
+                    InstrumentedRunner::wrap(Arc::new(runner)) as Arc<dyn AgentRunner>
+                });
+
             let tracker_for_api = tracker.clone();
+            let vector_store_embeddings = inferrer.as_ref().map(|i| i.embedding_count());
             let watcher = Arc::new(Watcher::new(WatcherOptions {
                 config: config.clone(),
                 sources,
@@ -3628,14 +4133,16 @@ async fn async_main() -> anyhow::Result<()> {
                 code_search_service,
                 relationships: None,
                 github_client: if config.is_github_enabled() {
-                    Some(GitHubClient::new(config.github().clone()))
+                    Some(Arc::new(GitHubClient::new(config.github().clone())))
                 } else {
                     None
                 },
                 scm_provider: None,
                 user_registry: user_registry.clone(),
                 agent,
+                classification_agent,
                 dry_run,
+                llm_engine,
             }));
 
             // Handle shutdown signals
@@ -3666,6 +4173,18 @@ async fn async_main() -> anyhow::Result<()> {
                     port,
                     no_dashboard,
                 } => {
+                    print_startup_banner_and_status(
+                        &config,
+                        &config_path,
+                        port,
+                        !no_dashboard, // dashboard
+                        false,         // webhooks
+                        true,          // polling
+                        interval,
+                        vector_store_embeddings,
+                        &user_registry,
+                    );
+
                     // Keep regression monitoring active in foreground poll mode so merged bug
                     // fixes complete the regression-final-check -> resolve flow.
                     let _regression_handle = start_regression_monitoring(
@@ -3689,7 +4208,6 @@ async fn async_main() -> anyhow::Result<()> {
                             _ = shutdown => {}
                         }
                     } else {
-                        tracing::info!("Dashboard API available at http://localhost:{}", port);
                         let api_server = ApiServer::with_port(
                             config.clone(),
                             tracker_for_api.clone(),

@@ -39,6 +39,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
   - [Inference Analytics](#inference-analytics)
   - [Release Tracking](#release-tracking)
   - [Diagnostics](#diagnostics)
+  - [Code Chat](#code-chat)
   - [Dry Run](#dry-run)
   - [User Registry](#user-registry)
 - [Fix Attempt Lifecycle](#fix-attempt-lifecycle)
@@ -93,8 +94,8 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - **Slack**: Poll Slack channels for messages as issues
 - **WhatsApp**: Receive WhatsApp messages via Cloud API webhooks
 - **Telegram**: Poll Telegram chats via Bot API
-- **GitHub Review Comments**: Respond to PR review comments tagged with `@claudear`
-- **GitLab MR Comments**: Respond to MR review comments tagged with `@claudear`
+- **GitHub Review Comments**: Respond to PR review comments tagged with `@claudear`, with `allowed_bots` to process comments from specific bots (e.g., Copilot)
+- **GitLab MR Comments**: Respond to MR review comments tagged with `@claudear`, with `allowed_bots` support
 - Per-source rate limiting, concurrent processing controls, and configurable poll intervals
 
 ### Intelligent Repository Routing
@@ -108,6 +109,7 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - Multi-provider support: Claude Code (primary), OpenAI Codex, with Gemini and Copilot planned
 - A/B experiment infrastructure: test providers against each other with weighted routing
 - Configurable model selection: Sonnet, Opus, Haiku, or any model ID
+- Separate `classification_model` for repo routing (use a cheaper model like Haiku for classification)
 - Project-specific `AGENT.md` files customize coding conventions per repo
 - Global instructions and tool permissions via `claudear.toml`
 - Configurable execution timeout (default 6 hours)
@@ -214,6 +216,13 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 - `start` / `stop` / `pause` / `resume` / `status` / `activity` commands
 - Unix socket communication with configurable timeout
 
+### Security
+- API security headers (HSTS, X-Content-Type-Options, X-Frame-Options)
+- CSRF protection with double-submit cookie pattern
+- Extended rate limiting per endpoint
+- Idle session timeout with automatic cleanup
+- Password hashing (bcrypt) and encrypted session tokens
+
 ### Webhooks
 - Real-time event processing from all configured sources (Linear, Sentry, GitHub, GitLab, Jira, Slack, Discord, Telegram, WhatsApp)
 - HMAC-SHA256 signature verification
@@ -232,8 +241,8 @@ Point it at Linear, Sentry, Jira, GitLab, Discord, Slack, or GitHub review comme
 | | Slack | Bot API | Channel message polling |
 | | WhatsApp | Cloud API | Webhook-fed message buffer |
 | | Telegram | Bot API | `getUpdates` long-polling |
-| **SCM** | GitHub | REST + Git | PRs, review comments, webhooks, App auth |
-| | GitLab | REST + Git | MRs, issue resolution, review comments |
+| **SCM** | GitHub | REST + Git | PRs, review comments, webhooks, App auth, bot comment processing |
+| | GitLab | REST + Git | MRs, issue resolution, review comments, bot comment processing |
 | **Notifications** | Console | stdout | Always-on logging |
 | | Discord | Webhook + Bot | Rich embeds, reply-based Q&A, thread tracking |
 | | Slack | Bot API + Webhook | Messages, reply-based Q&A |
@@ -401,6 +410,8 @@ All config values can be overridden with environment variables, useful for keepi
 | `CLAUDEAR_TLS_CACHE_DIR` | `tls.cache_dir` |
 | `CLAUDEAR_TLS_HTTPS_PORT` | `tls.https_port` |
 | `CLAUDEAR_TLS_HTTP_REDIRECT_PORT` | `tls.http_redirect_port` |
+| `CLAUDEAR_DISCORD_BOT_TOKEN` | `notifiers.discord.bot_token` |
+| `CLAUDEAR_SLACK_BOT_TOKEN` | `notifiers.slack.bot_token` |
 
 ### Minimal Configuration
 
@@ -435,9 +446,9 @@ api_key = "lin_api_xxxx"
 | `issues.jira` | Jira base URL, auth, project keys, JQL filters, issue types |
 | `issues.discord` | Discord bot token, listen channel ID |
 | `issues.slack` | Slack bot token, listen channel ID |
-| `scm.github` | GitHub token, PR poll interval, auto-resolve on merge, review trigger tag |
+| `scm.github` | GitHub token, PR poll interval, auto-resolve on merge, review trigger tag, allowed bots |
 | `scm.github.app` | GitHub App authentication (App ID, private key, installation ID) |
-| `scm.gitlab` | GitLab token, base URL, groups, MR poll interval, review trigger tag |
+| `scm.gitlab` | GitLab token, base URL, groups, MR poll interval, review trigger tag, allowed bots |
 | `notifiers.discord` | Discord webhook URL, bot token, channel ID for Q&A |
 | `notifiers.slack` | Slack bot token, channel ID, webhook URL for Q&A |
 | `notifiers.email` | SMTP sending + IMAP reply polling |
@@ -725,6 +736,29 @@ claudear diag release-path owner/source-repo owner/target-repo
 claudear diag db
 ```
 
+### Code Chat
+
+Ask questions about your indexed codebase using a local LLM.
+
+```bash
+# Interactive REPL
+claudear chat
+
+# Single question
+claudear chat "Where is the auth middleware defined?"
+
+# Scope to a specific repo
+claudear chat --repo my-org/my-repo "How does retry logic work?"
+
+# Use a specific model file
+claudear chat --model ~/.cache/claudear/models/custom.gguf
+
+# Download the default model if missing
+claudear chat --download-model
+```
+
+Requires `[llm]` and `[chat]` to be enabled in your config. The chat feature uses RAG (retrieval-augmented generation) over your indexed repositories.
+
 ### Dry Run
 
 ```bash
@@ -851,9 +885,16 @@ default_provider = "claude"
 # Agent process execution timeout in seconds (default: 21600 = 6 hours)
 timeout_secs = 21600
 
+# Use the local LLM as the agent runner instead of an external provider (default: false)
+# Requires [llm] to be enabled. Fully offline but much slower. Creates PRs via `gh` CLI.
+use_llm = false
+
 [agent.providers.claude]
 # Model selection
 model = "sonnet"   # sonnet, opus, haiku, or full model ID
+
+# Cheaper model for repo classification (optional, falls back to model)
+# classification_model = "haiku"
 
 # Custom instructions appended to the system prompt
 instructions = "Always write tests. Follow existing code style."
@@ -866,6 +907,13 @@ permissions = ["Bash(git *)", "Read", "Edit"]
 
 # Skip all permission prompts (default: true)
 skip_permissions = true
+
+# CLI binary path (set when daemon can't find it via PATH)
+# binary = "/home/user/.local/bin/claude"
+
+# Extra env vars for the agent process (useful for systemd services)
+# [agent.providers.claude.env]
+# PATH = "/home/user/.local/bin:/home/user/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin"
 ```
 
 ### A/B Experiments
@@ -885,6 +933,22 @@ weight = 0.8
 [[agent.experiments.providers]]
 name = "codex"
 weight = 0.2
+```
+
+### Local LLM
+
+Optional local model for offline repo classification and code chat:
+
+```toml
+[llm]
+enabled = false
+model_path = "~/.cache/claudear/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+gpu_layers = 99          # 0 = CPU only, 99 = all layers on GPU
+inference_timeout_secs = 120
+
+# Use the configured agent (claude/codex) for repo classification instead of
+# the local model. Much faster but costs API credits. (default: false)
+use_agent = false
 ```
 
 ---

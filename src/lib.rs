@@ -34,45 +34,58 @@ pub fn init_tls() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-pub mod api;
-pub mod api_events;
-pub(crate) mod ask_reply_inbox;
-pub mod chat;
-pub mod config;
-pub mod discord;
-pub mod env_writer;
-pub mod error;
-pub mod evaluation;
-pub mod feedback;
-pub mod github;
-pub mod github_app;
-pub mod gitlab;
-pub mod housekeeping;
-pub mod http;
-pub mod inference;
-pub mod ipc;
-pub mod learning;
-pub mod notifier;
-pub mod platform;
-pub mod prioritisation;
-pub mod processing;
-pub mod qa;
-pub mod regression;
-pub mod release;
+// Re-exported from claudear-core
+pub use claudear_core::error;
+pub use claudear_core::http;
+pub use claudear_core::platform;
+pub use claudear_core::secret;
+pub use claudear_core::templates;
+pub use claudear_core::types;
+
+// Re-exported from claudear-config
+pub use claudear_config::config;
+pub use claudear_config::env_writer;
+pub use claudear_config::users;
+
+// Re-exported from claudear-storage
+pub use claudear_storage as storage;
+
+// Re-exported from claudear-analysis
+pub use claudear_analysis::evaluation;
+pub use claudear_analysis::feedback;
+pub use claudear_analysis::inference;
+pub use claudear_analysis::learning;
+pub use claudear_analysis::prioritisation;
+pub use claudear_analysis::qa;
+pub use claudear_analysis::regression;
+pub use claudear_analysis::release;
+
+// Re-exported from claudear-integrations
+pub use claudear_integrations::ask_reply_inbox;
+pub use claudear_integrations::chat;
+pub use claudear_integrations::discord;
+pub use claudear_integrations::github;
+pub use claudear_integrations::github_app;
+pub use claudear_integrations::gitlab;
+pub use claudear_integrations::notifier;
+pub use claudear_integrations::reports;
+pub use claudear_integrations::runner;
+pub use claudear_integrations::scm;
+pub use claudear_integrations::source;
+pub use claudear_integrations::telemetry;
+pub use claudear_integrations::tls;
+// Re-exported from claudear-engine
+pub use claudear_engine::api;
+pub use claudear_engine::api_events;
+pub use claudear_engine::housekeeping;
+pub use claudear_engine::ipc;
+pub use claudear_engine::processing;
+pub use claudear_engine::repo_index;
+pub use claudear_engine::retry;
+pub use claudear_engine::watcher;
+
+// Local modules (thin wrappers)
 pub mod repo;
-pub mod reports;
-pub mod retry;
-pub mod runner;
-pub mod scm;
-pub mod secret;
-pub mod source;
-pub mod storage;
-pub mod telemetry;
-pub mod templates;
-pub mod tls;
-pub mod types;
-pub mod users;
-pub mod watcher;
 pub mod webhook;
 
 pub use chat::{ChatService, ChatState};
@@ -113,8 +126,9 @@ pub use ipc::{
     IpcResponse, IpcServer, WatcherState,
 };
 pub use repo::{
-    DependencyDiscovery, DependencyGraph, DependencyType, DiscoveredDependency, IndexedRepo,
-    RepoIndex, RepoRelationships, Repository,
+    build_repo_index, build_repo_index_from_github, build_repo_index_from_gitlab,
+    build_repo_index_with_fallback, index_repo_files, DependencyDiscovery, DependencyGraph,
+    DependencyType, DiscoveredDependency, IndexedRepo, RepoIndex, RepoRelationships, Repository,
 };
 pub use reports::{Report, ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler};
 pub use retry::{RetryDecision, RetryManager};
@@ -144,6 +158,7 @@ pub struct AppComponents {
     pub review_watcher: Option<Arc<ReviewWatcher>>,
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub agent: Arc<dyn runner::AgentRunner>,
+    pub classification_agent: Option<Arc<dyn runner::AgentRunner>>,
 }
 
 /// Build all non-storage components.
@@ -165,8 +180,12 @@ pub async fn build_app(
 
     // GitHub client for inferrer
     let github_client = github::GitHubClient::new(config.github().clone());
-    let (inferrer, embedding_client) =
-        watcher::Watcher::build_inferrer_with_embeddings(&config, Some(&github_client)).await?;
+    let (inferrer, embedding_client) = watcher::Watcher::build_inferrer_with_embeddings(
+        &config,
+        Some(&github_client),
+        Some(tracker.as_ref()),
+    )
+    .await?;
 
     // Review watcher
     let review_watcher = build_review_watcher(&config, tracker.clone());
@@ -197,9 +216,59 @@ pub async fn build_app(
                     .default_provider_config()
                     .map(|p| p.skip_permissions)
                     .unwrap_or(false),
+                binary: config
+                    .agent
+                    .default_provider_config()
+                    .and_then(|p| p.binary.clone())
+                    .unwrap_or_else(|| "claude".to_string()),
+                env: config
+                    .agent
+                    .default_provider_config()
+                    .map(|p| p.env.clone())
+                    .unwrap_or_default(),
             },
             tracker.clone(),
         )));
+
+    // Build a separate agent runner for classification if configured
+    let classification_agent: Option<Arc<dyn runner::AgentRunner>> = config
+        .agent
+        .default_provider_config()
+        .and_then(|p| p.classification_model.clone())
+        .map(|model| {
+            let r = runner::ClaudeAgentRunner::new(
+                runner::ClaudeRunnerConfig {
+                    timeout_secs: config.agent.timeout_secs,
+                    model: Some(model),
+                    instructions: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.instructions.clone()),
+                    permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.permissions.clone())
+                        .unwrap_or_default(),
+                    skip_permissions: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.skip_permissions)
+                        .unwrap_or(false),
+                    binary: config
+                        .agent
+                        .default_provider_config()
+                        .and_then(|p| p.binary.clone())
+                        .unwrap_or_else(|| "claude".to_string()),
+                    env: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.env.clone())
+                        .unwrap_or_default(),
+                },
+                tracker.clone(),
+            );
+            telemetry::InstrumentedRunner::wrap(Arc::new(r)) as Arc<dyn runner::AgentRunner>
+        });
 
     Ok(AppComponents {
         config,
@@ -212,6 +281,7 @@ pub async fn build_app(
         review_watcher,
         issue_embedding_service,
         agent,
+        classification_agent,
     })
 }
 

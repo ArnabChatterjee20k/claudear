@@ -74,18 +74,37 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock build.rs ./
+COPY crates/claudear-core/Cargo.toml crates/claudear-core/Cargo.toml
+COPY crates/claudear-config/Cargo.toml crates/claudear-config/Cargo.toml
+COPY crates/claudear-storage/Cargo.toml crates/claudear-storage/Cargo.toml
+COPY crates/claudear-analysis/Cargo.toml crates/claudear-analysis/Cargo.toml
+COPY crates/claudear-integrations/Cargo.toml crates/claudear-integrations/Cargo.toml
+COPY crates/claudear-engine/Cargo.toml crates/claudear-engine/Cargo.toml
+COPY crates/claudear-e2e/Cargo.toml crates/claudear-e2e/Cargo.toml
 RUN if [ -n "${APP_VERSION}" ] && [ "${APP_VERSION}" != "0.1.0" ]; then \
       sed -i '/^\[package\]/,/^$/ s/^version = .*/version = "'"${APP_VERSION}"'"/' Cargo.toml; \
     fi
-RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
+# Create stubs for each crate so cargo can resolve the workspace and cache dependencies
+RUN mkdir -p src crates/claudear-core/src crates/claudear-config/src \
+    crates/claudear-storage/src crates/claudear-analysis/src \
+    crates/claudear-integrations/src crates/claudear-engine/src \
+    crates/claudear-e2e/src \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
+    && for c in core config storage analysis integrations engine; do \
+         echo "" > crates/claudear-$c/src/lib.rs; done \
+    && echo "fn main() {}" > crates/claudear-e2e/src/main.rs
 RUN mkdir -p dashboard/dist
-RUN cargo build --release --bin claudear && rm -rf src
+RUN cargo build --release --bin claudear && rm -rf src crates/*/src
 
 COPY src ./src
+COPY crates ./crates
 COPY migrations ./migrations
 
 COPY --from=dashboard /app/dashboard/dist ./dashboard/dist
-RUN touch src/main.rs src/lib.rs && cargo build --release --bin claudear
+RUN touch src/main.rs src/lib.rs \
+    && for c in core config storage analysis integrations engine; do touch crates/claudear-$c/src/lib.rs; done \
+    && cargo build --release --bin claudear
 
 FROM debian:${DEBIAN_VERSION}-slim AS final
 ARG GIT_USER_NAME

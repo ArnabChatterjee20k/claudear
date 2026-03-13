@@ -8,11 +8,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-Dwarnings"
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-Dwarnings -C linker=clang -C link-arg=-fuse-ld=mold"
+  FASTEMBED_CACHE_DIR: /home/runner/.cache/fastembed
+  HF_HOME: /home/runner/.cache/fastembed
 
 jobs:
-  lint:
-    name: Lint
+  compile:
+    name: Compile
     runs-on: ubuntu-latest
     env:
       FASTEMBED_CACHE_DIR: /home/runner/.cache/fastembed
@@ -20,13 +23,22 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install system dependencies
+        run: sudo apt-get install -y mold
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@v5
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cargo-tarpaulin
+        run: cargo binstall --no-confirm cargo-tarpaulin
+
+      - name: Restore cargo cache
+        uses: actions/cache/restore@v5
         with:
           path: |
             ~/.cargo/registry
@@ -35,6 +47,49 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+
+      - name: Create dashboard dist stub
+        run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
+
+      - name: Compile all test targets via tarpaulin
+        run: cargo tarpaulin --workspace --all-features --skip-clean --no-run
+
+      - name: Save compiled cache
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-compiled-${{ github.sha }}
+
+  lint:
+    name: Lint
+    needs: [compile]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y mold
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Restore compiled cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-compiled-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-compiled-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -43,39 +98,52 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   test:
-    name: Test
+    name: Test (${{ matrix.crate }})
+    needs: [compile]
     runs-on: ubuntu-latest
-    env:
-      FASTEMBED_CACHE_DIR: /home/runner/.cache/fastembed
-      HF_HOME: /home/runner/.cache/fastembed
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - claudear-core
+          - claudear-config
+          - claudear-storage
+          - claudear-analysis
+          - claudear-engine
+          - claudear-integrations
+          - claudear
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: sudo apt-get install -y mold
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
+      - name: Restore compiled cache
+        uses: actions/cache/restore@v5
         with:
           path: |
+            ~/.cargo/bin
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-compiled-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-compiled-
 
       - name: Cache fastembed model
+        if: matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear'
+        id: fastembed-cache
         uses: actions/cache@v5
         with:
           path: ${{ env.FASTEMBED_CACHE_DIR }}
           key: fastembed-nomic-embed-text-v1.5
           enableCrossOsArchive: true
 
-      - name: Warmup embedding model
+      - name: Download embedding model
+        if: (matrix.crate == 'claudear-analysis' || matrix.crate == 'claudear') && steps.fastembed-cache.outputs.cache-hit != 'true'
         run: |
           python3 -m pip install -q huggingface-hub
           python3 -c "
@@ -87,14 +155,19 @@ jobs:
           )
           "
 
+      - name: Create dashboard dist stub
+        if: matrix.crate == 'claudear-engine' || matrix.crate == 'claudear'
+        run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
+
       - name: Run tests
-        run: cargo tarpaulin --out Xml --all-features
+        run: cargo tarpaulin -p ${{ matrix.crate }} --all-features --skip-clean --out Xml
 
       - name: Upload coverage to Codecov
         if: env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v5
         with:
           fail_ci_if_error: true
+          flags: ${{ matrix.crate }}
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -102,6 +175,8 @@ jobs:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-Dwarnings"
     strategy:
       fail-fast: false
       matrix:
@@ -130,6 +205,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+
+      - name: Create dashboard dist stub
+        run: mkdir -p dashboard/dist && touch dashboard/dist/index.html
+        shell: bash
 
       - name: Build release
         run: cargo build --release

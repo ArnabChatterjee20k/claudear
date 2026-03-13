@@ -86,6 +86,8 @@ pub struct WebhookServer {
     github_handler: Option<GitHubWebhookHandler>,
     agent: Arc<dyn AgentRunner>,
     port: u16,
+    /// When set, the dashboard API routes are merged into the webhook server.
+    dashboard_config_path: Option<std::path::PathBuf>,
 }
 
 impl WebhookServer {
@@ -138,6 +140,7 @@ impl WebhookServer {
             github_handler,
             agent,
             port,
+            dashboard_config_path: None,
         }
     }
 
@@ -164,14 +167,20 @@ impl WebhookServer {
         self.embedding_client = client;
     }
 
+    /// Enable the dashboard API routes alongside the webhook routes.
+    pub fn set_dashboard(&mut self, config_path: std::path::PathBuf) {
+        self.dashboard_config_path = Some(config_path);
+    }
+
     /// Build a repository inferrer from config.
     ///
     /// Delegates to `Watcher::build_inferrer` to avoid code duplication.
     pub async fn build_inferrer(
         config: &Config,
         github_client: Option<&crate::github::GitHubClient>,
+        tracker: Option<&dyn FixAttemptTracker>,
     ) -> Result<Option<RepoInferrer>> {
-        crate::watcher::Watcher::build_inferrer(config, github_client).await
+        crate::watcher::Watcher::build_inferrer(config, github_client, tracker).await
     }
 
     /// Start the server.
@@ -230,19 +239,38 @@ impl WebhookServer {
         // Combined with the processing set, this provides effective rate control
         let concurrency_layer = ConcurrencyLimitLayer::new(10);
 
-        let app = Router::new()
+        let webhook_routes = Router::new()
             .route("/health", get(health_handler))
             .route(
-                "/webhook/:source",
+                "/webhook/{source}",
                 get(webhook_verify_handler)
                     .post(webhook_handler)
                     .layer(concurrency_layer),
             )
             .layer(DefaultBodyLimit::max(512 * 1024)) // 512 KB body size limit
+            .with_state(state.clone());
+
+        // If dashboard is enabled, merge the dashboard API routes into the
+        // same server so both webhooks and the dashboard share a single port.
+        let dashboard_enabled = self.dashboard_config_path.is_some();
+        let app = if let Some(config_path) = self.dashboard_config_path {
+            let indexing_rx = state.tracker.subscribe_indexing_progress();
+            let dashboard_routes = claudear_engine::api::create_api_router_with_dashboard(
+                state.config.clone(),
+                state.tracker.clone(),
+                config_path,
+                indexing_rx,
+                None,
+            );
+            webhook_routes.merge(dashboard_routes)
+        } else {
+            webhook_routes
+        };
+
+        let app = app
             // Sentry layers: NewSentryLayer must be outermost (added last in axum's layer chain)
             .layer(SentryHttpLayer::new().enable_transaction())
-            .layer(NewSentryLayer::new_from_top())
-            .with_state(state.clone());
+            .layer(NewSentryLayer::new_from_top());
 
         let tls_enabled = state.config.tls.enabled;
         let scheme = if tls_enabled { "https" } else { "http" };
@@ -284,6 +312,9 @@ impl WebhookServer {
                 display_port,
                 handler.source_name()
             );
+        }
+        if dashboard_enabled {
+            tracing::info!("  Dashboard {}://localhost:{}", scheme, display_port);
         }
 
         if tls_enabled {
@@ -853,6 +884,7 @@ async fn process_issue(
         review_watcher: state.review_watcher.clone(),
         user_registry: state.user_registry.clone(),
         github_client: None,
+        llm_analyzer: None,
     };
 
     let input = ProcessingInput {
@@ -885,6 +917,16 @@ async fn process_issue(
             format!("Webhook processed: {} - failed", issue.short_id),
             json!({ "success": false, "error": error }),
         ),
+        ProcessingOutcome::WrongRepo {
+            original_repo,
+            suggested_repo,
+        } => (
+            format!(
+                "Webhook processed: {} - wrong repo ({})",
+                issue.short_id, original_repo
+            ),
+            json!({ "success": false, "wrong_repo": true, "original_repo": original_repo, "suggested_repo": suggested_repo }),
+        ),
     };
     let activity = ActivityLogEntry::new("webhook_processed", activity_msg)
         .with_source(source_name.clone())
@@ -908,7 +950,6 @@ mod tests {
         AgentConfig, AskConfig, CascadeConfig, CodeIndexConfig, IssuesConfig, LearningConfig,
         NotifiersConfig, PrioritisationConfig, RegressionConfig, RetryConfig, ScmConfig,
     };
-    use crate::feedback::Outcome;
     use crate::notifier::Notifier;
     use crate::processing::{
         enhance_prompt_with_learning, notify_failed_with_escalation, record_error_pattern,
@@ -916,6 +957,7 @@ mod tests {
     };
     use crate::reports::Report;
     use crate::storage::{AttemptTracker, SqliteTracker, WebhookStore};
+    use crate::types::Outcome;
     use crate::types::{Issue, MatchPriority, MatchResult};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1045,8 +1087,10 @@ mod tests {
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
+            llm: crate::config::LlmModelConfig::default(),
             chat: crate::config::ChatConfig::default(),
             tls: crate::config::TlsConfig::default(),
+            embedding: crate::config::EmbeddingModelConfig::default(),
         }
     }
 

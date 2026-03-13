@@ -1,0 +1,92 @@
+[package]
+name = "claudear-analysis"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = []
+sqlite = ["claudear-core/sqlite", "claudear-storage/sqlite"]
+cuda = ["ort/cuda"]
+
+[dependencies]
+claudear-core = { workspace = true }
+claudear-config = { workspace = true }
+claudear-storage = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Async
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# Regex
+regex-lite = { workspace = true }
+
+# Embeddings
+fastembed = { workspace = true }
+
+# ORT runtime (download binaries with rustls instead of native-tls)
+ort = { workspace = true }
+
+# Tree-sitter code parsing
+tree-sitter = { workspace = true }
+tree-sitter-rust = { workspace = true }
+tree-sitter-javascript = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-python = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-java = { workspace = true }
+tree-sitter-c = { workspace = true }
+tree-sitter-cpp = { workspace = true }
+tree-sitter-ruby = { workspace = true }
+tree-sitter-php = { workspace = true }
+tree-sitter-swift = { workspace = true }
+tree-sitter-kotlin-ng = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
+tree-sitter-json = { workspace = true }
+tree-sitter-yaml = { workspace = true }
+tree-sitter-lua = { workspace = true }
+
+# Parallel iteration
+rayon = { workspace = true }
+
+# File system utilities
+walkdir = { workspace = true }
+
+# Crypto (for content hashing)
+sha2 = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Crypto (hex encoding)
+hex = { workspace = true }
+
+# URL encoding
+urlencoding = { workspace = true }
+
+# System info
+sysinfo = { workspace = true }
+
+# Semantic versioning
+semver = { workspace = true }
+
+# Base64
+base64 = { workspace = true }
+
+# Async utilities
+futures = { workspace = true }
+
+# File system utilities (home dir)
+dirs = { workspace = true }
+
+# Random
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

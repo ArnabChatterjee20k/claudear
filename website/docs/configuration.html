@@ -143,14 +143,18 @@
             <ul>
             <li><code>default_provider</code>: which provider to use (default: <code>"claude"</code>).</li>
             <li><code>timeout_secs</code>: maximum time an agent run can take before being stopped.</li>
+            <li><code>use_llm</code>: use the local LLM model as the agent runner instead of an external provider. Requires <code>[llm]</code> to be enabled. Fully offline but much slower. Creates PRs via <code>gh</code> CLI (default: <code>false</code>).</li>
             </ul>
             <h3 id="claude-provider"><a class="anchor-link" href="#claude-provider" aria-label="Link to Claude provider settings">#</a>Claude provider settings (<code>[agent.providers.claude]</code>)</h3>
             <ul>
             <li><code>model</code>: the Claude model to use (e.g. <code>"sonnet"</code>, <code>"opus"</code>, <code>"haiku"</code>, or a full model ID).</li>
+            <li><code>classification_model</code>: cheaper model for repo classification (falls back to <code>model</code>). E.g., <code>"haiku"</code>.</li>
             <li><code>instructions</code>: custom instructions appended to Claude's system prompt. Use this to enforce coding standards, style rules, or project-specific guidance.</li>
             <li><code>instructions_file</code>: path to a file with additional instructions. If both <code>instructions</code> and <code>instructions_file</code> are set, the file content comes first.</li>
             <li><code>permissions</code>: tool permissions granted without prompting (e.g. <code>["Bash(git *)", "Read", "Edit"]</code>).</li>
             <li><code>skip_permissions</code>: skip all interactive permission prompts (default: <code>true</code>).</li>
+            <li><code>binary</code>: CLI binary name or absolute path (default: <code>"claude"</code>). Set the full path when the daemon cannot find the binary via PATH.</li>
+            <li><code>env</code>: extra environment variables for the agent process. Useful when running as a systemd service where PATH is limited (e.g. <code>env = { PATH = "/home/user/.local/bin:..." }</code>).</li>
             </ul>
           </div>
         </details>
@@ -192,6 +196,7 @@
             <li><code>token</code>: a personal access token with repo access.</li>
             <li><code>auto_resolve_on_merge</code>: automatically close the source issue when the PR merges.</li>
             <li><code>review_trigger</code>: the tag that triggers Claudear to respond to PR review comments (default: <code>@claudear</code>).</li>
+            <li><code>allowed_bots</code>: bot usernames whose review comments are processed. Use login name without <code>[bot]</code> suffix (e.g., <code>"copilot"</code>).</li>
             <li><code>use_ssh</code>: clone repos over SSH instead of HTTPS.</li>
             <li><code>webhook_secret</code>: for verifying incoming GitHub webhooks.</li>
             </ul>
@@ -220,6 +225,7 @@
             <li><code>auto_resolve_on_merge</code>: close source issues when MRs merge.</li>
             <li><code>webhook_secret</code>: secret for verifying GitLab webhook payloads.</li>
             <li><code>review_trigger</code>: tag that triggers Claudear on MR review comments.</li>
+            <li><code>allowed_bots</code>: bot usernames whose MR comments are processed.</li>
             <li><code>use_ssh</code>: clone repos over SSH instead of HTTPS.</li>
             <li><code>max_issues_per_cycle</code>, <code>max_concurrent</code>: per-source rate limiting overrides.</li>
             </ul>
@@ -454,6 +460,23 @@
           </div>
         </details>
 
+        <details id="llm-config">
+          <summary>Local LLM (<code>[llm]</code>) <span class="summary-desc">offline repo classification and code chat</span></summary>
+          <div class="details-content">
+            <p>Optional local model for offline repo classification and code chat. Uses a GGUF model via llama-cpp-2.</p>
+            <ul>
+            <li><code>enabled</code>: enable the local LLM (default: <code>false</code>).</li>
+            <li><code>model_path</code>: path to the GGUF model file.</li>
+            <li><code>model_url</code>: download URL for auto-download on startup if model is missing.</li>
+            <li><code>context_length</code>: context window in tokens (default: <code>16384</code>).</li>
+            <li><code>gpu_layers</code>: layers to offload to GPU, <code>0</code> = CPU only, <code>99</code> = all (default: <code>99</code>).</li>
+            <li><code>threads</code>: inference threads, <code>0</code> = auto-detect (default: <code>0</code>).</li>
+            <li><code>inference_timeout_secs</code>: max seconds per inference call, <code>0</code> = no limit (default: <code>120</code>).</li>
+            <li><code>use_agent</code>: use the configured agent (claude/codex) for repo classification instead of the local model. Much faster but costs API credits (default: <code>false</code>).</li>
+            </ul>
+          </div>
+        </details>
+
         <details id="dashboard-config">
           <summary>Dashboard (<code>[dashboard]</code>) <span class="summary-desc">display and cost settings</span></summary>
           <div class="details-content">
@@ -573,10 +596,17 @@ default_provider = &quot;claude&quot;
 # Agent process execution timeout in seconds (default: 21600 = 6 hours)
 timeout_secs = 21600
 
+# Use the local LLM as the agent runner instead of an external provider (default: false)
+# Requires [llm] to be enabled. Fully offline but much slower. Creates PRs via `gh` CLI.
+use_llm = false
+
 [agent.providers.claude]
 # Model to use (default: Claude CLI default)
 # Options: sonnet, opus, haiku, or full model ID (e.g., claude-sonnet-4-5-20250929)
 model = &quot;sonnet&quot;
+
+# Cheaper model for repo classification (falls back to model)
+# classification_model = &quot;haiku&quot;
 
 # Custom instructions appended to Claude&#39;s system prompt
 instructions = &quot;Always write tests. Follow existing code style.&quot;
@@ -670,6 +700,10 @@ webhook_secret = &quot;&quot;
 # Set to empty string to respond to all comments.
 review_trigger = &quot;@claudear&quot;
 
+# Bot usernames whose review comments are processed (default: [])
+# Use login name without [bot] suffix
+# allowed_bots = [&quot;copilot&quot;]
+
 # Use SSH URLs for cloning instead of HTTPS (default: false)
 # Set to true if SSH keys are configured for GitHub.
 use_ssh = false
@@ -737,6 +771,9 @@ webhook_secret = &quot;&quot;
 
 # Trigger tag for MR review comments (default: @claudear)
 review_trigger = &quot;@claudear&quot;
+
+# Bot usernames whose MR comments are processed (default: [])
+# allowed_bots = []
 
 # Use SSH URLs for cloning instead of HTTPS (default: false)
 use_ssh = false
@@ -1233,6 +1270,31 @@ fail_on_regression = false
 # custom_coverage_cmd = &quot;npm run coverage&quot;
 
 # ============================================
+# Local LLM
+# ============================================
+# Optional local model for offline repo classification and code chat.
+
+[llm]
+# Enable the local LLM (default: false)
+enabled = false
+
+# Path to the GGUF model file
+model_path = &quot;~/.cache/claudear/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf&quot;
+
+# Context window length in tokens (default: 16384)
+context_length = 16384
+
+# Number of layers to offload to GPU (0 = CPU only, 99 = all; default: 99)
+gpu_layers = 99
+
+# Maximum time in seconds for a single LLM inference call (0 = no limit; default: 120)
+inference_timeout_secs = 120
+
+# Use the configured agent (claude/codex) for repo classification instead of
+# the local model. Much faster but costs API credits. (default: false)
+use_agent = false
+
+# ============================================
 # Dashboard
 # ============================================
 # Display and cost estimation settings for the web dashboard.
@@ -1288,6 +1350,109 @@ enabled = false
           </div>
         </details>
 
+        <h3 id="embedding"><a class="anchor-link" href="#embedding" aria-label="Link to Embedding">#</a><code>[embedding]</code></h3>
+        <p>ONNX embedding model settings for code indexing and semantic search. GPU acceleration requires building with <code>--features cuda</code>.</p>
+        <div class="overflow-x-auto">
+          <table>
+            <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>gpu</code></td><td>bool</td><td><code>false</code></td><td>Try CUDA execution provider for GPU-accelerated embeddings. Falls back to CPU gracefully</td></tr>
+              <tr><td><code>device_id</code></td><td>int</td><td><code>0</code></td><td>CUDA device index</td></tr>
+              <tr><td><code>pool_size</code></td><td>int</td><td><code>0</code></td><td>Model instance pool size (0 = auto-detect from CPUs/RAM). GPU should use 1</td></tr>
+              <tr><td><code>sub_batch_size</code></td><td>int</td><td><code>0</code></td><td>Sub-batch size (0 = auto-detect). GPU can handle 64-256 vs CPU 4-16</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="code-index"><a class="anchor-link" href="#code-index" aria-label="Link to Code index">#</a><code>[code_index]</code></h3>
+        <p>Tree-sitter based code indexing for semantic search across repositories.</p>
+        <div class="overflow-x-auto">
+          <table>
+            <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td>bool</td><td><code>true</code></td><td>Enable tree-sitter code indexing</td></tr>
+              <tr><td><code>max_file_size_kb</code></td><td>int</td><td><code>1024</code></td><td>Maximum file size to index in KB</td></tr>
+              <tr><td><code>batch_size</code></td><td>int</td><td><code>32</code></td><td>Embedding batch size</td></tr>
+              <tr><td><code>reindex_interval_hours</code></td><td>float</td><td><code>6.0</code></td><td>Hours between re-indexing all repos (0 = disable)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="evaluation"><a class="anchor-link" href="#evaluation" aria-label="Link to Evaluation">#</a><code>[evaluation]</code></h3>
+        <p>Runs before/after comparisons (tests, lint, static analysis, coverage) to validate fixes before submitting PRs.</p>
+        <div class="overflow-x-auto">
+          <table>
+            <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable self-evaluation (opt-in, can be slow)</td></tr>
+              <tr><td><code>test_delta</code></td><td>bool</td><td><code>true</code></td><td>Run test before/after comparison</td></tr>
+              <tr><td><code>lint_delta</code></td><td>bool</td><td><code>true</code></td><td>Run lint before/after comparison</td></tr>
+              <tr><td><code>static_analysis_delta</code></td><td>bool</td><td><code>true</code></td><td>Run static analysis before/after comparison</td></tr>
+              <tr><td><code>coverage_delta</code></td><td>bool</td><td><code>false</code></td><td>Run coverage before/after comparison (slowest)</td></tr>
+              <tr><td><code>tool_timeout_secs</code></td><td>int</td><td><code>300</code></td><td>Timeout per tool in seconds</td></tr>
+              <tr><td><code>total_timeout_secs</code></td><td>int</td><td><code>900</code></td><td>Total timeout for all tools</td></tr>
+              <tr><td><code>post_pr_comment</code></td><td>bool</td><td><code>true</code></td><td>Post evaluation results as PR comment</td></tr>
+              <tr><td><code>fail_on_regression</code></td><td>bool</td><td><code>false</code></td><td>Fail the fix attempt on quality regression</td></tr>
+              <tr><td><code>custom_test_cmd</code></td><td>string</td><td><em>auto</em></td><td>Custom test command (auto-detected when empty)</td></tr>
+              <tr><td><code>custom_lint_cmd</code></td><td>string</td><td><em>auto</em></td><td>Custom lint command</td></tr>
+              <tr><td><code>custom_analysis_cmd</code></td><td>string</td><td><em>auto</em></td><td>Custom static analysis command</td></tr>
+              <tr><td><code>custom_coverage_cmd</code></td><td>string</td><td><em>auto</em></td><td>Custom coverage command</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="llm"><a class="anchor-link" href="#llm" aria-label="Link to LLM">#</a><code>[llm]</code></h3>
+        <p>Local inference model used for repo classification and code chat. Runs entirely offline using llama.cpp.</p>
+        <div class="overflow-x-auto">
+          <table>
+            <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable the local LLM</td></tr>
+              <tr><td><code>model_path</code></td><td>string</td><td>&mdash;</td><td>Path to the GGUF model file</td></tr>
+              <tr><td><code>model_url</code></td><td>string</td><td>&mdash;</td><td>Download URL (auto-downloaded on startup if missing)</td></tr>
+              <tr><td><code>context_length</code></td><td>int</td><td><code>8192</code></td><td>Context window length in tokens</td></tr>
+              <tr><td><code>gpu_layers</code></td><td>int</td><td><code>99</code></td><td>Layers to offload to GPU (0 = CPU only, 99 = all)</td></tr>
+              <tr><td><code>threads</code></td><td>int</td><td><code>0</code></td><td>Inference threads (0 = auto-detect)</td></tr>
+              <tr><td><code>inference_timeout_secs</code></td><td>int</td><td><code>120</code></td><td>Max time per inference call in seconds</td></tr>
+              <tr><td><code>use_agent</code></td><td>bool</td><td><code>false</code></td><td>Use the configured agent (claude/codex) for repo classification instead. Faster but costs API credits</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="chat"><a class="anchor-link" href="#chat" aria-label="Link to Chat">#</a><code>[chat]</code></h3>
+        <p>Local code chat feature. Requires <code>[llm]</code> to also be enabled.</p>
+        <div class="overflow-x-auto">
+          <table>
+            <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable the chat feature</td></tr>
+              <tr><td><code>temperature</code></td><td>float</td><td><code>0.7</code></td><td>Generation temperature</td></tr>
+              <tr><td><code>top_p</code></td><td>float</td><td><code>0.9</code></td><td>Top-p sampling</td></tr>
+              <tr><td><code>max_tokens</code></td><td>int</td><td><code>2048</code></td><td>Max tokens per response</td></tr>
+              <tr><td><code>max_context_chunks</code></td><td>int</td><td><code>10</code></td><td>Code chunks to retrieve per query</td></tr>
+              <tr><td><code>max_history_messages</code></td><td>int</td><td><code>20</code></td><td>Conversation history messages to include</td></tr>
+              <tr><td><code>session_ttl_days</code></td><td>int</td><td><code>7</code></td><td>Session TTL in days, cleaned by housekeeping</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="tls"><a class="anchor-link" href="#tls" aria-label="Link to TLS">#</a><code>[tls]</code></h3>
+        <p>Automatic TLS certificate provisioning using Let&rsquo;s Encrypt ACME TLS-ALPN-01 challenge. No reverse proxy required.</p>
+        <div class="overflow-x-auto">
+          <table>
+            <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td><code>enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable automatic TLS provisioning</td></tr>
+              <tr><td><code>domains</code></td><td>list</td><td>&mdash;</td><td>Domain names to provision certificates for</td></tr>
+              <tr><td><code>email</code></td><td>string</td><td>&mdash;</td><td>Contact email for Let&rsquo;s Encrypt notifications</td></tr>
+              <tr><td><code>production</code></td><td>bool</td><td><code>false</code></td><td>Use production environment (false = staging)</td></tr>
+              <tr><td><code>cache_dir</code></td><td>string</td><td><code>"./acme_cache"</code></td><td>Directory for caching ACME certificates</td></tr>
+              <tr><td><code>https_port</code></td><td>int</td><td><code>443</code></td><td>HTTPS listen port</td></tr>
+              <tr><td><code>http_redirect_port</code></td><td>int</td><td><code>80</code></td><td>HTTP&rarr;HTTPS redirect port (0 = disable)</td></tr>
+            </tbody>
+          </table>
+        </div>
+
       </article>
       <div class="docs-page-nav grid grid-cols-2 gap-4 pt-12 max-w-[780px]">
         <a href="./operations.html" class="group border border-border rounded-lg p-4 hover:border-accent/30 transition-colors">
@@ -1329,10 +1494,17 @@ enabled = false
         <li class="toc-item" data-toc-text="prioritisation ([prioritisation])"><a class="toc-link" data-toc-link href="#prioritisation" data-target-id="prioritisation"><span class="toc-link-label">Prioritisation</span></a></li>
         <li class="toc-item" data-toc-text="code indexing ([code_index])"><a class="toc-link" data-toc-link href="#code-index" data-target-id="code-index"><span class="toc-link-label">Code indexing</span></a></li>
         <li class="toc-item" data-toc-text="self-evaluation ([evaluation])"><a class="toc-link" data-toc-link href="#evaluation" data-target-id="evaluation"><span class="toc-link-label">Self-evaluation</span></a></li>
+        <li class="toc-item" data-toc-text="local llm ([llm])"><a class="toc-link" data-toc-link href="#llm-config" data-target-id="llm-config"><span class="toc-link-label">Local LLM</span></a></li>
         <li class="toc-item" data-toc-text="dashboard ([dashboard])"><a class="toc-link" data-toc-link href="#dashboard-config" data-target-id="dashboard-config"><span class="toc-link-label">Dashboard</span></a></li>
         <li class="toc-item" data-toc-text="tls auto-provisioning ([tls])"><a class="toc-link" data-toc-link href="#tls-config" data-target-id="tls-config"><span class="toc-link-label">TLS auto-provisioning</span></a></li>
         <li class="toc-item" data-toc-text="minimal config"><a class="toc-link" data-toc-link href="#minimal-config" data-target-id="minimal-config"><span class="toc-link-label">Minimal config</span></a></li>
         <li class="toc-item" data-toc-text="full annotated example"><a class="toc-link" data-toc-link href="#full-annotated-example-config-appendix" data-target-id="full-annotated-example-config-appendix"><span class="toc-link-label">Full annotated example</span></a></li>
+          <li class="toc-item" data-toc-text="embedding"><a class="toc-link toc-link-sub" data-toc-link href="#embedding" data-target-id="embedding"><span class="toc-link-label">[embedding]</span></a></li>
+          <li class="toc-item" data-toc-text="code index"><a class="toc-link toc-link-sub" data-toc-link href="#code-index" data-target-id="code-index"><span class="toc-link-label">[code_index]</span></a></li>
+          <li class="toc-item" data-toc-text="evaluation"><a class="toc-link toc-link-sub" data-toc-link href="#evaluation" data-target-id="evaluation"><span class="toc-link-label">[evaluation]</span></a></li>
+          <li class="toc-item" data-toc-text="llm"><a class="toc-link toc-link-sub" data-toc-link href="#llm" data-target-id="llm"><span class="toc-link-label">[llm]</span></a></li>
+          <li class="toc-item" data-toc-text="chat"><a class="toc-link toc-link-sub" data-toc-link href="#chat" data-target-id="chat"><span class="toc-link-label">[chat]</span></a></li>
+          <li class="toc-item" data-toc-text="tls"><a class="toc-link toc-link-sub" data-toc-link href="#tls" data-target-id="tls"><span class="toc-link-label">[tls]</span></a></li>
         </ul>
         <div class="toc-empty" data-toc-empty hidden>No matching headings</div>
       </div>

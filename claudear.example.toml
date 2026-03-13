@@ -77,10 +77,18 @@ default_provider = "claude"
 # Agent process execution timeout in seconds (default: 21600 = 6 hours)
 timeout_secs = 21600
 
+# Use the local LLM model as the agent runner instead of an external provider.
+# Requires [llm] to be enabled. Much slower but fully offline. (default: false)
+use_llm = false
+
 [agent.providers.claude]
 # Model to use (default: Claude CLI default)
 # Options: sonnet, opus, haiku, or full model ID (e.g., claude-sonnet-4-5-20250929)
 model = "sonnet"
+
+# Model to use for repo classification (optional, falls back to model above)
+# Use a cheaper/faster model for classification to reduce costs
+# classification_model = "haiku"
 
 # Custom instructions appended to Claude's system prompt
 instructions = "Always write tests. Follow existing code style."
@@ -98,6 +106,11 @@ skip_permissions = true
 
 # CLI binary name/path (default: auto-detected, e.g., "claude", "codex")
 binary = "claude"
+
+# Extra environment variables for the agent process.
+# Useful when the daemon runs as a service and the CLI needs PATH or other vars.
+# [agent.providers.claude.env]
+# PATH = "/home/user/.local/bin:/home/user/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin"
 
 # API key for API-based providers (alternative to CLI-based execution)
 api_key = ""
@@ -179,6 +192,18 @@ max_reuse_candidates = 3
 # On timeout, continue with uncertainty note instead of hard-fail (default: true)
 best_effort_on_timeout = true
 
+# Require human approval before processing each issue (default: false)
+require_approval = false
+
+# Timeout for approval requests in seconds (falls back to wait_timeout_secs when unset)
+# approval_timeout_secs = 900
+
+# Confidence threshold for triggering approval (optional).
+# When set, approval is requested when repo inference confidence
+# is at or below this level. Valid: "high", "medium", "low", "none".
+# Replies can be "yes", "no", or "use <repo_name>" to redirect.
+# approval_confidence_threshold = "low"
+
 # ============================================
 # SCM (Source Control Management)
 # ============================================
@@ -201,6 +226,11 @@ webhook_secret = ""
 # Comments must include this tag to trigger Claude.
 # Set to empty string to respond to all comments.
 review_trigger = "@claudear"
+
+# Bot usernames whose review comments should be processed (default: [])
+# When set, comments from these bots are treated like @claudear-tagged comments.
+# Use the bot's login name without the [bot] suffix (e.g., "copilot" matches "copilot[bot]").
+allowed_bots = []
 
 # Use SSH URLs for cloning instead of HTTPS (default: false)
 # Set to true if SSH keys are configured for GitHub.
@@ -278,6 +308,10 @@ webhook_secret = ""
 
 # Trigger tag for MR review comments (default: @claudear)
 review_trigger = "@claudear"
+
+# Bot usernames whose MR comments should be processed (default: [])
+# When set, comments from these bots are treated like @claudear-tagged comments.
+allowed_bots = []
 
 # Use SSH URLs for cloning instead of HTTPS (default: false)
 use_ssh = false
@@ -447,6 +481,17 @@ workspace = "mycompany"
 # Slack user ID (e.g., bot's own user ID for reply detection)
 user_id = ""
 
+# Slack signing secret for verifying Events API webhook requests
+# Set via SLACK_SIGNING_SECRET env var for security
+signing_secret = ""
+
+# Slack app ID used for apps.manifest.export/update auto-configuration
+app_id = ""
+
+# Slack app configuration token used for manifest API calls
+# Set via SLACK_APP_CONFIG_TOKEN env var for security
+app_config_token = ""
+
 # Polling interval in milliseconds (overrides global)
 poll_interval_ms = 300000
 
@@ -558,6 +603,17 @@ phone_number_id = ""
 
 # Meta Graph API access token
 access_token = ""
+
+# WhatsApp Business Account (WABA) ID for webhook subscription setup
+business_account_id = ""
+
+# Meta app secret for verifying webhook signatures
+# Set via WHATSAPP_APP_SECRET env var for security
+app_secret = ""
+
+# Verify token used for WhatsApp webhook callback challenge
+# Set via WHATSAPP_WEBHOOK_VERIFY_TOKEN env var for security
+webhook_verify_token = ""
 
 # Default recipient phone numbers
 to_numbers = []
@@ -752,6 +808,29 @@ suppression_rules = [
 ]
 
 # ============================================
+# Embedding Model
+# ============================================
+# ONNX embedding model settings for code indexing and semantic search.
+# GPU acceleration requires building with `--features cuda`.
+
+[embedding]
+# Try CUDA execution provider for GPU-accelerated embeddings (default: false)
+# Requires the binary to be compiled with `--features cuda` AND a CUDA-capable GPU.
+# Falls back to CPU gracefully if CUDA is unavailable.
+gpu = false
+
+# CUDA device index (default: 0)
+device_id = 0
+
+# Override model instance pool size (0 = auto-detect from CPUs/RAM; default: 0)
+# GPU should use 1 to avoid wasting VRAM.
+pool_size = 0
+
+# Override sub-batch size (0 = auto-detect from available memory; default: 0)
+# GPU can handle larger batches (64-256) vs CPU (4-16).
+sub_batch_size = 0
+
+# ============================================
 # Code Indexing
 # ============================================
 # Tree-sitter based code indexing for semantic search across repositories.
@@ -765,6 +844,9 @@ max_file_size_kb = 1024
 
 # Embedding batch size (default: 32)
 batch_size = 32
+
+# How often (in hours) to pull and re-index all repositories (default: 6.0, 0 = disable)
+reindex_interval_hours = 6.0
 
 # ============================================
 # Self-Evaluation
@@ -818,6 +900,64 @@ max_plan_monthly_cost = 0.0
 
 # Hourly engineer rate for cost-savings calculation (default: 150.0)
 hourly_engineer_rate = 150.0
+
+# ============================================
+# Local LLM
+# ============================================
+# Local inference model used for repo classification and code chat.
+
+[llm]
+# Enable the local LLM (default: false)
+enabled = false
+
+# Path to the GGUF model file
+model_path = "~/.cache/claudear/models/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+
+# Download URL for the model file (auto-downloaded on startup if missing)
+model_url = "https://huggingface.co/Qwen/Qwen2.5-Coder-3B-Instruct-GGUF/resolve/main/qwen2.5-coder-3b-instruct-q4_k_m.gguf"
+
+# Context window length in tokens (default: 8192)
+context_length = 8192
+
+# Number of layers to offload to GPU (0 = CPU only, 99 = all; default: 99)
+gpu_layers = 99
+
+# Number of threads for inference (0 = auto-detect; default: 0)
+threads = 0
+
+# Maximum time in seconds for a single LLM inference call (0 = no limit; default: 120)
+inference_timeout_secs = 120
+
+# Use the configured agent (claude/codex) for repo classification instead of
+# the local LLM model. Much faster but costs API credits. (default: false)
+use_agent = false
+
+# ============================================
+# Code Chat
+# ============================================
+# Local code chat feature (requires [llm] to also be enabled).
+
+[chat]
+# Enable the chat feature (default: false)
+enabled = false
+
+# Default generation temperature (default: 0.7)
+temperature = 0.7
+
+# Default top-p sampling (default: 0.9)
+top_p = 0.9
+
+# Maximum tokens to generate per response (default: 2048)
+max_tokens = 2048
+
+# Number of code chunks to retrieve per query (default: 10)
+max_context_chunks = 10
+
+# Maximum conversation history messages to include in context (default: 20)
+max_history_messages = 20
+
+# Session TTL in days, cleaned by housekeeping (default: 7)
+session_ttl_days = 7
 
 # ============================================
 # TLS Auto-Provisioning (Let's Encrypt)

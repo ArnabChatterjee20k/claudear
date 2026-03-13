@@ -1,0 +1,40 @@
+[package]
+name = "claudear-storage"
+version = "1.0.0"
+edition = "2021"
+
+[features]
+default = []
+sqlite = ["dep:rusqlite", "claudear-core/sqlite"]
+
+[dependencies]
+claudear-core = { workspace = true }
+
+# Database
+rusqlite = { workspace = true, optional = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Async
+async-trait = { workspace = true }
+
+# Regex
+regex-lite = { workspace = true }
+
+# Async runtime (for watch channels)
+tokio = { workspace = true }
+
+# Crypto (for error hashing)
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Random (for test utilities)
+rand = { workspace = true }
