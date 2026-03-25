@@ -1,6 +1,6 @@
 //! HTTP server for webhooks.
 
-use super::{GitHubWebhookHandler, WebhookHandler, WebhookHandlerRegistry};
+use super::{GitHubWebhookHandler, WebhookAction, WebhookHandler, WebhookHandlerRegistry};
 use crate::config::Config;
 use crate::error::Error;
 use crate::error::Result;
@@ -816,11 +816,24 @@ async fn handle_github_webhook(
         .process_webhook(body.as_ref(), &payload, header_map)
         .await
     {
-        Ok(true) => (StatusCode::OK, Json(json!({ "status": "processed" }))),
-        Ok(false) => (
+        Ok(WebhookAction::Processed) => {
+            (StatusCode::OK, Json(json!({ "status": "processed" })))
+        }
+        Ok(WebhookAction::Ignored) => (
             StatusCode::OK,
             Json(json!({ "status": "ignored", "reason": "Event not applicable" })),
         ),
+        Ok(WebhookAction::PrClosed { pr_url, merged }) => {
+            handle_pr_closed_webhook(&state, &pr_url, merged);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "processed",
+                    "action": "pr_closed",
+                    "merged": merged
+                })),
+            )
+        }
         Err(Error::Webhook(_)) | Err(Error::InvalidSignature) => {
             let rejected_activity = ActivityLogEntry::new(
                 "webhook_rejected",
@@ -840,6 +853,92 @@ async fn handle_github_webhook(
                 Json(json!({ "error": "Failed to process GitHub webhook" })),
             )
         }
+    }
+}
+
+/// Handle a PR closed/merged event received via webhook.
+///
+/// Looks up the fix attempt by PR URL and updates its status immediately so the
+/// dashboard reflects reality without waiting for the next polling cycle. Cascade
+/// triggering is intentionally left to the housekeeping loop.
+fn handle_pr_closed_webhook(state: &Arc<AppState>, pr_url: &str, merged: bool) {
+    let attempt = match state.tracker.get_attempt_by_pr_url(pr_url) {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            tracing::debug!(
+                source = "github",
+                pr_url = %pr_url,
+                "No fix attempt found for PR URL, ignoring close event"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::error!(
+                source = "github",
+                pr_url = %pr_url,
+                error = %e,
+                "Failed to look up fix attempt by PR URL"
+            );
+            return;
+        }
+    };
+
+    if merged {
+        if let Err(e) = state.tracker.mark_merged(&attempt.source, &attempt.issue_id) {
+            tracing::error!(
+                source = "github",
+                issue_id = %attempt.issue_id,
+                error = %e,
+                "Failed to mark attempt as merged via webhook"
+            );
+            return;
+        }
+
+        let activity = ActivityLogEntry::new(
+            "pr_merged",
+            format!("PR merged (webhook): {}", pr_url),
+        )
+        .with_source(attempt.source.clone())
+        .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+        .with_metadata(json!({ "pr_url": pr_url, "via": "webhook" }));
+        state.tracker.record_activity(&activity).ok();
+
+        if attempt.scm_repo.is_some() {
+            state.tracker.update_pr_status(pr_url, "merged").ok();
+        }
+    } else {
+        if let Err(e) = state.tracker.mark_closed(&attempt.source, &attempt.issue_id) {
+            tracing::error!(
+                source = "github",
+                issue_id = %attempt.issue_id,
+                error = %e,
+                "Failed to mark attempt as closed via webhook"
+            );
+            return;
+        }
+
+        let activity = ActivityLogEntry::new(
+            "pr_closed",
+            format!("PR closed without merge (webhook): {}", pr_url),
+        )
+        .with_source(attempt.source.clone())
+        .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+        .with_metadata(json!({ "pr_url": pr_url, "via": "webhook" }));
+        state.tracker.record_activity(&activity).ok();
+
+        if attempt.scm_repo.is_some() {
+            state.tracker.update_pr_status(pr_url, "closed").ok();
+        }
+    }
+
+    // Unwatch the PR from the review watcher since it's no longer open
+    if let Some(ref review_watcher) = state.review_watcher {
+        review_watcher.unwatch_pr(pr_url);
+        tracing::debug!(
+            source = "github",
+            pr_url = %pr_url,
+            "Unwatched PR after close/merge webhook"
+        );
     }
 }
 

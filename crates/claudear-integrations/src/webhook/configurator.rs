@@ -1320,7 +1320,7 @@ impl WebhookConfigurator {
         let payload = serde_json::json!({
             "name": "web",
             "active": true,
-            "events": ["pull_request_review", "pull_request_review_comment"],
+            "events": ["pull_request_review", "pull_request_review_comment", "pull_request"],
             "config": {
                 "url": callback_url,
                 "content_type": "json",
