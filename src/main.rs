@@ -154,6 +154,10 @@ enum Commands {
         /// Path to .env file for saving webhook secrets
         #[arg(long, default_value = ".env")]
         env_file: String,
+
+        /// Run self-test: start server, send test payloads, verify processing
+        #[arg(long)]
+        self_test: bool,
     },
 
     /// Manually trigger a fix for an issue
@@ -170,6 +174,13 @@ enum Commands {
         source: String,
         /// Issue ID
         issue_id: String,
+    },
+
+    /// Purge operational data (attempts, PRs, executions) while preserving knowledge, inference, and embeddings
+    Purge {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        confirm: bool,
     },
 
     /// Show statistics about fix attempts
@@ -2527,6 +2538,80 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if let Commands::Purge { confirm } = cli.command {
+        if is_daemon_running() {
+            anyhow::bail!(
+                "Daemon is running. Stop it first with 'claudear stop' before purging."
+            );
+        }
+
+        let db_tracker = SqliteTracker::new(&config.db_path)?;
+
+        if !confirm {
+            let counts = db_tracker.get_diagnostic_counts()?;
+
+            println!("\nThis will DELETE all operational data:");
+            println!("  fix_attempts:     {}", counts.fix_attempts);
+            println!("  prs:              {}", counts.prs);
+            println!("  pr_reviews:       {}", counts.pr_reviews);
+            println!("  pr_review_states: {}", counts.pr_review_states);
+            println!("  claude_executions:{}", counts.claude_executions);
+            println!("  activity_log:     {}", counts.activity_log);
+            println!("  processing_metrics:{}", counts.processing_metrics);
+            println!("  feedback_outcomes: {} (detached, not deleted)", counts.feedback_outcomes);
+
+            println!("\nThis will PRESERVE:");
+            println!("  issues (with embeddings): {}", counts.issues);
+            println!("  similar_issues:           {}", counts.similar_issues);
+            println!("  repositories:             {}", counts.repositories);
+            println!("  repo_files:               {}", counts.repo_files);
+            println!("  inference_attempts:        {}", counts.inference_attempts);
+            println!("  error_patterns:           {}", counts.error_patterns);
+            println!("  qa_knowledge, promoted_instructions, repo_knowledge, review_patterns");
+            println!("  code_symbols, code_chunks, code_chunk_embeddings");
+
+            println!("\nRe-run with --confirm to proceed.");
+            return Ok(());
+        }
+
+        let result = db_tracker.purge_operational_data()?;
+
+        println!("\nPurged operational data:");
+        println!("  fix_attempts:         {}", result.fix_attempts);
+        println!("  prs:                  {}", result.prs);
+        println!("  pr_reviews:           {}", result.pr_reviews);
+        println!("  pr_review_comments:   {}", result.pr_review_comments);
+        println!("  pr_review_states:     {}", result.pr_review_states);
+        println!("  claude_executions:    {}", result.claude_executions);
+        println!("  strategy_fingerprints:{}", result.strategy_fingerprints);
+        println!("  diff_analyses:        {}", result.diff_analyses);
+        println!("  regression_watches:   {}", result.regression_watches);
+        println!("  release_tracking:     {}", result.release_tracking);
+        println!("  regression_checks:    {}", result.regression_checks);
+        println!("  qa_usage:             {}", result.qa_usage);
+        println!("  activity_log:         {}", result.activity_log);
+        println!("  processing_metrics:   {}", result.processing_metrics);
+        println!("  webhook_deliveries:   {}", result.webhook_deliveries);
+        println!("  issue_clusters:       {}", result.issue_clusters);
+        println!("  issue_cluster_members:{}", result.issue_cluster_members);
+        println!("  content_clusters:     {}", result.content_clusters);
+        println!("  severity_scores:      {}", result.severity_scores);
+        println!("  suppression_log:      {}", result.suppression_log);
+        println!("  eval_snapshots:       {}", result.eval_snapshots);
+        println!("  eval_deltas:          {}", result.eval_deltas);
+
+        println!("\nPreserved:");
+        println!(
+            "  feedback_outcomes detached: {}",
+            result.feedback_outcomes_detached
+        );
+        println!("  Knowledge, inference, embeddings, and code index retained.");
+
+        println!("\nTotal rows deleted: {}", result.total_deleted());
+
+        return Ok(());
+    }
+
     // Handle Diag commands early (don't need sources or full validation)
     if let Commands::Diag(ref diag_cmd) = cli.command {
         let db_tracker = SqliteTracker::new(&config.db_path)?;
@@ -3792,6 +3877,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             setup,
             base_url,
             env_file,
+            self_test,
         } => {
             let mut config = config;
             config.webhook_port = port;
@@ -3822,6 +3908,13 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         anyhow::bail!("Webhook auto-configuration failed: {}", e);
                     }
                 }
+            }
+
+            // When self-testing, inject temporary webhook secrets into configured
+            // sources that don't already have one. This lets the self-test exercise
+            // the full webhook pipeline without requiring prior --setup registration.
+            if self_test {
+                claudear::webhook::self_test::inject_test_secrets(&mut config);
             }
 
             let handlers = create_webhook_handlers(&config);
@@ -3915,6 +4008,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     h.abort();
                 }
             };
+
+            if self_test {
+                let port_for_test = port;
+                let config_for_test = config.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    match claudear::webhook::self_test::run(port_for_test, &config_for_test).await {
+                        Ok(()) => {
+                            tracing::info!("Self-test passed!");
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            tracing::error!("Self-test failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                });
+            }
 
             tokio::select! {
                 result = server.start() => result?,
@@ -4277,7 +4388,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 | Commands::Inference(_)
                 | Commands::Diag(_)
                 | Commands::Users(_)
-                | Commands::Chat { .. } => unreachable!(),
+                | Commands::Chat { .. }
+                | Commands::Purge { .. } => unreachable!(),
             }
         }
     }
