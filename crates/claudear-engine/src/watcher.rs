@@ -729,9 +729,14 @@ impl Watcher {
         );
 
         for (name, path, scm_url) in &repos {
-            if let Err(e) = GitOps::ensure_repo_fetched(path, scm_url).await {
-                tracing::warn!(repo = %name, error = %e, "Failed to fetch repo during periodic reindex");
-                continue;
+            match GitOps::ensure_repo_fetched(path, scm_url).await {
+                Ok(default_branch) => {
+                    tracing::debug!(repo = %name, default_branch = %default_branch, "Fetched repo");
+                }
+                Err(e) => {
+                    tracing::warn!(repo = %name, error = %e, "Failed to fetch repo during periodic reindex");
+                    continue;
+                }
             }
             self.reindex_repo(name, path).await;
         }
@@ -1311,92 +1316,109 @@ impl Watcher {
         }
 
         // Process the issue with the review feedback appended to context.
-        if let Some(pr_url) = &attempt.pr_url {
-            // Look up the existing PR branch so the worktree can check it out
-            let existing_pr_branch = self
-                .tracker
-                .get_pr(pr_url)
-                .ok()
-                .flatten()
-                .and_then(|pr| pr.head_branch);
+        let pr_url = match &attempt.pr_url {
+            Some(url) => url,
+            None => {
+                tracing::warn!(
+                    source = %attempt.source,
+                    issue_id = %attempt.issue_id,
+                    short_id = %attempt.short_id,
+                    "Cannot process review feedback: attempt has no PR URL"
+                );
+                return Err(claudear_core::error::Error::source(
+                    &attempt.source,
+                    format!(
+                        "Attempt {} has no PR URL, cannot address review feedback",
+                        attempt.short_id
+                    ),
+                ));
+            }
+        };
 
-            tracing::info!(
-                pr_url = %pr_url,
-                branch = ?existing_pr_branch,
-                "Re-processing issue to address review feedback"
-            );
+        // Look up the existing PR branch so the worktree can check it out
+        let existing_pr_branch = self
+            .tracker
+            .get_pr(pr_url)
+            .ok()
+            .flatten()
+            .and_then(|pr| pr.head_branch);
 
-            // If the same issue is currently being processed, wait for that run
-            // to finish so review feedback isn't silently dropped.
-            let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
-            let wait_started = std::time::Instant::now();
-            let max_wait = std::time::Duration::from_secs(300);
-            loop {
-                while {
-                    let processing = self.processing.read().await;
-                    processing.contains(&processing_key)
-                } {
-                    if !self.is_running.load(Ordering::SeqCst) {
-                        return Err(claudear_core::error::Error::source(
-                            &attempt.source,
-                            format!(
-                                "Watcher stopping while waiting for in-flight processing of {}",
-                                attempt.short_id
-                            ),
-                        ));
-                    }
-                    if wait_started.elapsed() >= max_wait {
-                        return Err(claudear_core::error::Error::source(
-                            &attempt.source,
-                            format!(
-                                "Timed out waiting for in-flight processing of {}",
-                                attempt.short_id
-                            ),
-                        ));
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                }
+        tracing::info!(
+            pr_url = %pr_url,
+            branch = ?existing_pr_branch,
+            "Re-processing issue to address review feedback"
+        );
 
-                match self
-                    .trigger_issue_with_feedback(
+        // If the same issue is currently being processed, wait for that run
+        // to finish so review feedback isn't silently dropped.
+        let processing_key = format!("{}:{}", attempt.source, attempt.issue_id);
+        let wait_started = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_secs(300);
+        loop {
+            while {
+                let processing = self.processing.read().await;
+                processing.contains(&processing_key)
+            } {
+                if !self.is_running.load(Ordering::SeqCst) {
+                    return Err(claudear_core::error::Error::source(
                         &attempt.source,
-                        &attempt.issue_id,
-                        Some(feedback.to_string()),
-                        existing_pr_branch.clone(),
-                        Some("Review feedback received".into()),
-                    )
-                    .await
-                {
-                    Ok(()) => break,
-                    Err(e) => {
-                        let still_processing = {
-                            let processing = self.processing.read().await;
-                            processing.contains(&processing_key)
-                        };
-                        if still_processing {
-                            if !self.is_running.load(Ordering::SeqCst) {
-                                return Err(claudear_core::error::Error::source(
-                                    &attempt.source,
-                                    format!(
-                                        "Watcher stopping while waiting for in-flight processing of {}",
-                                        attempt.short_id
-                                    ),
-                                ));
-                            }
-                            if wait_started.elapsed() >= max_wait {
-                                return Err(claudear_core::error::Error::source(
-                                    &attempt.source,
-                                    format!(
-                                        "Timed out waiting for in-flight processing of {}",
-                                        attempt.short_id
-                                    ),
-                                ));
-                            }
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            continue;
+                        format!(
+                            "Watcher stopping while waiting for in-flight processing of {}",
+                            attempt.short_id
+                        ),
+                    ));
+                }
+                if wait_started.elapsed() >= max_wait {
+                    return Err(claudear_core::error::Error::source(
+                        &attempt.source,
+                        format!(
+                            "Timed out waiting for in-flight processing of {}",
+                            attempt.short_id
+                        ),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+
+            match self
+                .trigger_issue_with_feedback(
+                    &attempt.source,
+                    &attempt.issue_id,
+                    Some(feedback.to_string()),
+                    existing_pr_branch.clone(),
+                    Some("Review feedback received".into()),
+                )
+                .await
+            {
+                Ok(()) => break,
+                Err(e) => {
+                    let still_processing = {
+                        let processing = self.processing.read().await;
+                        processing.contains(&processing_key)
+                    };
+                    if still_processing {
+                        if !self.is_running.load(Ordering::SeqCst) {
+                            return Err(claudear_core::error::Error::source(
+                                &attempt.source,
+                                format!(
+                                    "Watcher stopping while waiting for in-flight processing of {}",
+                                    attempt.short_id
+                                ),
+                            ));
                         }
-                        return Err(e);
+                        if wait_started.elapsed() >= max_wait {
+                            return Err(claudear_core::error::Error::source(
+                                &attempt.source,
+                                format!(
+                                    "Timed out waiting for in-flight processing of {}",
+                                    attempt.short_id
+                                ),
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
                     }
+                    return Err(e);
                 }
             }
         }
@@ -1784,13 +1806,18 @@ impl Watcher {
         )?;
 
         // Fetch the downstream repo (no checkout/reset — just update object store)
-        if let Err(e) = GitOps::ensure_repo_fetched(&project_dir, &scm_url).await {
-            tracing::warn!(
-                downstream = %downstream_repo_name,
-                error = %e,
-                "Failed to fetch downstream repo, continuing anyway"
-            );
-        }
+        let detected_default_branch =
+            match GitOps::ensure_repo_fetched(&project_dir, &scm_url).await {
+                Ok(branch) => branch,
+                Err(e) => {
+                    tracing::warn!(
+                        downstream = %downstream_repo_name,
+                        error = %e,
+                        "Failed to fetch downstream repo, continuing with index default branch"
+                    );
+                    default_branch.clone()
+                }
+            };
 
         // Incrementally re-index code after fetch so code search is up-to-date
         self.reindex_repo(downstream_repo_name, &project_dir).await;
@@ -1800,7 +1827,7 @@ impl Watcher {
         let wt_path = worktree_path(&self.config.workspace, downstream_repo_name, &cascade_id);
         let effective_branch = rule
             .and_then(|r| r.target_branch.as_deref())
-            .unwrap_or(&default_branch);
+            .unwrap_or(&detected_default_branch);
         GitOps::create_worktree(
             &project_dir,
             &wt_path,

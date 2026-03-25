@@ -691,6 +691,11 @@ pub struct ReviewWatcher {
     states: std::sync::RwLock<std::collections::HashMap<String, PrReviewState>>,
     /// Optional tracker for recording reviews and persisting review states to the database.
     tracker: Option<Arc<dyn FixAttemptTracker>>,
+    /// Events produced by webhook-triggered `check_for_pr` calls that haven't
+    /// been consumed by the polling path yet. Without this buffer, the webhook
+    /// path advances the cursor but discards the events, so the next polling
+    /// cycle never sees them.
+    pending_webhook_events: std::sync::Mutex<Vec<ReviewEvent>>,
 }
 
 impl ReviewWatcher {
@@ -700,6 +705,7 @@ impl ReviewWatcher {
             provider,
             states: std::sync::RwLock::new(std::collections::HashMap::new()),
             tracker: None,
+            pending_webhook_events: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -712,6 +718,7 @@ impl ReviewWatcher {
             provider,
             states: std::sync::RwLock::new(std::collections::HashMap::new()),
             tracker: Some(tracker),
+            pending_webhook_events: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -819,6 +826,18 @@ impl ReviewWatcher {
         states.values().cloned().collect()
     }
 
+    /// Drain all buffered webhook events, returning them and clearing the buffer.
+    fn drain_pending_webhook_events(&self) -> Vec<ReviewEvent> {
+        let mut pending = self
+            .pending_webhook_events
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                tracing::warn!(component = "review_watcher", "Mutex poisoned, recovering");
+                poisoned.into_inner()
+            });
+        std::mem::take(&mut *pending)
+    }
+
     /// Returns `true` when a comment is strictly after the current cursor.
     fn comment_is_after_cursor(
         comment: &ReviewComment,
@@ -837,9 +856,14 @@ impl ReviewWatcher {
     }
 
     /// Check all watched PRs for new reviews.
+    ///
+    /// This also drains any events buffered by webhook-triggered `check_for_pr`
+    /// calls, ensuring they are not lost when the webhook path advances cursors.
     pub async fn check_for_reviews(&self) -> Result<Vec<ReviewEvent>> {
+        let mut events = self.drain_pending_webhook_events();
+
         if !self.provider.is_enabled() {
-            return Ok(vec![]);
+            return Ok(events);
         }
 
         let states_to_check: Vec<PrReviewState> = {
@@ -849,8 +873,6 @@ impl ReviewWatcher {
             });
             states.values().filter(|s| s.is_active).cloned().collect()
         };
-
-        let mut events = Vec::new();
 
         for state in states_to_check {
             match self.check_pr_reviews(&state).await {
@@ -870,6 +892,10 @@ impl ReviewWatcher {
     }
 
     /// Check reviews for a single watched PR (triggered by webhook).
+    ///
+    /// Events are buffered internally so the next `check_for_reviews` call
+    /// will include them. This prevents the webhook path from advancing
+    /// cursors while silently dropping the events.
     pub async fn check_for_pr(&self, pr_url: &str) -> Result<Vec<ReviewEvent>> {
         if !self.provider.is_enabled() {
             return Ok(vec![]);
@@ -883,10 +909,20 @@ impl ReviewWatcher {
             states.get(pr_url).filter(|s| s.is_active).cloned()
         };
 
-        match state {
-            Some(state) => self.check_pr_reviews(&state).await,
-            None => Ok(vec![]),
+        let events = match state {
+            Some(state) => self.check_pr_reviews(&state).await?,
+            None => return Ok(vec![]),
+        };
+
+        if !events.is_empty() {
+            let mut pending = self.pending_webhook_events.lock().unwrap_or_else(|poisoned| {
+                tracing::warn!(component = "review_watcher", "Mutex poisoned, recovering");
+                poisoned.into_inner()
+            });
+            pending.extend(events.clone());
         }
+
+        Ok(events)
     }
 
     /// Record a review to the database for analytics.
@@ -4929,6 +4965,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "sqlite")]
         #[tokio::test]
         async fn test_with_regression_tracking_constructor() {
             let provider = Arc::new(MockPrScmProvider::new(true).with_status(
@@ -5021,6 +5058,7 @@ mod tests {
             assert!(!monitor.is_bug_type(&attempt));
         }
 
+        #[cfg(feature = "sqlite")]
         #[tokio::test]
         async fn test_merged_non_bug_no_regression_watch() {
             let provider = Arc::new(MockPrScmProvider::new(true).with_status(
@@ -5300,9 +5338,7 @@ mod tests {
         assert_eq!(cloned.side.as_deref(), Some("LEFT"));
     }
 
-    // Additional coverage: record_review_to_db, tracker
-    // persistence, check_pr_reviews with sqlite, PrMonitor
-    // activity log recording, and ReviewWatcher persistence paths.
+    #[cfg(feature = "sqlite")]
     mod sqlite_persistence_tests {
         use crate::scm::{
             CodeReview, PrInfo, PrReviewState, PrStatus, RemoteRepo, ReviewComment, ReviewUser,
