@@ -2540,9 +2540,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     if let Commands::Purge { confirm } = cli.command {
         if is_daemon_running() {
-            anyhow::bail!(
-                "Daemon is running. Stop it first with 'claudear stop' before purging."
-            );
+            anyhow::bail!("Daemon is running. Stop it first with 'claudear stop' before purging.");
         }
 
         let db_tracker = SqliteTracker::new(&config.db_path)?;
@@ -2558,7 +2556,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             println!("  claude_executions:{}", counts.claude_executions);
             println!("  activity_log:     {}", counts.activity_log);
             println!("  processing_metrics:{}", counts.processing_metrics);
-            println!("  feedback_outcomes: {} (detached, not deleted)", counts.feedback_outcomes);
+            println!(
+                "  feedback_outcomes: {} (detached, not deleted)",
+                counts.feedback_outcomes
+            );
 
             println!("\nThis will PRESERVE:");
             println!("  issues (with embeddings): {}", counts.issues);

@@ -112,9 +112,7 @@ pub(crate) fn remember_ask_poll_channel(
     if guard.ask_poll_channels.len() > 512 {
         let live_keys: std::collections::HashSet<String> =
             guard.ask_delivery_ids.keys().cloned().collect();
-        guard
-            .ask_poll_channels
-            .retain(|k, _| live_keys.contains(k));
+        guard.ask_poll_channels.retain(|k, _| live_keys.contains(k));
     }
 }
 

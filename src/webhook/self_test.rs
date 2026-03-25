@@ -86,8 +86,8 @@ impl fmt::Display for TestStatus {
 }
 
 fn sign_hmac_sha256(secret: &str, payload: &[u8]) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     mac.update(payload);
     hex::encode(mac.finalize().into_bytes())
 }
@@ -193,11 +193,17 @@ fn build_github_test(config: &Config) -> Option<(String, Vec<(String, String)>)>
         }
     });
     let body_str = serde_json::to_string(&body).unwrap();
-    let sig = format!("sha256={}", sign_hmac_sha256(secret.expose(), body_str.as_bytes()));
+    let sig = format!(
+        "sha256={}",
+        sign_hmac_sha256(secret.expose(), body_str.as_bytes())
+    );
 
     let headers = vec![
         ("x-hub-signature-256".to_string(), sig),
-        ("x-github-event".to_string(), "pull_request_review".to_string()),
+        (
+            "x-github-event".to_string(),
+            "pull_request_review".to_string(),
+        ),
         ("content-type".to_string(), "application/json".to_string()),
     ];
     Some((body_str, headers))
@@ -223,9 +229,7 @@ fn build_jira_test(config: &Config) -> Option<(String, Vec<(String, String)>)> {
     });
     let body_str = serde_json::to_string(&body).unwrap();
 
-    let headers = vec![
-        ("content-type".to_string(), "application/json".to_string()),
-    ];
+    let headers = vec![("content-type".to_string(), "application/json".to_string())];
     Some((body_str, headers))
 }
 
@@ -327,24 +331,32 @@ async fn send_test(
 }
 
 fn print_results(results: &[TestResult]) {
-    let source_width = results.iter().map(|r| r.source.len()).max().unwrap_or(10).max(6);
+    let source_width = results
+        .iter()
+        .map(|r| r.source.len())
+        .max()
+        .unwrap_or(10)
+        .max(6);
     let status_width = 4;
     let code_width = 4;
 
     println!();
+    let header = "DETAIL";
+    let separator = "-".repeat(30);
     println!(
-        "  {:<sw$}  {:<stw$}  {:<cw$}  {}",
-        "SOURCE", "RESULT", "CODE", "DETAIL",
+        "  {:<sw$}  {:<stw$}  {:<cw$}  {header}",
+        "SOURCE",
+        "RESULT",
+        "CODE",
         sw = source_width,
         stw = status_width,
         cw = code_width,
     );
     println!(
-        "  {:<sw$}  {:<stw$}  {:<cw$}  {}",
+        "  {:<sw$}  {:<stw$}  {:<cw$}  {separator}",
         "-".repeat(source_width),
         "-".repeat(status_width),
         "-".repeat(code_width),
-        "-".repeat(30),
         sw = source_width,
         stw = status_width,
         cw = code_width,
@@ -378,7 +390,8 @@ pub async fn run(port: u16, config: &Config) -> anyhow::Result<()> {
     wait_for_healthy(&client, &base_url).await?;
     tracing::info!("Webhook server is healthy, running self-test...");
 
-    let sources: Vec<(&str, Option<(String, Vec<(String, String)>)>)> = vec![
+    type TestPayload = Option<(String, Vec<(String, String)>)>;
+    let sources: Vec<(&str, TestPayload)> = vec![
         ("sentry", build_sentry_test(config)),
         ("linear", build_linear_test(config)),
         ("github", build_github_test(config)),

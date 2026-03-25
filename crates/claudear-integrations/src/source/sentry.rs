@@ -1,12 +1,12 @@
 //! Sentry issue source adapter.
 
 use super::IssueSource;
+use crate::webhook::{sentry_map_priority as map_priority, sentry_map_status as map_status};
 use async_trait::async_trait;
 use claudear_config::config::SentryConfig;
 use claudear_core::error::{Error, Result};
 use claudear_core::http::HttpResponse;
 use claudear_core::types::{Issue, IssuePriority, IssueStatus, MatchPriority, MatchResult};
-use crate::webhook::{sentry_map_priority as map_priority, sentry_map_status as map_status};
 use futures::future::join_all;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -1329,42 +1329,18 @@ mod tests {
 
     #[test]
     fn test_map_priority() {
-        assert_eq!(
-            map_priority("fatal", 0),
-            IssuePriority::Critical
-        );
-        assert_eq!(
-            map_priority("error", 1001),
-            IssuePriority::Critical
-        );
-        assert_eq!(
-            map_priority("error", 100),
-            IssuePriority::High
-        );
-        assert_eq!(
-            map_priority("warning", 100),
-            IssuePriority::Medium
-        );
-        assert_eq!(
-            map_priority("info", 100),
-            IssuePriority::Low
-        );
+        assert_eq!(map_priority("fatal", 0), IssuePriority::Critical);
+        assert_eq!(map_priority("error", 1001), IssuePriority::Critical);
+        assert_eq!(map_priority("error", 100), IssuePriority::High);
+        assert_eq!(map_priority("warning", 100), IssuePriority::Medium);
+        assert_eq!(map_priority("info", 100), IssuePriority::Low);
     }
 
     #[test]
     fn test_map_status() {
-        assert_eq!(
-            map_status("resolved"),
-            IssueStatus::Resolved
-        );
-        assert_eq!(
-            map_status("ignored"),
-            IssueStatus::Ignored
-        );
-        assert_eq!(
-            map_status("unresolved"),
-            IssueStatus::Open
-        );
+        assert_eq!(map_status("resolved"), IssueStatus::Resolved);
+        assert_eq!(map_status("ignored"), IssueStatus::Ignored);
+        assert_eq!(map_status("unresolved"), IssueStatus::Open);
     }
 
     #[test]
@@ -1529,74 +1505,26 @@ mod tests {
 
     #[test]
     fn test_map_priority_all_levels() {
-        assert_eq!(
-            map_priority("fatal", 0),
-            IssuePriority::Critical
-        );
-        assert_eq!(
-            map_priority("fatal", 1),
-            IssuePriority::Critical
-        );
-        assert_eq!(
-            map_priority("error", 1001),
-            IssuePriority::Critical
-        );
-        assert_eq!(
-            map_priority("error", 1000),
-            IssuePriority::High
-        );
-        assert_eq!(
-            map_priority("error", 999),
-            IssuePriority::High
-        );
-        assert_eq!(
-            map_priority("error", 1),
-            IssuePriority::High
-        );
-        assert_eq!(
-            map_priority("warning", 0),
-            IssuePriority::Medium
-        );
-        assert_eq!(
-            map_priority("warning", 10000),
-            IssuePriority::Medium
-        );
-        assert_eq!(
-            map_priority("info", 0),
-            IssuePriority::Low
-        );
-        assert_eq!(
-            map_priority("debug", 0),
-            IssuePriority::Low
-        );
-        assert_eq!(
-            map_priority("unknown", 0),
-            IssuePriority::Low
-        );
+        assert_eq!(map_priority("fatal", 0), IssuePriority::Critical);
+        assert_eq!(map_priority("fatal", 1), IssuePriority::Critical);
+        assert_eq!(map_priority("error", 1001), IssuePriority::Critical);
+        assert_eq!(map_priority("error", 1000), IssuePriority::High);
+        assert_eq!(map_priority("error", 999), IssuePriority::High);
+        assert_eq!(map_priority("error", 1), IssuePriority::High);
+        assert_eq!(map_priority("warning", 0), IssuePriority::Medium);
+        assert_eq!(map_priority("warning", 10000), IssuePriority::Medium);
+        assert_eq!(map_priority("info", 0), IssuePriority::Low);
+        assert_eq!(map_priority("debug", 0), IssuePriority::Low);
+        assert_eq!(map_priority("unknown", 0), IssuePriority::Low);
     }
 
     #[test]
     fn test_map_status_all_values() {
-        assert_eq!(
-            map_status("resolved"),
-            IssueStatus::Resolved
-        );
-        assert_eq!(
-            map_status("ignored"),
-            IssueStatus::Ignored
-        );
-        assert_eq!(
-            map_status("unresolved"),
-            IssueStatus::Open
-        );
-        assert_eq!(
-            map_status("reprocessing"),
-            IssueStatus::Open
-        );
-        assert_eq!(
-            map_status(""),
-            IssueStatus::Open
-        );
+        assert_eq!(map_status("resolved"), IssueStatus::Resolved);
+        assert_eq!(map_status("ignored"), IssueStatus::Ignored);
+        assert_eq!(map_status("unresolved"), IssueStatus::Open);
+        assert_eq!(map_status("reprocessing"), IssueStatus::Open);
+        assert_eq!(map_status(""), IssueStatus::Open);
     }
 
     #[test]

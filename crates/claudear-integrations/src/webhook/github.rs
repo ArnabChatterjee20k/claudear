@@ -405,14 +405,14 @@ impl GitHubWebhookHandler {
             .unwrap_or_default();
 
         if pr_url.is_empty() {
-            tracing::warn!(source = "github", "Missing html_url in pull_request payload");
+            tracing::warn!(
+                source = "github",
+                "Missing html_url in pull_request payload"
+            );
             return Ok(WebhookAction::Ignored);
         }
 
-        let merged = pr
-            .get("merged")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let merged = pr.get("merged").and_then(|v| v.as_bool()).unwrap_or(false);
 
         tracing::info!(
             source = "github",
@@ -999,7 +999,10 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert!(!result.unwrap().is_processed(), "No watcher should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "No watcher should return Ok(false)"
+        );
     }
 
     #[tokio::test]
@@ -1028,7 +1031,10 @@ mod tests {
         let result = handler
             .process_webhook(&payload_bytes, &payload_value, &headers)
             .await;
-        assert!(!result.unwrap().is_processed(), "Unwatched PR should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Unwatched PR should return Ok(false)"
+        );
     }
 
     #[tokio::test]
@@ -1170,7 +1176,10 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert!(!result.unwrap().is_processed(), "Bot review should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Bot review should return Ok(false)"
+        );
     }
 
     #[tokio::test]
@@ -1195,7 +1204,10 @@ mod tests {
         });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert!(!result.unwrap().is_processed(), "Pending review should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Pending review should return Ok(false)"
+        );
     }
 
     // handle_review_comment tests (3 tests)
@@ -1254,7 +1266,10 @@ mod tests {
         });
 
         let result = handler.handle_review_comment(&payload).await;
-        assert!(!result.unwrap().is_processed(), "Bot comment should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Bot comment should return Ok(false)"
+        );
     }
 
     // parse edge case tests (2 tests)
@@ -2105,7 +2120,10 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert!(!result.unwrap().is_processed(), "Ping event should be ignored");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Ping event should be ignored"
+        );
     }
 
     #[tokio::test]
@@ -2118,7 +2136,10 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert!(!result.unwrap().is_processed(), "Issues event should be ignored");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Issues event should be ignored"
+        );
     }
 
     #[tokio::test]
@@ -2131,7 +2152,10 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert!(!result.unwrap().is_processed(), "Check suite event should be ignored");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Check suite event should be ignored"
+        );
     }
 
     #[tokio::test]
@@ -2256,7 +2280,10 @@ mod tests {
         let result = handler
             .process_webhook(payload, &serde_json::json!({}), &headers)
             .await;
-        assert!(!result.unwrap().is_processed(), "Empty event type should be ignored");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Empty event type should be ignored"
+        );
     }
 
     #[tokio::test]
@@ -2308,7 +2335,10 @@ mod tests {
         let payload = serde_json::json!({ "action": "dismissed" });
 
         let result = handler.handle_review_submitted(&payload).await;
-        assert!(!result.unwrap().is_processed(), "Dismissed action should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "Dismissed action should return Ok(false)"
+        );
     }
 
     #[tokio::test]
@@ -2518,7 +2548,10 @@ mod tests {
         let payload = comment_created_payload(pr_url);
 
         let result = handler.handle_review_comment(&payload).await;
-        assert!(!result.unwrap().is_processed(), "No watcher should return Ok(false)");
+        assert!(
+            !result.unwrap().is_processed(),
+            "No watcher should return Ok(false)"
+        );
     }
 
     // constructor and handler struct tests

@@ -1189,8 +1189,7 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         // Prefer the channel the webhook actually posted to (fixes M2: webhook
         // may target a different channel than self.config.channel_id). Fall back
         // to the configured channel_id when no remembered channel exists.
-        let poll_channel =
-            ask_reply_inbox::ask_poll_channel("discord", &request.correlation_id);
+        let poll_channel = ask_reply_inbox::ask_poll_channel("discord", &request.correlation_id);
         let channel_id = match poll_channel
             .as_deref()
             .or(self.config.channel_id.as_deref())
@@ -1272,7 +1271,18 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             .collect();
 
         for (msg_id, _) in &reply_pairs {
-            let emojis = ["\u{1F389}", "\u{1F49C}", "\u{2728}", "\u{1F31F}", "\u{1F64C}", "\u{1F4AA}", "\u{1F525}", "\u{1F680}", "\u{1F929}", "\u{1F496}"];
+            let emojis = [
+                "\u{1F389}",
+                "\u{1F49C}",
+                "\u{2728}",
+                "\u{1F31F}",
+                "\u{1F64C}",
+                "\u{1F4AA}",
+                "\u{1F525}",
+                "\u{1F680}",
+                "\u{1F929}",
+                "\u{1F496}",
+            ];
             let hash: usize = msg_id
                 .bytes()
                 .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
@@ -1708,10 +1718,7 @@ mod tests {
         notifier.notify_start(&issue).await.unwrap();
 
         let (url, _) = notifier.http.get_last_call().unwrap();
-        assert_eq!(
-            url,
-            "https://discord.com/api/webhooks/123/abc?wait=true"
-        );
+        assert_eq!(url, "https://discord.com/api/webhooks/123/abc?wait=true");
     }
 
     #[tokio::test]
@@ -4009,10 +4016,7 @@ mod tests {
         // Should have used the webhook (mock was called), not the bot API
         assert_eq!(notifier.http.get_call_count(), 1);
         let (url, _) = notifier.http.get_last_call().unwrap();
-        assert_eq!(
-            url,
-            "https://discord.com/api/webhooks/123/abc?wait=true"
-        );
+        assert_eq!(url, "https://discord.com/api/webhooks/123/abc?wait=true");
     }
 
     #[test]

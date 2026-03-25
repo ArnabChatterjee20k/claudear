@@ -126,7 +126,10 @@ impl SentryApiClient {
         let response = self
             .client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.auth_token.expose()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.auth_token.expose()),
+            )
             .send()
             .await
             .map_err(|e| Error::api(format!("Failed to send request to Sentry API: {}", e)))?;
@@ -183,7 +186,10 @@ impl SentryApiClient {
         let response = self
             .client
             .post(&api_url)
-            .header("Authorization", format!("Bearer {}", self.auth_token.expose()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.auth_token.expose()),
+            )
             .header("Content-Type", "application/json")
             .json(&request_body)
             .send()
@@ -244,7 +250,10 @@ impl SentryApiClient {
         let response = self
             .client
             .get(&url)
-            .header("Authorization", format!("Bearer {}", self.auth_token.expose()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.auth_token.expose()),
+            )
             .send()
             .await
             .map_err(|e| Error::api(format!("Failed to send request to Sentry API: {}", e)))?;
@@ -279,11 +288,7 @@ impl SentryApiClient {
     pub async fn delete_webhook(&self, project_slug: &str, hook_id: &str) -> Result<()> {
         validate_slug(&self.org_slug, "organization")?;
         validate_slug(project_slug, "project")?;
-        if hook_id.is_empty()
-            || !hook_id
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '-')
-        {
+        if hook_id.is_empty() || !hook_id.chars().all(|c| c.is_alphanumeric() || c == '-') {
             return Err(Error::config(format!(
                 "hook ID contains invalid characters: {}",
                 hook_id
@@ -300,7 +305,10 @@ impl SentryApiClient {
         let response = self
             .client
             .delete(&url)
-            .header("Authorization", format!("Bearer {}", self.auth_token.expose()))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.auth_token.expose()),
+            )
             .send()
             .await
             .map_err(|e| Error::api(format!("Failed to send request to Sentry API: {}", e)))?;

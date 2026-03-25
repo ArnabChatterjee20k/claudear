@@ -189,13 +189,12 @@ impl IssueProcessor {
 
             // Use the detected default branch from the remote, falling back to
             // the index value if detection returned the same fallback.
-            let effective_default_branch = if detected_default_branch != "main"
-                || default_branch == "main"
-            {
-                &detected_default_branch
-            } else {
-                default_branch
-            };
+            let effective_default_branch =
+                if detected_default_branch != "main" || default_branch == "main" {
+                    &detected_default_branch
+                } else {
+                    default_branch
+                };
 
             tracing::info!(
                 short_id = %issue.short_id,
@@ -447,22 +446,20 @@ impl IssueProcessor {
                                 new_resolution.default_branch(),
                                 new_resolution.repo_name(),
                             ) {
-                                let detected_branch = match GitOps::ensure_repo_fetched(
-                                    &new_project_dir,
-                                    scm_url,
-                                )
-                                .await
-                                {
-                                    Ok(branch) => branch,
-                                    Err(e) => {
-                                        break Ok(ProcessingOutcome::Failed {
-                                            error: format!(
-                                                "Failed to fetch alternative repo {}: {}",
-                                                repo_name, e
-                                            ),
-                                        });
-                                    }
-                                };
+                                let detected_branch =
+                                    match GitOps::ensure_repo_fetched(&new_project_dir, scm_url)
+                                        .await
+                                    {
+                                        Ok(branch) => branch,
+                                        Err(e) => {
+                                            break Ok(ProcessingOutcome::Failed {
+                                                error: format!(
+                                                    "Failed to fetch alternative repo {}: {}",
+                                                    repo_name, e
+                                                ),
+                                            });
+                                        }
+                                    };
                                 self.reindex_repo(repo_name, &new_project_dir).await;
 
                                 let checkout_ref = format!("origin/{}", detected_branch);

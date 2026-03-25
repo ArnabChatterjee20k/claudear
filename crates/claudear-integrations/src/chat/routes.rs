@@ -331,7 +331,6 @@ async fn delete_session_handler(
 mod tests {
     use super::*;
 
-
     #[test]
     fn chat_chunk_serialization_minimal() {
         let chunk = ChatChunk {
@@ -391,7 +390,6 @@ mod tests {
         assert!(json.contains("\"done\":true"));
     }
 
-
     #[test]
     fn chat_request_deserialization_minimal() {
         let json = r#"{"message": "Hello"}"#;
@@ -434,7 +432,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-
     #[test]
     fn chat_source_serialization() {
         let source = ChatSource {
@@ -469,7 +466,6 @@ mod tests {
         assert!((source.similarity - 0.75).abs() < f32::EPSILON);
     }
 
-
     #[test]
     fn generation_params_override_partial() {
         let json = r#"{"max_tokens": 512}"#;
@@ -496,7 +492,6 @@ mod tests {
         assert!(params.temperature.is_none());
         assert!(params.top_p.is_none());
     }
-
 
     #[test]
     fn models_response_serialization() {
@@ -560,7 +555,6 @@ mod tests {
         assert!(json.contains("\"status\":\"loading\""));
     }
 
-
     #[test]
     fn chat_session_serialization() {
         let session = ChatSession {
@@ -606,7 +600,6 @@ mod tests {
         assert_eq!(session.messages[1].role, ChatRole::Assistant);
     }
 
-
     #[test]
     fn chat_message_serialization() {
         let msg = ChatMessage {
@@ -636,7 +629,6 @@ mod tests {
         // sources_json has skip_serializing_if = "Option::is_none"
         assert!(!json.contains("sources_json"));
     }
-
 
     #[cfg(feature = "sqlite")]
     #[test]

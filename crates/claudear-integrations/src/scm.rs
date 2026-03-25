@@ -915,10 +915,13 @@ impl ReviewWatcher {
         };
 
         if !events.is_empty() {
-            let mut pending = self.pending_webhook_events.lock().unwrap_or_else(|poisoned| {
-                tracing::warn!(component = "review_watcher", "Mutex poisoned, recovering");
-                poisoned.into_inner()
-            });
+            let mut pending = self
+                .pending_webhook_events
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    tracing::warn!(component = "review_watcher", "Mutex poisoned, recovering");
+                    poisoned.into_inner()
+                });
             pending.extend(events.clone());
         }
 

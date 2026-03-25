@@ -5605,7 +5605,6 @@ more output"#;
         assert!(caps.structured_output);
     }
 
-
     #[test]
     fn test_structured_result_with_changelog() {
         let json = r#"{"summary":"Applied fix","success":true,"pr_url":"https://github.com/org/repo/pull/7","changelog":"- Fixed null check\n- Added test"}"#;
@@ -6319,7 +6318,6 @@ more output"#;
             "Schema description should describe confidence scoring"
         );
     }
-
 
     /// Simulate the extraction logic from execute(): parse a serde_json::Value as
     /// StructuredResult and extract the confidence fields, matching lines 1418-1447.

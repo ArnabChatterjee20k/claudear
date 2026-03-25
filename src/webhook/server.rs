@@ -816,9 +816,7 @@ async fn handle_github_webhook(
         .process_webhook(body.as_ref(), &payload, header_map)
         .await
     {
-        Ok(WebhookAction::Processed) => {
-            (StatusCode::OK, Json(json!({ "status": "processed" })))
-        }
+        Ok(WebhookAction::Processed) => (StatusCode::OK, Json(json!({ "status": "processed" }))),
         Ok(WebhookAction::Ignored) => (
             StatusCode::OK,
             Json(json!({ "status": "ignored", "reason": "Event not applicable" })),
@@ -884,7 +882,10 @@ fn handle_pr_closed_webhook(state: &Arc<AppState>, pr_url: &str, merged: bool) {
     };
 
     if merged {
-        if let Err(e) = state.tracker.mark_merged(&attempt.source, &attempt.issue_id) {
+        if let Err(e) = state
+            .tracker
+            .mark_merged(&attempt.source, &attempt.issue_id)
+        {
             tracing::error!(
                 source = "github",
                 issue_id = %attempt.issue_id,
@@ -894,20 +895,21 @@ fn handle_pr_closed_webhook(state: &Arc<AppState>, pr_url: &str, merged: bool) {
             return;
         }
 
-        let activity = ActivityLogEntry::new(
-            "pr_merged",
-            format!("PR merged (webhook): {}", pr_url),
-        )
-        .with_source(attempt.source.clone())
-        .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
-        .with_metadata(json!({ "pr_url": pr_url, "via": "webhook" }));
+        let activity =
+            ActivityLogEntry::new("pr_merged", format!("PR merged (webhook): {}", pr_url))
+                .with_source(attempt.source.clone())
+                .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                .with_metadata(json!({ "pr_url": pr_url, "via": "webhook" }));
         state.tracker.record_activity(&activity).ok();
 
         if attempt.scm_repo.is_some() {
             state.tracker.update_pr_status(pr_url, "merged").ok();
         }
     } else {
-        if let Err(e) = state.tracker.mark_closed(&attempt.source, &attempt.issue_id) {
+        if let Err(e) = state
+            .tracker
+            .mark_closed(&attempt.source, &attempt.issue_id)
+        {
             tracing::error!(
                 source = "github",
                 issue_id = %attempt.issue_id,
