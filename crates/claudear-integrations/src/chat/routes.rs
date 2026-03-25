@@ -331,7 +331,6 @@ async fn delete_session_handler(
 mod tests {
     use super::*;
 
-    // --- ChatChunk serialization ---
 
     #[test]
     fn chat_chunk_serialization_minimal() {
@@ -392,7 +391,6 @@ mod tests {
         assert!(json.contains("\"done\":true"));
     }
 
-    // --- ChatRequest deserialization ---
 
     #[test]
     fn chat_request_deserialization_minimal() {
@@ -436,7 +434,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- ChatSource serialization ---
 
     #[test]
     fn chat_source_serialization() {
@@ -472,7 +469,6 @@ mod tests {
         assert!((source.similarity - 0.75).abs() < f32::EPSILON);
     }
 
-    // --- GenerationParamsOverride deserialization ---
 
     #[test]
     fn generation_params_override_partial() {
@@ -501,7 +497,6 @@ mod tests {
         assert!(params.top_p.is_none());
     }
 
-    // --- ModelsResponse serialization ---
 
     #[test]
     fn models_response_serialization() {
@@ -565,7 +560,6 @@ mod tests {
         assert!(json.contains("\"status\":\"loading\""));
     }
 
-    // --- ChatSession serde ---
 
     #[test]
     fn chat_session_serialization() {
@@ -612,7 +606,6 @@ mod tests {
         assert_eq!(session.messages[1].role, ChatRole::Assistant);
     }
 
-    // --- ChatMessage serde ---
 
     #[test]
     fn chat_message_serialization() {
@@ -644,7 +637,6 @@ mod tests {
         assert!(!json.contains("sources_json"));
     }
 
-    // --- create_chat_router constructs without panic ---
 
     #[cfg(feature = "sqlite")]
     #[test]

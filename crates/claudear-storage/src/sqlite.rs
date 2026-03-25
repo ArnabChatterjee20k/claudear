@@ -2,8 +2,8 @@
 
 use super::types::{
     ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
-    InferenceStats, StoredDependency, StoredIndexedRepo, StoredPrReviewComment, StoredRepository,
-    UserRow,
+    InferenceStats, PurgeResult, StoredDependency, StoredIndexedRepo, StoredPrReviewComment,
+    StoredRepository, UserRow,
 };
 use super::{
     is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
@@ -1996,6 +1996,95 @@ impl ActivityStore for SqliteTracker {
         )?;
 
         Ok(deleted)
+    }
+
+    fn purge_operational_data(&self) -> Result<PurgeResult> {
+        let conn = self.acquire_lock()?;
+
+        // Detach feedback_outcomes from attempts (preserve learnings/embeddings).
+        // Set attempt_id to NULL so the FK constraint doesn't block deleting fix_attempts.
+        // FixOutcome.attempt_id is i64 so NULLs deserialize as 0 via row.get().
+        let feedback_outcomes_detached = conn.execute(
+            "UPDATE feedback_outcomes SET attempt_id = NULL WHERE attempt_id IS NOT NULL",
+            [],
+        )?;
+
+        // Temporarily disable FK enforcement so we can bulk-delete without
+        // worrying about ordering across every referencing table.
+        // PRAGMA foreign_keys cannot be changed inside a transaction, so we
+        // run it outside, do all deletes, then re-enable.
+        conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+
+        let result = (|| -> Result<PurgeResult> {
+            // Regression tracking
+            let release_tracking = conn.execute("DELETE FROM release_tracking", [])?;
+            let regression_checks = conn.execute("DELETE FROM regression_checks", [])?;
+            let regression_watches = conn.execute("DELETE FROM regression_watches", [])?;
+
+            // PR review data
+            let pr_review_comments = conn.execute("DELETE FROM pr_review_comments", [])?;
+            let pr_reviews = conn.execute("DELETE FROM pr_reviews", [])?;
+            let pr_review_states = conn.execute("DELETE FROM pr_review_states", [])?;
+
+            // Execution & strategy data
+            let claude_executions = conn.execute("DELETE FROM claude_executions", [])?;
+            let strategy_fingerprints = conn.execute("DELETE FROM strategy_fingerprints", [])?;
+            let diff_analyses = conn.execute("DELETE FROM diff_analyses", [])?;
+            let qa_usage = conn.execute("DELETE FROM qa_usage", [])?;
+
+            // Evaluation data
+            let eval_snapshots = conn.execute("DELETE FROM eval_snapshots", [])?;
+            let eval_deltas = conn.execute("DELETE FROM eval_deltas", [])?;
+
+            // PRs
+            let prs = conn.execute("DELETE FROM prs", [])?;
+
+            // Clustering & prioritisation
+            let issue_cluster_members = conn.execute("DELETE FROM issue_cluster_members", [])?;
+            let issue_clusters = conn.execute("DELETE FROM issue_clusters", [])?;
+            let content_clusters = conn.execute("DELETE FROM content_clusters", [])?;
+            let severity_scores = conn.execute("DELETE FROM severity_scores", [])?;
+            let suppression_log = conn.execute("DELETE FROM suppression_log", [])?;
+
+            // Operational logs & metrics
+            let activity_log = conn.execute("DELETE FROM activity_log", [])?;
+            let processing_metrics = conn.execute("DELETE FROM processing_metrics", [])?;
+            let webhook_deliveries = conn.execute("DELETE FROM webhook_deliveries", [])?;
+
+            // Fix attempts (root entity)
+            let fix_attempts = conn.execute("DELETE FROM fix_attempts", [])?;
+
+            Ok(PurgeResult {
+                fix_attempts,
+                prs,
+                pr_reviews,
+                pr_review_comments,
+                pr_review_states,
+                claude_executions,
+                strategy_fingerprints,
+                diff_analyses,
+                regression_watches,
+                release_tracking,
+                regression_checks,
+                qa_usage,
+                activity_log,
+                processing_metrics,
+                webhook_deliveries,
+                issue_clusters,
+                issue_cluster_members,
+                content_clusters,
+                severity_scores,
+                suppression_log,
+                eval_snapshots,
+                eval_deltas,
+                feedback_outcomes_detached,
+            })
+        })();
+
+        // Always re-enable FK enforcement
+        conn.execute_batch("PRAGMA foreign_keys = ON")?;
+
+        result
     }
 
     /// Get diagnostic counts for all major tables.
@@ -17588,5 +17677,250 @@ mod tests {
         // Should have the default value
         let progress = rx.borrow().clone();
         assert_eq!(progress.status, "idle");
+    }
+
+    #[test]
+    fn test_purge_operational_data_deletes_attempts_and_related() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create fix attempts
+        tracker
+            .record_attempt("linear", "issue-1", "LIN-1")
+            .unwrap();
+        tracker
+            .record_attempt("sentry", "issue-2", "SEN-2")
+            .unwrap();
+        tracker
+            .mark_success("linear", "issue-1", "https://github.com/org/repo/pull/1")
+            .unwrap();
+
+        // Create activity log entries
+        let entry = ActivityLogEntry {
+            id: 0,
+            timestamp: Utc::now(),
+            activity_type: "test".to_string(),
+            source: Some("linear".to_string()),
+            issue_id: Some("issue-1".to_string()),
+            short_id: None,
+            message: "test entry".to_string(),
+            metadata: None,
+        };
+        tracker.record_activity(&entry).unwrap();
+
+        // Create processing metrics
+        let metric = ProcessingMetric {
+            id: 0,
+            timestamp: Utc::now(),
+            metric_name: "test_metric".to_string(),
+            metric_value: 1.0,
+            source: None,
+            tags: None,
+        };
+        tracker.record_metric(&metric).unwrap();
+
+        // Verify data exists
+        let stats = tracker.get_stats().unwrap();
+        assert_eq!(stats.total, 2);
+        let activities = tracker.get_recent_activities(100, None).unwrap();
+        assert!(!activities.is_empty());
+
+        // Purge
+        let result = tracker.purge_operational_data().unwrap();
+
+        assert_eq!(result.fix_attempts, 2);
+        assert_eq!(result.activity_log, 1);
+        assert_eq!(result.processing_metrics, 1);
+        assert!(result.total_deleted() >= 4);
+
+        // Verify operational data is gone
+        let stats = tracker.get_stats().unwrap();
+        assert_eq!(stats.total, 0);
+        let activities = tracker.get_recent_activities(100, None).unwrap();
+        assert!(activities.is_empty());
+    }
+
+    #[test]
+    fn test_purge_preserves_knowledge_and_embeddings() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a fix attempt and feedback outcome
+        tracker
+            .record_attempt("linear", "issue-k", "LIN-K")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-k").unwrap().unwrap();
+        let outcome = FixOutcome {
+            id: 0,
+            attempt_id: attempt.id,
+            source: "linear".to_string(),
+            issue_id: "issue-k".to_string(),
+            issue_text: "Bug in handler".to_string(),
+            prompt_used: "Fix the bug".to_string(),
+            outcome: Outcome::Merged,
+            error_type: Some("null_ref".to_string()),
+            learnings: Some("Always null-check".to_string()),
+            keywords: vec!["null".to_string()],
+            embedding: None,
+            created_at: Utc::now(),
+        };
+        tracker.store_feedback_outcome(&outcome).unwrap();
+
+        // Store an issue embedding
+        let issue_embedding = IssueEmbedding {
+            id: 0,
+            source: "linear".to_string(),
+            issue_id: "issue-k".to_string(),
+            short_id: Some("LIN-K".to_string()),
+            title: Some("Bug".to_string()),
+            description: Some("A bug".to_string()),
+            url: None,
+            priority: None,
+            status: None,
+            labels: None,
+            embedding: None,
+            embedding_model: None,
+            created_at: Utc::now(),
+            updated_at: None,
+        };
+        tracker.store_issue(&issue_embedding).unwrap();
+
+        // Store an error pattern
+        let pattern = ErrorPattern {
+            id: 0,
+            pattern_hash: "hash1".to_string(),
+            error_type: Some("null_ref".to_string()),
+            error_message: Some("null pointer".to_string()),
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            occurrence_count: 3,
+            sources: Some(vec!["linear".to_string()]),
+            example_issue_ids: Some(vec!["issue-k".to_string()]),
+            resolution_hints: None,
+        };
+        tracker.record_error_pattern(&pattern).unwrap();
+
+        // Purge
+        let result = tracker.purge_operational_data().unwrap();
+
+        // Attempts should be deleted
+        assert_eq!(result.fix_attempts, 1);
+
+        // Feedback outcomes should be detached (attempt_id NULLed), not deleted
+        assert_eq!(result.feedback_outcomes_detached, 1);
+        // Verify the row still exists in the DB (attempt_id is NULL so the trait
+        // method can't deserialize it, but the knowledge is preserved)
+        {
+            let conn = tracker.acquire_lock().unwrap();
+            let (count, learnings): (i64, Option<String>) = conn
+                .query_row(
+                    "SELECT COUNT(*), MAX(learnings) FROM feedback_outcomes",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(learnings, Some("Always null-check".to_string()));
+        }
+
+        // Issue embeddings should be preserved
+        let issues = tracker.list_issues(None, 100, 0).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].issue_id, "issue-k");
+
+        // Error patterns should be preserved
+        let patterns = tracker.get_error_patterns(100).unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].error_type, Some("null_ref".to_string()));
+    }
+
+    #[test]
+    fn test_purge_preserves_repositories_and_code_index() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Create a repository
+        let repo_id = tracker.get_or_create_repo_id("org/repo").unwrap();
+        assert!(repo_id > 0);
+
+        // Store inference attempt
+        tracker
+            .record_inference_attempt(
+                "issue-inf",
+                "linear",
+                &["main.rs".to_string()],
+                &["handle".to_string()],
+                &["null".to_string()],
+                Some(repo_id),
+                "high",
+                "file match",
+                None,
+            )
+            .unwrap();
+
+        // Purge
+        tracker.purge_operational_data().unwrap();
+
+        // Repository should still exist
+        let repo = tracker.get_repository("org/repo").unwrap();
+        assert!(repo.is_some());
+        assert_eq!(repo.unwrap().name, "org/repo");
+
+        // Inference attempts should still exist
+        let history = tracker.get_inference_history(100).unwrap();
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn test_purge_on_empty_db() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let result = tracker.purge_operational_data().unwrap();
+        assert_eq!(result.total_deleted(), 0);
+        assert_eq!(result.feedback_outcomes_detached, 0);
+    }
+
+    #[test]
+    fn test_purge_deletes_regression_tracking() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        tracker
+            .record_attempt("linear", "issue-r", "LIN-R")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-r").unwrap().unwrap();
+        tracker
+            .mark_success("linear", "issue-r", "https://github.com/org/repo/pull/5")
+            .unwrap();
+
+        let watch = claudear_core::types::RegressionWatch {
+            id: 0,
+            issue_type: claudear_core::types::IssueType::LinearBug,
+            issue_id: "issue-r".to_string(),
+            fix_attempt_id: attempt.id,
+            status: claudear_core::types::RegressionWatchStatus::AwaitingRelease,
+            pr_merged_at: None,
+            monitoring_started_at: None,
+            resolved_at: None,
+            regressed_at: None,
+            created_at: Utc::now(),
+        };
+        let watch_id = tracker.create_regression_watch(&watch).unwrap();
+        assert!(watch_id > 0);
+
+        let check = claudear_core::types::RegressionCheck {
+            id: 0,
+            regression_watch_id: watch_id,
+            issue_still_exists: false,
+            checked_at: Some(Utc::now()),
+            check_details: Some("all clear".to_string()),
+            created_at: Utc::now(),
+        };
+        tracker.add_regression_check(&check).unwrap();
+
+        // Purge
+        let result = tracker.purge_operational_data().unwrap();
+        assert_eq!(result.regression_watches, 1);
+        assert_eq!(result.regression_checks, 1);
+        assert_eq!(result.fix_attempts, 1);
+
+        // Verify regression data is gone
+        let watches = tracker.get_all_regression_watches().unwrap();
+        assert!(watches.is_empty());
     }
 }

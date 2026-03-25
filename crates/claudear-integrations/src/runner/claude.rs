@@ -275,15 +275,6 @@ impl ClaudeAgentRunner {
         }
     }
 
-    /// Create a new Claude runner without template support (for testing).
-    #[cfg(feature = "sqlite")]
-    pub fn new_simple(config: ClaudeRunnerConfig) -> Self {
-        use claudear_storage::SqliteTracker;
-        // Use a temporary in-memory tracker
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
-        Self::new(config, tracker)
-    }
-
     /// Run Claude Code with a prompt to fix an issue in a specific repository.
     pub async fn run_fix(
         &self,
@@ -1796,6 +1787,12 @@ impl AgentRunner for ClaudeAgentRunner {
 mod tests {
     use super::*;
 
+    /// Create a runner with a no-op tracker for tests that don't need persistence.
+    fn new_simple(config: ClaudeRunnerConfig) -> ClaudeAgentRunner {
+        let tracker = Arc::new(claudear_storage::NoopTracker);
+        ClaudeAgentRunner::new(config, tracker)
+    }
+
     /// Mutex to serialize tests that manipulate process-global env vars.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1999,7 +1996,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_no_question_protocol() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "context", std::path::Path::new("/tmp"));
         assert!(!prompt.contains("CLAUDEAR_QUESTION"));
@@ -2007,7 +2004,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_no_pr_url_instruction() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "context", std::path::Path::new("/tmp"));
         assert!(!prompt.contains("PR_URL:"));
@@ -2048,7 +2045,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
 
         let issue = Issue::new(
             "123",
@@ -2124,7 +2121,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_sentry_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
 
         let issue = Issue::new(
             "456",
@@ -2186,7 +2183,7 @@ mod tests {
     #[test]
     fn test_runner_config() {
         let config = ClaudeRunnerConfig::default();
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         let issue = Issue::new("1", "TEST-1", "Test", "https://test.com", "linear");
         let project_dir = std::path::Path::new("/path/to/project");
         let prompt = runner.build_prompt(&issue, "context", project_dir);
@@ -2252,7 +2249,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_github_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "789",
             "#789",
@@ -2267,7 +2264,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_unknown_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "123",
             "JIRA-123",
@@ -2281,13 +2278,13 @@ mod tests {
 
     #[test]
     fn test_has_agent_md() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         assert!(!runner.has_agent_md(std::path::Path::new("/nonexistent/path")));
     }
 
     #[test]
     fn test_get_agent_md_nonexistent() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         assert!(runner
             .get_agent_md(std::path::Path::new("/nonexistent/path"))
             .is_none());
@@ -2360,7 +2357,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_empty_context() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Test", "https://example.com", "linear");
         let prompt = runner.build_prompt(&issue, "", std::path::Path::new("/tmp"));
         assert!(!prompt.is_empty());
@@ -2369,7 +2366,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_special_characters() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "1",
             "TEST-1",
@@ -2409,7 +2406,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_multiline_context() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -2473,7 +2470,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_unicode_context() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "1",
             "TEST-1",
@@ -2491,8 +2488,7 @@ mod tests {
 
     #[test]
     fn test_claude_runner_new_with_tracker() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         assert!(!runner.has_agent_md(std::path::Path::new("/tmp")));
     }
@@ -3197,7 +3193,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_with_issue() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("id-42", "PROJ-42", "A bug", "https://ex.com", "linear");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -3215,7 +3211,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_without_issue() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let (env, label) = runner.prepare_env_and_label(None);
 
         assert_eq!(label, "custom");
@@ -3225,7 +3221,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_sentry_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("s-1", "SENTRY-1", "Error", "https://sentry.io/1", "sentry");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -3243,7 +3239,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_github_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "789",
             "#789",
@@ -3260,7 +3256,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_for_issue_matches_build_prompt() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "TEST-1", "Bug", "https://example.com", "linear");
         let project_dir = Path::new("/tmp");
 
@@ -3275,7 +3271,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp_dir);
         std::fs::write(tmp_dir.join("AGENT.md"), "# Agent instructions\nDo things.").unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         assert!(runner.has_agent_md(&tmp_dir));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -3288,7 +3284,7 @@ mod tests {
         let content = "# Agent\nCustom instructions here.";
         std::fs::write(tmp_dir.join("AGENT.md"), content).unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let loaded = runner.get_agent_md(&tmp_dir);
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap(), content);
@@ -3298,7 +3294,7 @@ mod tests {
 
     #[test]
     fn test_get_agent_md_returns_none_for_missing() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         assert!(runner
             .get_agent_md(Path::new("/nonexistent/path/xyz"))
             .is_none());
@@ -3804,7 +3800,7 @@ mod tests {
             skip_permissions: true,
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         // Verify the runner works by calling methods that depend on proper initialization
         assert!(!runner.has_agent_md(Path::new("/nonexistent")));
         let issue = Issue::new("1", "T-1", "Bug", "https://example.com", "linear");
@@ -4010,7 +4006,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_contains_issue_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "LIN-1", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -4026,7 +4022,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_contains_context() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "LIN-1", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -4041,7 +4037,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_contains_short_id() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "PROJ-999", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(
             &issue,
@@ -4056,7 +4052,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt_fallback_instructs_pr_creation() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "linear");
         let prompt =
             runner.build_prompt(&issue, "ctx", Path::new("/tmp/nonexistent_project_dir_xyz"));
@@ -4408,7 +4404,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_gitlab_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("gl-1", "MR-1", "Fix", "https://gitlab.com/1", "gitlab");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -4423,7 +4419,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_jira_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("j-99", "JIRA-99", "Task", "https://jira.ex.com/99", "jira");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
 
@@ -4434,7 +4430,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_custom_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "c-1",
             "CUSTOM-1",
@@ -4454,7 +4450,7 @@ mod tests {
 
     #[test]
     fn test_prepare_env_and_label_env_contains_inherited_vars() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let (_env, _label) = runner.prepare_env_and_label(None);
         // The environment should contain inherited env vars from the process
         // PATH should always be present
@@ -4480,7 +4476,7 @@ mod tests {
         )
         .unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "linear");
         let prompt = runner.build_prompt(&issue, "error context here", &tmp_dir);
 
@@ -4504,7 +4500,7 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         std::fs::write(tmp_dir.join("AGENT.md"), "# Agent v2").unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("1", "T-1", "Bug", "https://ex.com", "sentry");
         let from_public = runner.build_prompt_for_issue(&issue, "ctx", &tmp_dir);
         let from_private = runner.build_prompt(&issue, "ctx", &tmp_dir);
@@ -4842,7 +4838,7 @@ mod tests {
             model: Some("haiku".to_string()),
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         assert_eq!(runner.config.model.as_deref(), Some("haiku"));
     }
 
@@ -4852,7 +4848,7 @@ mod tests {
             timeout_secs: 42,
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         assert_eq!(runner.config.timeout_secs, 42);
     }
 
@@ -4862,7 +4858,7 @@ mod tests {
             skip_permissions: true,
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         assert!(runner.config.skip_permissions);
     }
 
@@ -4872,7 +4868,7 @@ mod tests {
             instructions: Some("Be thorough".to_string()),
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         assert_eq!(runner.config.instructions.as_deref(), Some("Be thorough"));
     }
 
@@ -4882,13 +4878,13 @@ mod tests {
             permissions: vec!["Bash".to_string(), "Read".to_string()],
             ..Default::default()
         };
-        let runner = ClaudeAgentRunner::new_simple(config);
+        let runner = new_simple(config);
         assert_eq!(runner.config.permissions, vec!["Bash", "Read"]);
     }
 
     #[test]
     fn test_runner_base_env_captures_process_env() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         // The base_env should be a snapshot of the process environment
         assert!(!runner.base_env.is_empty());
         // PATH is virtually always present
@@ -5014,7 +5010,7 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         std::fs::write(tmp_dir.join("AGENT.md"), "# GitHub Agent").unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "42",
             "#42",
@@ -5041,7 +5037,7 @@ mod tests {
         std::fs::create_dir_all(&tmp_dir).unwrap();
         std::fs::write(tmp_dir.join("AGENT.md"), "# Sentry Handler").unwrap();
 
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new(
             "99",
             "SENTRY-99",
@@ -5493,16 +5489,14 @@ more output"#;
 
     #[test]
     fn test_claude_agent_runner_name() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         assert_eq!(runner.name(), "claude");
     }
 
     #[test]
     fn test_claude_agent_runner_capabilities() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         let caps = runner.capabilities();
         assert!(
@@ -5526,8 +5520,7 @@ more output"#;
 
     #[test]
     fn test_claude_agent_runner_build_prompt_delegates() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         let issue = Issue::new("1", "LIN-1", "Bug title", "https://example.com", "linear");
         // The trait method should produce the same result as the internal method
@@ -5538,9 +5531,8 @@ more output"#;
 
     #[tokio::test]
     async fn test_claude_execute_nonexistent_binary_returns_error() {
-        use claudear_storage::SqliteTracker;
         // Use a project_dir that does not exist to force a spawn error
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let config = ClaudeRunnerConfig::default();
         let runner = ClaudeAgentRunner::new(config, tracker);
         let result = runner
@@ -5562,6 +5554,7 @@ more output"#;
         );
     }
 
+    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn test_claude_execute_records_activity_on_failure() {
         use claudear_storage::SqliteTracker;
@@ -5603,8 +5596,7 @@ more output"#;
 
     #[test]
     fn test_claude_agent_runner_as_dyn_trait() {
-        use claudear_storage::SqliteTracker;
-        let tracker = Arc::new(SqliteTracker::in_memory().unwrap());
+        let tracker = Arc::new(claudear_storage::NoopTracker);
         let runner = ClaudeAgentRunner::new(ClaudeRunnerConfig::default(), tracker);
         // Verify it can be used as Arc<dyn AgentRunner>
         let agent: Arc<dyn AgentRunner> = Arc::new(runner);
@@ -5613,7 +5605,6 @@ more output"#;
         assert!(caps.structured_output);
     }
 
-    // --- Additional coverage tests ---
 
     #[test]
     fn test_structured_result_with_changelog() {
@@ -5988,7 +5979,7 @@ more output"#;
 
     #[test]
     fn test_prepare_env_and_label_does_not_include_claudecode() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let (env, _) = runner.prepare_env_and_label(None);
         // The base_env should have filtered out CLAUDECODE
         assert!(!env.contains_key("CLAUDECODE"));
@@ -5996,7 +5987,7 @@ more output"#;
 
     #[test]
     fn test_prepare_env_and_label_discord_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("d-1", "DISC-1", "Bug", "https://discord.com/1", "discord");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
         assert_eq!(label, "DISC-1");
@@ -6009,7 +6000,7 @@ more output"#;
 
     #[test]
     fn test_prepare_env_and_label_slack_source() {
-        let runner = ClaudeAgentRunner::new_simple(ClaudeRunnerConfig::default());
+        let runner = new_simple(ClaudeRunnerConfig::default());
         let issue = Issue::new("s-1", "SLACK-1", "Task", "https://slack.com/1", "slack");
         let (env, label) = runner.prepare_env_and_label(Some(&issue));
         assert_eq!(label, "SLACK-1");
@@ -6329,7 +6320,6 @@ more output"#;
         );
     }
 
-    // --- StructuredResult → extraction logic tests ---
 
     /// Simulate the extraction logic from execute(): parse a serde_json::Value as
     /// StructuredResult and extract the confidence fields, matching lines 1418-1447.

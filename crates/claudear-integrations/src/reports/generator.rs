@@ -332,7 +332,7 @@ impl Report {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use claudear_storage::SqliteTracker;

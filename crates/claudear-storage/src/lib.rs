@@ -17,7 +17,7 @@ pub use analytics::{
 pub use sqlite::SqliteTracker;
 pub use types::{
     ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
-    InferenceStats, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
+    InferenceStats, PurgeResult, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
 };
 #[cfg(feature = "sqlite")]
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
@@ -343,6 +343,40 @@ pub trait ActivityStore: Send + Sync {
     /// Prune old activity log entries. Returns count pruned.
     fn prune_old_activities(&self, _days_to_keep: i64) -> Result<usize> {
         Ok(0)
+    }
+
+    /// Purge all operational data (attempts, PRs, executions, reviews, activity logs,
+    /// regressions, clusters, metrics) while preserving knowledge, inference, embeddings,
+    /// code index, and learned patterns.
+    ///
+    /// Feedback outcomes are detached from attempts (attempt_id set to NULL) rather than
+    /// deleted, so learnings and embeddings are retained.
+    fn purge_operational_data(&self) -> Result<types::PurgeResult> {
+        Ok(types::PurgeResult {
+            fix_attempts: 0,
+            prs: 0,
+            pr_reviews: 0,
+            pr_review_comments: 0,
+            pr_review_states: 0,
+            claude_executions: 0,
+            strategy_fingerprints: 0,
+            diff_analyses: 0,
+            regression_watches: 0,
+            release_tracking: 0,
+            regression_checks: 0,
+            qa_usage: 0,
+            activity_log: 0,
+            processing_metrics: 0,
+            webhook_deliveries: 0,
+            issue_clusters: 0,
+            issue_cluster_members: 0,
+            content_clusters: 0,
+            severity_scores: 0,
+            suppression_log: 0,
+            eval_snapshots: 0,
+            eval_deltas: 0,
+            feedback_outcomes_detached: 0,
+        })
     }
 
     /// Prune old processing metrics. Returns count pruned.
@@ -1389,6 +1423,93 @@ impl<T> FixAttemptTracker for T where
         + ChatStore
 {
 }
+
+/// A no-op tracker for use in tests that don't need persistence.
+///
+/// Implements all tracker traits with no-op defaults. Unlike `SqliteTracker`,
+/// this is available without the `sqlite` feature flag.
+pub struct NoopTracker;
+
+impl AttemptTracker for NoopTracker {
+    fn has_attempted(&self, _: &str, _: &str) -> Result<bool> {
+        Ok(false)
+    }
+    fn get_attempted_issue_ids(&self, _: &str) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
+    }
+    fn record_attempt(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn record_attempt_with_labels(&self, _: &str, _: &str, _: &str, _: &[String]) -> Result<()> {
+        Ok(())
+    }
+    fn mark_success(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn mark_failed(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn mark_merged(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn mark_closed(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn mark_resolved(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn get_attempt(&self, _: &str, _: &str) -> Result<Option<FixAttempt>> {
+        Ok(None)
+    }
+    fn get_attempts_by_status(&self, _: FixAttemptStatus) -> Result<Vec<FixAttempt>> {
+        Ok(vec![])
+    }
+    fn get_pending_prs(&self) -> Result<Vec<FixAttempt>> {
+        Ok(vec![])
+    }
+    fn get_attempt_by_pr_url(&self, _: &str) -> Result<Option<FixAttempt>> {
+        Ok(None)
+    }
+    fn reset_attempt(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn get_stats(&self) -> Result<FixAttemptStats> {
+        Ok(FixAttemptStats {
+            total: 0,
+            pending: 0,
+            success: 0,
+            failed: 0,
+            merged: 0,
+            closed: 0,
+            cannot_fix: 0,
+            by_source: Default::default(),
+        })
+    }
+    fn increment_retry(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn mark_cannot_fix(&self, _: &str, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+    fn get_retryable_issues(&self, _: u32) -> Result<Vec<FixAttempt>> {
+        Ok(vec![])
+    }
+    fn prepare_for_retry(&self, _: &str, _: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl ActivityStore for NoopTracker {}
+impl KnowledgeStore for NoopTracker {}
+impl EmbeddingStore for NoopTracker {}
+impl ExperimentStore for NoopTracker {}
+impl EvaluationStore for NoopTracker {}
+impl WebhookStore for NoopTracker {}
+impl SimilarityStore for NoopTracker {}
+impl RepoStore for NoopTracker {}
+impl UserStore for NoopTracker {}
+impl RegressionStore for NoopTracker {}
+impl ChatStore for NoopTracker {}
 
 #[cfg(test)]
 mod tests {

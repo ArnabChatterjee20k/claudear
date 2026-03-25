@@ -122,6 +122,60 @@ pub struct StoredDependency {
 
 /// Diagnostic counts for all major tables.
 #[derive(Debug, Clone, Serialize)]
+pub struct PurgeResult {
+    pub fix_attempts: usize,
+    pub prs: usize,
+    pub pr_reviews: usize,
+    pub pr_review_comments: usize,
+    pub pr_review_states: usize,
+    pub claude_executions: usize,
+    pub strategy_fingerprints: usize,
+    pub diff_analyses: usize,
+    pub regression_watches: usize,
+    pub release_tracking: usize,
+    pub regression_checks: usize,
+    pub qa_usage: usize,
+    pub activity_log: usize,
+    pub processing_metrics: usize,
+    pub webhook_deliveries: usize,
+    pub issue_clusters: usize,
+    pub issue_cluster_members: usize,
+    pub content_clusters: usize,
+    pub severity_scores: usize,
+    pub suppression_log: usize,
+    pub eval_snapshots: usize,
+    pub eval_deltas: usize,
+    pub feedback_outcomes_detached: usize,
+}
+
+impl PurgeResult {
+    pub fn total_deleted(&self) -> usize {
+        self.fix_attempts
+            + self.prs
+            + self.pr_reviews
+            + self.pr_review_comments
+            + self.pr_review_states
+            + self.claude_executions
+            + self.strategy_fingerprints
+            + self.diff_analyses
+            + self.regression_watches
+            + self.release_tracking
+            + self.regression_checks
+            + self.qa_usage
+            + self.activity_log
+            + self.processing_metrics
+            + self.webhook_deliveries
+            + self.issue_clusters
+            + self.issue_cluster_members
+            + self.content_clusters
+            + self.severity_scores
+            + self.suppression_log
+            + self.eval_snapshots
+            + self.eval_deltas
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DiagnosticCounts {
     pub fix_attempts: i64,
     pub fix_attempts_by_status: HashMap<String, i64>,
