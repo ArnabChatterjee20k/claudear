@@ -62,12 +62,20 @@ impl GitOps {
     ///
     /// If the repository doesn't exist locally, it will be cloned.
     /// If it exists, only `git fetch origin` is run — the working tree is untouched.
-    pub async fn ensure_repo_fetched(repo_path: &Path, scm_url: &str) -> Result<()> {
+    ///
+    /// After fetching/cloning, updates `refs/remotes/origin/HEAD` so the remote's
+    /// default branch can be detected, and returns the detected default branch name.
+    pub async fn ensure_repo_fetched(repo_path: &Path, scm_url: &str) -> Result<String> {
         if repo_path.exists() {
-            Self::fetch_all(repo_path).await
+            Self::fetch_all(repo_path).await?;
         } else {
-            Self::clone(scm_url, repo_path).await
+            Self::clone(scm_url, repo_path).await?;
         }
+
+        // Update origin/HEAD so we know the remote's default branch.
+        Self::update_remote_head(repo_path).await;
+
+        Ok(Self::detect_default_branch(repo_path).await)
     }
 
     /// Fetch all remote refs without touching the working tree.
@@ -412,6 +420,81 @@ impl GitOps {
     pub fn is_git_repo(path: &Path) -> bool {
         let git_path = path.join(".git");
         git_path.is_dir() || git_path.is_file()
+    }
+
+    /// Detect the remote's default branch by reading `refs/remotes/origin/HEAD`.
+    ///
+    /// Returns the branch name (e.g. `"main"`) or falls back to `"main"` if the
+    /// ref cannot be read.
+    pub async fn detect_default_branch(repo_path: &Path) -> String {
+        let output = Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let refname = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                // e.g. "refs/remotes/origin/main" → "main"
+                refname
+                    .strip_prefix("refs/remotes/origin/")
+                    .unwrap_or("main")
+                    .to_string()
+            }
+            _ => "main".to_string(),
+        }
+    }
+
+    /// Synchronous version of [`detect_default_branch`](Self::detect_default_branch)
+    /// for use in non-async contexts (e.g. filesystem index building).
+    pub fn detect_default_branch_sync(repo_path: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(repo_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let refname = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                refname
+                    .strip_prefix("refs/remotes/origin/")
+                    .unwrap_or("main")
+                    .to_string()
+            }
+            _ => "main".to_string(),
+        }
+    }
+
+    /// Update `refs/remotes/origin/HEAD` to match the remote's default branch.
+    ///
+    /// This queries the remote to determine its HEAD, so it requires network
+    /// access. Failures are logged but not propagated since this is best-effort.
+    async fn update_remote_head(repo_path: &Path) {
+        let output = Command::new("git")
+            .args(["remote", "set-head", "origin", "--auto"])
+            .current_dir(repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                tracing::debug!(repo = ?repo_path, "Updated origin/HEAD");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::debug!(repo = ?repo_path, error = %stderr, "Failed to update origin/HEAD");
+            }
+            Err(e) => {
+                tracing::debug!(repo = ?repo_path, error = %e, "Failed to run git remote set-head");
+            }
+        }
     }
 
     /// Get the current branch of a repository.
@@ -1066,9 +1149,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Now ensure_repo_fetched should just fetch
+        // Now ensure_repo_fetched should just fetch and return the default branch
         let result = GitOps::ensure_repo_fetched(&target, &url).await;
-        assert!(result.is_ok(), "fetch failed: {:?}", result.unwrap_err());
+        let default_branch = result.expect("fetch failed");
+        assert_eq!(default_branch, "main");
     }
 
     // ════════════════════════════════════════════════════════════
