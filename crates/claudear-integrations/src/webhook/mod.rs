@@ -13,12 +13,13 @@ mod telegram;
 mod whatsapp;
 
 pub use configurator::{print_setup_result, WebhookConfigurator, WebhookSetupResult};
-pub use github::GitHubWebhookHandler;
+pub use github::{GitHubWebhookHandler, WebhookAction};
 pub use gitlab::{GitLabIssueWebhookHandler, GitLabMrWebhookHandler};
 pub use jira::JiraWebhookHandler;
 pub use linear::LinearWebhookHandler;
 pub use linear_api::{LinearApiClient, WebhookRegistration};
 pub use sentry::SentryWebhookHandler;
+pub(crate) use sentry::{map_priority as sentry_map_priority, map_status as sentry_map_status};
 pub use sentry_api::{SentryApiClient, SentryWebhookRegistration};
 pub use slack::SlackWebhookHandler;
 pub use telegram::TelegramWebhookHandler;
