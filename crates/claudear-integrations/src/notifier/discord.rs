@@ -1,6 +1,7 @@
 //! Discord webhook notifier.
 
 use super::Notifier;
+use crate::ask_reply_inbox;
 use crate::discord::{CreateMessageParams, DiscordClient, MessageEmbed};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -50,6 +51,12 @@ impl DiscordWebhookClient for ReqwestDiscordWebhookClient {
 
         Ok(HttpResponse { status, body })
     }
+}
+
+/// Metadata returned after successfully sending a Discord message.
+struct SentMessageInfo {
+    message_id: String,
+    channel_id: String,
 }
 
 /// Discord webhook notifier.
@@ -171,10 +178,15 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         }
     }
 
-    async fn send(&self, message: DiscordMessage) -> Result<()> {
+    async fn send(&self, message: DiscordMessage) -> Result<Option<SentMessageInfo>> {
         if let Some(ref webhook_url) = self.config.webhook_url {
             let body = serde_json::to_value(&message)?;
-            let response = self.http.post_json(webhook_url.expose(), &body).await?;
+            let url_with_wait = if webhook_url.expose().contains('?') {
+                format!("{}&wait=true", webhook_url.expose())
+            } else {
+                format!("{}?wait=true", webhook_url.expose())
+            };
+            let response = self.http.post_json(&url_with_wait, &body).await?;
 
             if response.status < 200 || response.status >= 300 {
                 return Err(Error::notifier(
@@ -183,19 +195,33 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
                 ));
             }
 
-            return Ok(());
+            let info = serde_json::from_str::<serde_json::Value>(&response.body)
+                .ok()
+                .and_then(|v| {
+                    let id = v.get("id")?.as_str()?.to_string();
+                    let channel_id = v.get("channel_id")?.as_str()?.to_string();
+                    Some(SentMessageInfo {
+                        message_id: id,
+                        channel_id,
+                    })
+                });
+            return Ok(info);
         }
 
         if let Some(ref client) = self.bot_client {
             if let Some(ref channel_id) = self.config.channel_id {
                 if !channel_id.is_empty() {
                     let params = Self::to_create_message_params(&message);
-                    client.send_message(channel_id, params).await?;
+                    let sent = client.send_message(channel_id, params).await?;
+                    return Ok(Some(SentMessageInfo {
+                        message_id: sent.id,
+                        channel_id: sent.channel_id,
+                    }));
                 }
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 
     fn has_bot_channel(&self) -> bool {
@@ -210,6 +236,28 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
                 .as_ref()
                 .map(|v| !v.is_empty())
                 .unwrap_or(false)
+    }
+
+    /// Returns true when at least one concrete delivery path exists:
+    /// a non-empty webhook URL, or a successfully constructed bot client
+    /// paired with a non-empty channel ID.
+    fn has_delivery_path(&self) -> bool {
+        let has_webhook = self
+            .config
+            .webhook_url
+            .as_ref()
+            .map(|v| !v.expose().is_empty())
+            .unwrap_or(false);
+
+        let has_bot = self.bot_client.is_some()
+            && self
+                .config
+                .channel_id
+                .as_ref()
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+
+        has_webhook || has_bot
     }
 
     fn to_create_message_params(msg: &DiscordMessage) -> CreateMessageParams {
@@ -1001,7 +1049,8 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
 
     async fn notify_start(&self, issue: &Issue) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_start_message(issue, mention)).await
+        let _ = self.send(build_start_message(issue, mention)).await?;
+        Ok(())
     }
 
     async fn notify_success(&self, issue: &Issue, pr_url: &str) -> Result<()> {
@@ -1010,12 +1059,15 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             .get_metadata::<String>("cascade_downstream_repo")
             .is_some()
         {
-            self.send(build_cascade_success_message(issue, pr_url, mention))
-                .await
+            let _ = self
+                .send(build_cascade_success_message(issue, pr_url, mention))
+                .await?;
         } else {
-            self.send(build_success_message(issue, pr_url, mention))
-                .await
+            let _ = self
+                .send(build_success_message(issue, pr_url, mention))
+                .await?;
         }
+        Ok(())
     }
 
     async fn notify_completed(&self, issue: &Issue) -> Result<()> {
@@ -1024,11 +1076,13 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             .get_metadata::<bool>("regression_resolved")
             .unwrap_or(false)
         {
-            self.send(build_regression_resolved_message(issue, mention))
-                .await
+            let _ = self
+                .send(build_regression_resolved_message(issue, mention))
+                .await?;
         } else {
-            self.send(build_completed_message(issue, mention)).await
+            let _ = self.send(build_completed_message(issue, mention)).await?;
         }
+        Ok(())
     }
 
     async fn notify_failed(&self, issue: &Issue, error: &str) -> Result<()> {
@@ -1037,41 +1091,51 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             .get_metadata::<bool>("regression_detected")
             .unwrap_or(false)
         {
-            self.send(build_regression_detected_message(issue, error, mention))
-                .await
+            let _ = self
+                .send(build_regression_detected_message(issue, error, mention))
+                .await?;
         } else if issue
             .get_metadata::<String>("cascade_downstream_repo")
             .is_some()
         {
-            self.send(build_cascade_failed_message(issue, error, mention))
-                .await
+            let _ = self
+                .send(build_cascade_failed_message(issue, error, mention))
+                .await?;
         } else {
-            self.send(build_failed_message(issue, error, mention)).await
+            let _ = self
+                .send(build_failed_message(issue, error, mention))
+                .await?;
         }
+        Ok(())
     }
 
     async fn notify_merged(&self, issue: &Issue, pr_url: &str) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_merged_message(issue, pr_url, mention))
-            .await
+        let _ = self
+            .send(build_merged_message(issue, pr_url, mention))
+            .await?;
+        Ok(())
     }
 
     async fn notify_closed(&self, issue: &Issue, pr_url: &str) -> Result<()> {
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_closed_message(issue, pr_url, mention))
-            .await
+        let _ = self
+            .send(build_closed_message(issue, pr_url, mention))
+            .await?;
+        Ok(())
     }
 
     async fn notify_status(&self, message: &str) -> Result<()> {
-        self.send(build_status_message(message)).await
+        let _ = self.send(build_status_message(message)).await?;
+        Ok(())
     }
 
     async fn notify_urgent_issues(&self, issues: &[Issue]) -> Result<()> {
         let mention = self.get_user_mention();
-        match build_urgent_issues_message(issues, mention) {
-            Some(message) => self.send(message).await,
-            None => Ok(()),
+        if let Some(message) = build_urgent_issues_message(issues, mention) {
+            let _ = self.send(message).await?;
         }
+        Ok(())
     }
 
     async fn ask_question(
@@ -1079,14 +1143,36 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         issue: &Issue,
         request: &AskRequest,
     ) -> Result<Option<AskDelivery>> {
+        if !self.has_delivery_path() {
+            return Err(Error::notifier(
+                "discord",
+                "No delivery path configured: need either a webhook URL or a bot token with channel ID",
+            ));
+        }
+
         let mention = self.get_user_mention_for_issue(issue);
-        self.send(build_ask_question_message(issue, request, mention))
+        let sent_info = self
+            .send(build_ask_question_message(issue, request, mention))
             .await?;
+
+        let message_id = sent_info.as_ref().map(|info| info.message_id.clone());
+        if let Some(ref info) = sent_info {
+            ask_reply_inbox::remember_ask_delivery_id(
+                "discord",
+                &request.correlation_id,
+                info.message_id.clone(),
+            );
+            ask_reply_inbox::remember_ask_poll_channel(
+                "discord",
+                &request.correlation_id,
+                info.channel_id.clone(),
+            );
+        }
 
         Ok(Some(AskDelivery {
             channel: "discord".to_string(),
             target: self.get_target_discord_id_for_issue(issue),
-            message_id: None,
+            message_id,
         }))
     }
 
@@ -1099,29 +1185,56 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             Some(c) => c,
             None => return Ok(Vec::new()),
         };
-        let channel_id = match self.config.channel_id.as_ref() {
+
+        // Prefer the channel the webhook actually posted to (fixes M2: webhook
+        // may target a different channel than self.config.channel_id). Fall back
+        // to the configured channel_id when no remembered channel exists.
+        let poll_channel =
+            ask_reply_inbox::ask_poll_channel("discord", &request.correlation_id);
+        let channel_id = match poll_channel
+            .as_deref()
+            .or(self.config.channel_id.as_deref())
+        {
             Some(v) if !v.is_empty() => v,
             _ => return Ok(Vec::new()),
         };
 
-        let messages = client.list_channel_messages(channel_id, 50).await?;
+        // Use remembered delivery IDs from the inbox (set during ask_question).
+        let remembered_ids: std::collections::HashSet<String> =
+            ask_reply_inbox::ask_delivery_ids("discord", &request.correlation_id)
+                .into_iter()
+                .collect();
 
-        // Identify ask messages by their embed title ("❓ Input needed: ...").
-        let ask_prefix = format!("\u{2753} Input needed: {}", request.short_id);
-        let ask_message_ids: std::collections::HashSet<String> = messages
-            .iter()
-            .filter(|m| {
-                m.embeds
+        // When we have a known ask message ID, fetch only messages posted after
+        // it (fixes the 50-message window limit). Otherwise fall back to recent
+        // history and scan by embed title.
+        let messages = if let Some(after_id) = remembered_ids.iter().min() {
+            client
+                .list_channel_messages_after(channel_id, after_id, 100)
+                .await?
+        } else {
+            client.list_channel_messages(channel_id, 100).await?
+        };
+
+        // Build the full set of ask message IDs: start with remembered IDs,
+        // then also scan fetched messages for the embed title pattern as a
+        // fallback (covers the case where remembered IDs are empty).
+        let mut ask_message_ids = remembered_ids;
+        if ask_message_ids.is_empty() {
+            let ask_prefix = format!("\u{2753} Input needed: {}", request.short_id);
+            for m in &messages {
+                if m.embeds
                     .iter()
                     .any(|e| e.title.as_ref().is_some_and(|t| t.starts_with(&ask_prefix)))
-            })
-            .map(|m| m.id.clone())
-            .collect();
+                {
+                    ask_message_ids.insert(m.id.clone());
+                }
+            }
+        }
 
         let reply_pairs: Vec<(String, AskReply)> = messages
             .into_iter()
             .filter_map(|message| {
-                // Skip the ask messages themselves.
                 if ask_message_ids.contains(&message.id) {
                     return None;
                 }
@@ -1133,14 +1246,11 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
                     .map(|dt| dt.with_timezone(&Utc))?;
 
                 // Only accept Discord replies (message_reference) to an ask message.
-                // No timestamp filter: replies matched by message_reference are
-                // authoritative regardless of timing (the reply can arrive before
-                // the daemon finishes internal bookkeeping).
                 let is_reply_to_ask = message
                     .message_reference
                     .as_ref()
                     .and_then(|r| r.message_id.as_ref())
-                    .map(|message_id| ask_message_ids.contains(message_id))
+                    .map(|mid| ask_message_ids.contains(mid))
                     .unwrap_or(false);
 
                 if !is_reply_to_ask {
@@ -1161,9 +1271,8 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
             })
             .collect();
 
-        // React to reply messages with an emoji
         for (msg_id, _) in &reply_pairs {
-            let emojis = ["🎉", "💜", "✨", "🌟", "🙌", "💪", "🔥", "🚀", "🤩", "💖"];
+            let emojis = ["\u{1F389}", "\u{1F49C}", "\u{2728}", "\u{1F31F}", "\u{1F64C}", "\u{1F4AA}", "\u{1F525}", "\u{1F680}", "\u{1F929}", "\u{1F496}"];
             let hash: usize = msg_id
                 .bytes()
                 .fold(0usize, |acc, b| acc.wrapping_add(b as usize));
@@ -1599,7 +1708,10 @@ mod tests {
         notifier.notify_start(&issue).await.unwrap();
 
         let (url, _) = notifier.http.get_last_call().unwrap();
-        assert_eq!(url, "https://discord.com/api/webhooks/123/abc");
+        assert_eq!(
+            url,
+            "https://discord.com/api/webhooks/123/abc?wait=true"
+        );
     }
 
     #[tokio::test]
@@ -2952,7 +3064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ask_question_disabled_webhook_returns_ok_delivery() {
+    async fn test_ask_question_disabled_webhook_returns_error() {
         let config = DiscordConfig {
             webhook_url: None,
             user_id: None,
@@ -2963,9 +3075,10 @@ mod tests {
         let issue = Issue::new("1", "LIN-1", "Test", "https://example.com", "linear");
         let request = make_ask_request("tok-9", "Confirm?", None, vec![], None, None);
 
-        let result = notifier.ask_question(&issue, &request).await.unwrap();
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().channel, "discord");
+        let result = notifier.ask_question(&issue, &request).await;
+        assert!(result.is_err());
+        let err_str = result.unwrap_err().to_string();
+        assert!(err_str.contains("No delivery path configured"));
     }
 
     #[tokio::test]
@@ -3896,7 +4009,10 @@ mod tests {
         // Should have used the webhook (mock was called), not the bot API
         assert_eq!(notifier.http.get_call_count(), 1);
         let (url, _) = notifier.http.get_last_call().unwrap();
-        assert_eq!(url, "https://discord.com/api/webhooks/123/abc");
+        assert_eq!(
+            url,
+            "https://discord.com/api/webhooks/123/abc?wait=true"
+        );
     }
 
     #[test]

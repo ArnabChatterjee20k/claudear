@@ -164,7 +164,6 @@ impl IssueProcessor {
             }
         };
 
-        // --- Git fetch + worktree creation ---
         if let (Some(scm_url), Some(default_branch), Some(repo_name)) = (
             resolution.scm_url(),
             resolution.default_branch(),
@@ -176,13 +175,34 @@ impl IssueProcessor {
                 "Fetching latest changes"
             );
 
-            if let Err(e) = GitOps::ensure_repo_fetched(&project_dir, scm_url).await {
-                let error = format!("Failed to fetch repository: {}", e);
-                self.tracker
-                    .mark_failed(source_name, &issue.id, &error)
-                    .ok();
-                return Ok(ProcessingOutcome::Failed { error });
-            }
+            let detected_default_branch =
+                match GitOps::ensure_repo_fetched(&project_dir, scm_url).await {
+                    Ok(branch) => branch,
+                    Err(e) => {
+                        let error = format!("Failed to fetch repository: {}", e);
+                        self.tracker
+                            .mark_failed(source_name, &issue.id, &error)
+                            .ok();
+                        return Ok(ProcessingOutcome::Failed { error });
+                    }
+                };
+
+            // Use the detected default branch from the remote, falling back to
+            // the index value if detection returned the same fallback.
+            let effective_default_branch = if detected_default_branch != "main"
+                || default_branch == "main"
+            {
+                &detected_default_branch
+            } else {
+                default_branch
+            };
+
+            tracing::info!(
+                short_id = %issue.short_id,
+                repo = %repo_name,
+                default_branch = %effective_default_branch,
+                "Repository fetched"
+            );
 
             // Incrementally re-index code after fetch
             self.reindex_repo(repo_name, &project_dir).await;
@@ -196,12 +216,12 @@ impl IssueProcessor {
                         branch = %branch,
                         "Failed to fetch PR branch, falling back to default"
                     );
-                    format!("origin/{}", default_branch)
+                    format!("origin/{}", effective_default_branch)
                 } else {
                     format!("origin/{}", branch)
                 }
             } else {
-                format!("origin/{}", default_branch)
+                format!("origin/{}", effective_default_branch)
             };
 
             // Create per-issue worktree.
@@ -422,24 +442,30 @@ impl IssueProcessor {
                                 RepoResolution::Skip { .. } => unreachable!(),
                             };
 
-                            if let (Some(scm_url), Some(default_branch), Some(repo_name)) = (
+                            if let (Some(scm_url), Some(_index_default_branch), Some(repo_name)) = (
                                 new_resolution.scm_url(),
                                 new_resolution.default_branch(),
                                 new_resolution.repo_name(),
                             ) {
-                                if let Err(e) =
-                                    GitOps::ensure_repo_fetched(&new_project_dir, scm_url).await
+                                let detected_branch = match GitOps::ensure_repo_fetched(
+                                    &new_project_dir,
+                                    scm_url,
+                                )
+                                .await
                                 {
-                                    break Ok(ProcessingOutcome::Failed {
-                                        error: format!(
-                                            "Failed to fetch alternative repo {}: {}",
-                                            repo_name, e
-                                        ),
-                                    });
-                                }
+                                    Ok(branch) => branch,
+                                    Err(e) => {
+                                        break Ok(ProcessingOutcome::Failed {
+                                            error: format!(
+                                                "Failed to fetch alternative repo {}: {}",
+                                                repo_name, e
+                                            ),
+                                        });
+                                    }
+                                };
                                 self.reindex_repo(repo_name, &new_project_dir).await;
 
-                                let checkout_ref = format!("origin/{}", default_branch);
+                                let checkout_ref = format!("origin/{}", detected_branch);
                                 let wt_path = worktree_path(
                                     &self.config.workspace,
                                     repo_name,
