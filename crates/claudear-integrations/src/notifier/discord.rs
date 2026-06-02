@@ -224,6 +224,31 @@ impl<H: DiscordWebhookClient> DiscordNotifier<H> {
         Ok(None)
     }
 
+    /// Send a message, preferring the channel the issue originated from.
+    ///
+    /// When a bot client is available and the issue carries an originating
+    /// `channel_id` (e.g. a Discord question), the reply is posted there.
+    /// Otherwise it falls back to the default delivery path (webhook / configured
+    /// channel).
+    async fn send_to_issue_channel(
+        &self,
+        issue: &Issue,
+        message: DiscordMessage,
+    ) -> Result<Option<SentMessageInfo>> {
+        let origin_channel = issue
+            .get_metadata::<String>("channel_id")
+            .filter(|c| !c.is_empty());
+        if let (Some(client), Some(channel_id)) = (self.bot_client.as_ref(), origin_channel) {
+            let params = Self::to_create_message_params(&message);
+            let sent = client.send_message(&channel_id, params).await?;
+            return Ok(Some(SentMessageInfo {
+                message_id: sent.id,
+                channel_id: sent.channel_id,
+            }));
+        }
+        self.send(message).await
+    }
+
     fn has_bot_channel(&self) -> bool {
         self.config
             .bot_token
@@ -400,6 +425,115 @@ pub(crate) fn build_start_message(issue: &Issue, mention: Option<String>) -> Dis
             timestamp: Some(timestamp()),
         }]),
     }
+}
+
+/// Maximum number of message chunks to send for a single answer.
+const MAX_ANSWER_CHUNKS: usize = 5;
+
+/// Split `text` into UTF-8-safe chunks of at most `max_len` bytes, preferring to
+/// break on newline boundaries. At most `max_chunks` are produced; if content
+/// remains beyond the cap, a truncation marker is appended to the last chunk.
+pub(crate) fn chunk_text(text: &str, max_len: usize, max_chunks: usize) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() || max_len == 0 || max_chunks == 0 {
+        return Vec::new();
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() && chunks.len() < max_chunks {
+        if remaining.len() <= max_len {
+            chunks.push(remaining.to_string());
+            remaining = "";
+            break;
+        }
+
+        // Largest char boundary <= max_len.
+        let mut split = max_len;
+        while split > 0 && !remaining.is_char_boundary(split) {
+            split -= 1;
+        }
+        // Prefer breaking on the last newline in the first half..split for cleaner output.
+        if let Some(nl) = remaining[..split].rfind('\n') {
+            if nl > max_len / 2 {
+                split = nl + 1;
+            }
+        }
+        if split == 0 {
+            // Pathological: a single char wider than max_len shouldn't happen, but
+            // guard against an infinite loop.
+            split = remaining.len().min(max_len.max(1));
+            while split < remaining.len() && !remaining.is_char_boundary(split) {
+                split += 1;
+            }
+        }
+
+        chunks.push(remaining[..split].to_string());
+        remaining = remaining[split..].trim_start_matches('\n');
+    }
+
+    if !remaining.is_empty() {
+        let marker = "\n…(answer truncated)";
+        if let Some(last) = chunks.last_mut() {
+            let budget = max_len.saturating_sub(marker.len());
+            if last.len() > budget {
+                let mut cut = budget;
+                while cut > 0 && !last.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                last.truncate(cut);
+            }
+            last.push_str(marker);
+        }
+    }
+
+    chunks
+}
+
+/// Build the Discord message(s) carrying a RAG-grounded answer. Long answers are
+/// split across multiple embeds/messages.
+pub(crate) fn build_answer_messages(
+    issue: &Issue,
+    answer: &str,
+    mention: Option<String>,
+) -> Vec<DiscordMessage> {
+    let short_id = truncate_string(&issue.short_id, MAX_SHORT_ID_LENGTH);
+    let chunks = chunk_text(answer, MAX_DESCRIPTION_LENGTH, MAX_ANSWER_CHUNKS);
+    let total = chunks.len();
+
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let title = if i == 0 {
+                Some(format!("\u{1F4AC} Answer: {}", short_id))
+            } else {
+                None
+            };
+            let footer_text = if total > 1 {
+                format!("Claudear \u{00B7} {}/{}", i + 1, total)
+            } else {
+                "Claudear".to_string()
+            };
+            DiscordMessage {
+                content: if i == 0 { mention.clone() } else { None },
+                embeds: Some(vec![DiscordEmbed {
+                    title,
+                    description: Some(chunk),
+                    url: if i == 0 {
+                        Some(truncate_string(&issue.url, MAX_URL_LENGTH))
+                    } else {
+                        None
+                    },
+                    color: Some(0x9b59b6), // Purple
+                    fields: None,
+                    footer: Some(DiscordFooter { text: footer_text }),
+                    timestamp: Some(timestamp()),
+                }]),
+            }
+        })
+        .collect()
 }
 
 /// Build the Discord message for a "PR created" notification.
@@ -1130,6 +1264,20 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
         Ok(())
     }
 
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<()> {
+        if !self.has_delivery_path() {
+            return Err(Error::notifier(
+                "discord",
+                "No delivery path configured: need either a webhook URL or a bot token with channel ID",
+            ));
+        }
+        let mention = self.get_user_mention_for_issue(issue);
+        for message in build_answer_messages(issue, answer, mention) {
+            let _ = self.send_to_issue_channel(issue, message).await?;
+        }
+        Ok(())
+    }
+
     async fn notify_urgent_issues(&self, issues: &[Issue]) -> Result<()> {
         let mention = self.get_user_mention();
         if let Some(message) = build_urgent_issues_message(issues, mention) {
@@ -1316,6 +1464,61 @@ mod tests {
         assert_eq!(get_source_emoji("sentry"), "\u{1F534}");
         assert_eq!(get_source_emoji("github"), "\u{1F419}");
         assert_eq!(get_source_emoji("unknown"), "\u{1F4CC}");
+    }
+
+    #[test]
+    fn test_chunk_text_short_single_chunk() {
+        let chunks = chunk_text("hello world", 2048, 5);
+        assert_eq!(chunks, vec!["hello world".to_string()]);
+    }
+
+    #[test]
+    fn test_chunk_text_empty() {
+        assert!(chunk_text("", 2048, 5).is_empty());
+        assert!(chunk_text("   ", 2048, 5).is_empty());
+    }
+
+    #[test]
+    fn test_chunk_text_splits_on_length() {
+        let text = "a".repeat(50);
+        let chunks = chunk_text(&text, 20, 5);
+        assert!(chunks.len() >= 3);
+        for c in &chunks {
+            assert!(c.len() <= 20);
+        }
+        // Concatenation preserves all content (no truncation within cap).
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn test_chunk_text_respects_max_chunks_and_marks_truncation() {
+        let text = "a".repeat(1000);
+        let chunks = chunk_text(&text, 20, 2);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.last().unwrap().contains("truncated"));
+    }
+
+    #[test]
+    fn test_build_answer_messages_first_has_title_and_mention() {
+        let issue = Issue::new("123", "DISCORD-123", "Q", "https://x/y", "discord");
+        let msgs = build_answer_messages(&issue, "a short answer", Some("<@1>".to_string()));
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content.as_deref(), Some("<@1>"));
+        let embed = &msgs[0].embeds.as_ref().unwrap()[0];
+        assert!(embed.title.as_ref().unwrap().contains("DISCORD-123"));
+        assert_eq!(embed.description.as_deref(), Some("a short answer"));
+    }
+
+    #[test]
+    fn test_build_answer_messages_multichunk_only_first_has_mention() {
+        let issue = Issue::new("123", "DISCORD-123", "Q", "https://x/y", "discord");
+        let long = "b".repeat(MAX_DESCRIPTION_LENGTH * 2 + 100);
+        let msgs = build_answer_messages(&issue, &long, Some("<@1>".to_string()));
+        assert!(msgs.len() >= 2);
+        assert_eq!(msgs[0].content.as_deref(), Some("<@1>"));
+        assert!(msgs[1].content.is_none());
+        // Continuation embeds carry no title.
+        assert!(msgs[1].embeds.as_ref().unwrap()[0].title.is_none());
     }
 
     #[test]

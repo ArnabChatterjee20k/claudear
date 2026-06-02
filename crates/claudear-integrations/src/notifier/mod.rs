@@ -161,6 +161,15 @@ pub trait Notifier: Send + Sync {
         false
     }
 
+    /// Send a RAG-grounded answer to a question back to the originating channel.
+    ///
+    /// Default implementation falls back to a plain status message; channels that
+    /// can reply to a specific conversation (e.g. Discord) should override this.
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<()> {
+        self.notify_status(&format!("Answer for {}:\n{}", issue.short_id, answer))
+            .await
+    }
+
     /// Notify that a repo swap is happening for an issue.
     async fn notify_repo_swap(&self, issue: &Issue, from_repo: &str, to_repo: &str) -> Result<()> {
         self.notify_status(&format!(
@@ -291,6 +300,18 @@ impl Notifier for CompositeNotifier {
         self.broadcast(|n| {
             let issues = issues.clone();
             async move { n.notify_urgent_issues(&issues).await }
+        })
+        .await;
+        Ok(())
+    }
+
+    async fn notify_answer(&self, issue: &Issue, answer: &str) -> Result<()> {
+        let issue = issue.clone();
+        let answer = answer.to_string();
+        self.broadcast(|n| {
+            let issue = issue.clone();
+            let answer = answer.clone();
+            async move { n.notify_answer(&issue, &answer).await }
         })
         .await;
         Ok(())
