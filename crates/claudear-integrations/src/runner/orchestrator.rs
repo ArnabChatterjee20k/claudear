@@ -189,6 +189,21 @@ impl AgentRunner for AgentOrchestrator {
             }
         }
     }
+
+    async fn answer_question(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<String> {
+        // Read-only Q&A always uses the primary provider.
+        let provider = self
+            .providers
+            .first()
+            .map(|p| &p.provider)
+            .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
+        provider.answer_question(issue, context, project_dir).await
+    }
 }
 
 #[cfg(test)]
