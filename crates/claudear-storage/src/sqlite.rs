@@ -1321,6 +1321,24 @@ impl AttemptTracker for SqliteTracker {
         Ok(())
     }
 
+    fn mark_answered(&self, source: &str, issue_id: &str, summary: &str) -> Result<()> {
+        tracing::info!(
+            source = source,
+            issue_id = issue_id,
+            "Marking attempt as answered"
+        );
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            UPDATE fix_attempts
+            SET status = 'answered', error_message = ?
+            WHERE source = ? AND issue_id = ?
+            "#,
+            params![summary, source, issue_id],
+        )?;
+        Ok(())
+    }
+
     fn get_retryable_issues(&self, max_retries: u32) -> Result<Vec<FixAttempt>> {
         let conn = self.acquire_lock()?;
         let mut stmt = conn.prepare_cached(
