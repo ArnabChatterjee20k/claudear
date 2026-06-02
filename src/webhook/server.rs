@@ -1192,6 +1192,7 @@ mod tests {
             chat: crate::config::ChatConfig::default(),
             tls: crate::config::TlsConfig::default(),
             embedding: crate::config::EmbeddingModelConfig::default(),
+            qa: crate::config::QaConfig::default(),
         }
     }
 

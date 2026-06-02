@@ -2161,6 +2161,7 @@ async fn telemetry_timeseries_handler(
                 FixAttemptStatus::Merged => point.merged += 1,
                 FixAttemptStatus::Closed => point.closed += 1,
                 FixAttemptStatus::CannotFix => point.cannot_fix += 1,
+                FixAttemptStatus::Answered => {}
             }
         }
     }
@@ -2691,6 +2692,7 @@ mod tests {
             chat: claudear_config::config::ChatConfig::default(),
             tls: claudear_config::config::TlsConfig::default(),
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
+            qa: claudear_config::config::QaConfig::default(),
         }
     }
 

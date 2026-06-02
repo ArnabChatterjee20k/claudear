@@ -343,6 +343,9 @@ pub enum FixAttemptStatus {
     /// Max retries reached, issue cannot be automatically fixed.
     #[serde(rename = "cannot_fix")]
     CannotFix,
+    /// Input was a question and was answered (no PR/fix attempted).
+    #[serde(rename = "answered")]
+    Answered,
 }
 
 impl std::fmt::Display for FixAttemptStatus {
@@ -354,6 +357,7 @@ impl std::fmt::Display for FixAttemptStatus {
             Self::Merged => write!(f, "merged"),
             Self::Closed => write!(f, "closed"),
             Self::CannotFix => write!(f, "cannot_fix"),
+            Self::Answered => write!(f, "answered"),
         }
     }
 }
@@ -369,6 +373,7 @@ impl std::str::FromStr for FixAttemptStatus {
             "merged" => Ok(Self::Merged),
             "closed" => Ok(Self::Closed),
             "cannot_fix" => Ok(Self::CannotFix),
+            "answered" => Ok(Self::Answered),
             _ => Err(format!("Unknown status: {}", s)),
         }
     }

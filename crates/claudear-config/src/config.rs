@@ -399,6 +399,9 @@ pub struct Config {
     /// Embedding model configuration (GPU acceleration, pool size).
     #[serde(default)]
     pub embedding: EmbeddingModelConfig,
+    /// RAG-grounded question answering configuration.
+    #[serde(default)]
+    pub qa: QaConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
@@ -588,6 +591,35 @@ impl Default for Config {
             chat: ChatConfig::default(),
             tls: TlsConfig::default(),
             embedding: EmbeddingModelConfig::default(),
+            qa: QaConfig::default(),
+        }
+    }
+}
+
+/// RAG-grounded question answering configuration.
+///
+/// When enabled, incoming messages from chat sources (e.g. Discord) are first
+/// classified as a question vs a fix/feature request. Pure questions are
+/// answered with code-grounded context (via the RAG code search) by the agent
+/// in a read-only mode — no branch or PR is created. Anything ambiguous falls
+/// back to the normal issue-resolution path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QaConfig {
+    /// Enable question/answer handling (default: false).
+    pub enabled: bool,
+    /// Number of code chunks to retrieve for grounding the answer (default: 8).
+    pub max_context_chunks: usize,
+    /// Timeout for generating an answer, in seconds (default: 600).
+    pub answer_timeout_secs: u64,
+}
+
+impl Default for QaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_context_chunks: 8,
+            answer_timeout_secs: 600,
         }
     }
 }
