@@ -38,6 +38,12 @@ fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
 }
 
+/// Whether a source is conversational and therefore eligible for question/answer
+/// handling. Tracker-style sources (Sentry, Linear, GitHub, etc.) are not.
+fn qa_eligible_source(source: &str) -> bool {
+    matches!(source, "discord" | "slack" | "telegram" | "whatsapp")
+}
+
 /// Decision from parsing an approval reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ApprovalDecision {
@@ -3405,37 +3411,48 @@ Create a PR with your changes.{custom_instructions}"#,
         // Save issue info before move for post-processing
         let issue_short_id = issue.short_id.clone();
 
-        // Build IssueProcessor and delegate to shared pipeline
-        let processor = IssueProcessor {
-            config: self.config.clone(),
-            tracker: Arc::clone(&self.tracker),
-            notifier: Arc::clone(&self.notifier),
-            agent: Arc::clone(&self.agent),
-            inferrer: self.inferrer.clone(),
-            embedding_client: self.embedding_client.clone(),
-            issue_embedding_service: self.issue_embedding_service.clone(),
-            code_search_service: self.code_search_service.clone(),
-            feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
-                FeedbackAnalyzer::new().with_tracker(self.tracker.clone()),
-            )),
-            review_watcher: self.review_watcher.clone(),
-            user_registry: self.user_registry.clone(),
-            github_client: self.github_client.clone(),
-            llm_analyzer: self.llm_analyzer.clone(),
-        };
+        // Q&A short-circuit: pure questions are answered with RAG-grounded context
+        // (read-only, no PR) instead of being routed to the fix pipeline. Anything
+        // ambiguous or non-question falls through to normal processing.
+        let outcome = if self.config.qa.enabled
+            && qa_eligible_source(source.name())
+            && self.qa_classify_is_question(&issue)
+        {
+            self.answer_question_issue(&issue, &resolution, source.name())
+                .await
+        } else {
+            // Build IssueProcessor and delegate to shared pipeline
+            let processor = IssueProcessor {
+                config: self.config.clone(),
+                tracker: Arc::clone(&self.tracker),
+                notifier: Arc::clone(&self.notifier),
+                agent: Arc::clone(&self.agent),
+                inferrer: self.inferrer.clone(),
+                embedding_client: self.embedding_client.clone(),
+                issue_embedding_service: self.issue_embedding_service.clone(),
+                code_search_service: self.code_search_service.clone(),
+                feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
+                    FeedbackAnalyzer::new().with_tracker(self.tracker.clone()),
+                )),
+                review_watcher: self.review_watcher.clone(),
+                user_registry: self.user_registry.clone(),
+                github_client: self.github_client.clone(),
+                llm_analyzer: self.llm_analyzer.clone(),
+            };
 
-        let input = ProcessingInput {
-            issue,
-            source_name: source.name().to_string(),
-            match_result,
-            resolution,
-            attempt_id,
-            review_feedback,
-            existing_pr_branch,
-        };
+            let input = ProcessingInput {
+                issue,
+                source_name: source.name().to_string(),
+                match_result,
+                resolution,
+                attempt_id,
+                review_feedback,
+                existing_pr_branch,
+            };
 
-        let context_provider = crate::processing::SourceContext(source.as_ref());
-        let outcome = processor.run(input, &context_provider).await;
+            let context_provider = crate::processing::SourceContext(source.as_ref());
+            processor.run(input, &context_provider).await
+        };
 
         // Watcher-specific: check for rate limit errors and pause if needed
         if let ProcessingOutcome::Failed { ref error } = outcome {
@@ -3457,6 +3474,104 @@ Create a PR with your changes.{custom_instructions}"#,
         // true for everything else
         !matches!(&outcome, ProcessingOutcome::Failed { error }
             if error.contains("Semantic duplicate of"))
+    }
+
+    /// Classify whether an incoming message is a pure question. Returns false
+    /// (i.e. treat as a fix request) when no classifier is available or the
+    /// result is ambiguous — preserving the default issue-resolution behaviour.
+    fn qa_classify_is_question(&self, issue: &Issue) -> bool {
+        match self.llm_analyzer.as_ref() {
+            Some(analyzer) => matches!(
+                analyzer.classify_intent(issue),
+                Some(crate::llm_analyzer::Intent::Question)
+            ),
+            None => false,
+        }
+    }
+
+    /// Answer a pure question with RAG-grounded context, read-only (no PR).
+    async fn answer_question_issue(
+        &self,
+        issue: &Issue,
+        resolution: &RepoResolution,
+        source_name: &str,
+    ) -> crate::processing::ProcessingOutcome {
+        use crate::processing::ProcessingOutcome;
+
+        // Run in the resolved repo when available (lets the agent read real code),
+        // otherwise a scratch dir (answer is grounded purely in RAG context).
+        let project_dir = match resolution {
+            RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
+            RepoResolution::Skip { .. } => {
+                let dir = std::env::temp_dir().join("claudear-qa");
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            }
+        };
+
+        // Retrieve grounding context from the code index across ALL repos.
+        let context = if let Some(ref code_search) = self.code_search_service {
+            let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
+            match code_search
+                .search(&query, None, self.config.qa.max_context_chunks)
+                .await
+            {
+                Ok(results) if !results.is_empty() => {
+                    claudear_analysis::repo::code_index::format_code_search_context(&results)
+                }
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
+        self.record_issue_decision(
+            issue,
+            "question_detected",
+            format!("Answering {} as a question (read-only)", issue.short_id),
+            json!({ "context_chars": context.len() }),
+        );
+
+        let timeout = Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
+        let answer_result = tokio::time::timeout(
+            timeout,
+            self.agent.answer_question(issue, &context, &project_dir),
+        )
+        .await;
+
+        match answer_result {
+            Ok(Ok(answer)) => {
+                if let Err(e) = self.notifier.notify_answer(issue, &answer).await {
+                    tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to deliver answer");
+                }
+                let summary: String = answer.chars().take(500).collect();
+                if let Err(e) = self.tracker.mark_answered(source_name, &issue.id, &summary) {
+                    tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to mark answered");
+                }
+                self.record_issue_decision(
+                    issue,
+                    "question_answered",
+                    format!("Answered question {}", issue.short_id),
+                    json!({ "answer_chars": answer.len() }),
+                );
+                ProcessingOutcome::CompletedNoPr {
+                    reason: "answered question".to_string(),
+                }
+            }
+            Ok(Err(e)) => {
+                let error = e.to_string();
+                let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
+                ProcessingOutcome::Failed { error }
+            }
+            Err(_) => {
+                let error = format!(
+                    "Answer generation timed out after {}s",
+                    self.config.qa.answer_timeout_secs
+                );
+                let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
+                ProcessingOutcome::Failed { error }
+            }
+        }
     }
 
     async fn clear_rate_limit_pause(&self) {
@@ -4478,6 +4593,7 @@ mod tests {
             chat: claudear_config::config::ChatConfig::default(),
             tls: claudear_config::config::TlsConfig::default(),
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
+            qa: claudear_config::config::QaConfig::default(),
         }
     }
 
