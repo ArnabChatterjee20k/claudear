@@ -60,6 +60,12 @@ impl ContextProvider for WebhookContext<'_> {
     }
 }
 
+/// Whether a source is conversational and therefore eligible for question/answer
+/// handling. Tracker-style sources (Sentry, Linear, GitHub, etc.) are not.
+fn qa_eligible_source(source: &str) -> bool {
+    matches!(source, "discord" | "slack" | "telegram" | "whatsapp")
+}
+
 /// Holds shared services needed to process an issue.
 pub struct IssueProcessor {
     pub config: Config,
@@ -117,6 +123,20 @@ impl IssueProcessor {
         input: ProcessingInput,
         context_provider: &dyn ContextProvider,
     ) -> ProcessingOutcome {
+        // Q&A short-circuit: pure questions are answered with RAG-grounded context
+        // (read-only, no PR) instead of being routed to the fix pipeline. This runs
+        // before any repo fetch / worktree setup since the answer path reads the
+        // resolved repo directly (or a scratch dir on Skip). Anything ambiguous or
+        // non-question falls through to normal processing.
+        if self.config.qa.enabled
+            && qa_eligible_source(&input.source_name)
+            && self.qa_classify_is_question(&input.issue)
+        {
+            return self
+                .answer_question_issue(&input.issue, &input.resolution, &input.source_name)
+                .await;
+        }
+
         match self.run_inner(input, context_provider).await {
             Ok(ProcessingOutcome::WrongRepo {
                 original_repo,
@@ -1348,6 +1368,120 @@ impl IssueProcessor {
                 }
             }
         }
+    }
+
+    /// Classify whether an incoming message is a pure question. Returns false
+    /// (i.e. treat as a fix request) when no classifier is available or the
+    /// result is ambiguous — preserving the default issue-resolution behaviour.
+    fn qa_classify_is_question(&self, issue: &Issue) -> bool {
+        match self.llm_analyzer.as_ref() {
+            Some(analyzer) => matches!(
+                analyzer.classify_intent(issue),
+                Some(crate::llm_analyzer::Intent::Question)
+            ),
+            None => false,
+        }
+    }
+
+    /// Answer a pure question with RAG-grounded context, read-only (no PR).
+    async fn answer_question_issue(
+        &self,
+        issue: &Issue,
+        resolution: &RepoResolution,
+        source_name: &str,
+    ) -> ProcessingOutcome {
+        // Run in the resolved repo when available (lets the agent read real code),
+        // otherwise a scratch dir (answer is grounded purely in RAG context).
+        let project_dir = match resolution {
+            RepoResolution::Resolved { project_dir, .. } => project_dir.clone(),
+            RepoResolution::Skip { .. } => {
+                let dir = std::env::temp_dir().join("claudear-qa");
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            }
+        };
+
+        // Retrieve grounding context from the code index across ALL repos.
+        let context = if let Some(ref code_search) = self.code_search_service {
+            let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
+            match code_search
+                .search(&query, None, self.config.qa.max_context_chunks)
+                .await
+            {
+                Ok(results) if !results.is_empty() => {
+                    claudear_analysis::repo::code_index::format_code_search_context(&results)
+                }
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
+        self.record_issue_decision(
+            issue,
+            "question_detected",
+            format!("Answering {} as a question (read-only)", issue.short_id),
+            json!({ "context_chars": context.len() }),
+        );
+
+        let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
+        let answer_result = tokio::time::timeout(
+            timeout,
+            self.agent.answer_question(issue, &context, &project_dir),
+        )
+        .await;
+
+        match answer_result {
+            Ok(Ok(answer)) => {
+                if let Err(e) = self.notifier.notify_answer(issue, &answer).await {
+                    tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to deliver answer");
+                }
+                let summary: String = answer.chars().take(500).collect();
+                if let Err(e) = self.tracker.mark_answered(source_name, &issue.id, &summary) {
+                    tracing::warn!(short_id = %issue.short_id, error = %e, "Failed to mark answered");
+                }
+                self.record_issue_decision(
+                    issue,
+                    "question_answered",
+                    format!("Answered question {}", issue.short_id),
+                    json!({ "answer_chars": answer.len() }),
+                );
+                ProcessingOutcome::CompletedNoPr {
+                    reason: "answered question".to_string(),
+                }
+            }
+            Ok(Err(e)) => {
+                let error = e.to_string();
+                let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
+                ProcessingOutcome::Failed { error }
+            }
+            Err(_) => {
+                let error = format!(
+                    "Answer generation timed out after {}s",
+                    self.config.qa.answer_timeout_secs
+                );
+                let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
+                ProcessingOutcome::Failed { error }
+            }
+        }
+    }
+
+    /// Record an issue-level decision as a "decision" activity entry.
+    fn record_issue_decision(
+        &self,
+        issue: &Issue,
+        decision: &str,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) {
+        let activity = ActivityLogEntry::new("decision", message.into())
+            .with_source(issue.source.clone())
+            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .with_metadata(json!({
+                "decision": decision,
+                "details": details,
+            }));
+        self.tracker.record_activity(&activity).ok();
     }
 
     /// Resolve an alternative repository after a wrong_repo detection.
