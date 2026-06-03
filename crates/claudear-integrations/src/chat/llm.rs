@@ -170,14 +170,14 @@ impl LlmEngine {
 
         // Generate tokens
         let mut output_tokens = Vec::new();
-        let mut n_cur = tokens.len() as i32;
+        let prompt_len = tokens.len() as i32;
         let max_gen = params
             .max_tokens
             .min(self.context_length - tokens.len() as u32);
         let mut accumulated = String::new();
         let start = Instant::now();
 
-        for _ in 0..max_gen {
+        for i in 0..max_gen {
             // Check inference timeout
             if let Some(timeout) = self.timeout {
                 if start.elapsed() > timeout {
@@ -226,9 +226,8 @@ impl LlmEngine {
             // Prepare next batch
             batch.clear();
             batch
-                .add(new_token, n_cur, &[0], true)
+                .add(new_token, prompt_len + i as i32, &[0], true)
                 .map_err(|_| Error::Other("Failed to add token to batch".into()))?;
-            n_cur += 1;
 
             ctx.decode(&mut batch)
                 .map_err(|e| Error::Other(format!("Decode step failed: {e}")))?;
@@ -303,14 +302,14 @@ impl LlmEngine {
 
         let mut decoder = encoding_rs::UTF_8.new_decoder();
 
-        let mut n_cur = tokens.len() as i32;
+        let prompt_len = tokens.len() as i32;
         let max_gen = params
             .max_tokens
             .min(self.context_length - tokens.len() as u32);
         let mut accumulated = String::new();
         let start = Instant::now();
 
-        for _ in 0..max_gen {
+        for i in 0..max_gen {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -359,9 +358,8 @@ impl LlmEngine {
 
             batch.clear();
             batch
-                .add(new_token, n_cur, &[0], true)
+                .add(new_token, prompt_len + i as i32, &[0], true)
                 .map_err(|_| Error::Other("Failed to add token to batch".into()))?;
-            n_cur += 1;
 
             ctx.decode(&mut batch)
                 .map_err(|e| Error::Other(format!("Decode step failed: {e}")))?;

@@ -23,6 +23,11 @@ const DEFAULT_LOG_DIR: &str = "./logs";
 const CLAUDE_LOG_SUBDIR: &str = "claude";
 const EXECUTION_LOG_PREVIEW_LIMIT: usize = 2000;
 
+/// Read-only tools granted for RAG-grounded Q&A runs. The agent may inspect the
+/// repository (read files, search) but cannot modify it, run arbitrary commands,
+/// or create branches/PRs.
+const READ_ONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+
 /// Resolve the root directory for execution logs.
 /// Used by both the runner and the API to validate log file paths.
 pub fn resolve_log_root() -> PathBuf {
@@ -579,8 +584,35 @@ The PR title should include the issue ID: {}
         env: HashMap<String, String>,
         project_dir: &Path,
     ) -> Result<AgentResult> {
-        self.execute_with_env_and_attempt(prompt, label, env, None, project_dir)
+        self.execute_with_env_and_attempt(prompt, label, env, None, project_dir, true)
             .await
+    }
+
+    /// Run the agent in a read-only mode that returns a plain-text answer
+    /// (no structured fix schema, no PR/branch). Used for RAG-grounded Q&A.
+    ///
+    /// Restricts the granted tools to a read-only set and never skips permission
+    /// prompts, so the agent cannot mutate the repository regardless of config.
+    pub async fn run_answer(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<String> {
+        let prompt = build_answer_prompt(issue, context);
+        let (env, _) = self.prepare_env_and_label(Some(issue));
+        let result = self
+            .execute_with_env_and_attempt(&prompt, &issue.short_id, env, None, project_dir, false)
+            .await?;
+        if result.success || !result.output.trim().is_empty() {
+            Ok(result.output)
+        } else {
+            Err(Error::runner(
+                result
+                    .error
+                    .unwrap_or_else(|| "Failed to generate answer".to_string()),
+            ))
+        }
     }
 
     async fn execute_with_env_and_attempt(
@@ -590,6 +622,7 @@ The PR title should include the issue ID: {}
         env: HashMap<String, String>,
         attempt_id: Option<i64>,
         project_dir: &Path,
+        structured: bool,
     ) -> Result<AgentResult> {
         // Create execution record for analytics
         let mut execution = AgentExecution::new();
@@ -630,10 +663,16 @@ The PR title should include the issue ID: {}
             "--verbose".to_string(),
             "--output-format".to_string(),
             "stream-json".to_string(),
-            "--json-schema".to_string(),
-            RESULT_SCHEMA.to_string(),
         ];
-        if self.config.skip_permissions {
+        // Structured (fix) runs enforce the result JSON schema. Read-only Q&A
+        // runs return plain assistant text instead.
+        if structured {
+            args.push("--json-schema".to_string());
+            args.push(RESULT_SCHEMA.to_string());
+        }
+        // Read-only Q&A runs must never skip permission prompts, and are
+        // restricted to a read-only tool set so the repo cannot be mutated.
+        if structured && self.config.skip_permissions {
             args.push("--dangerously-skip-permissions".to_string());
         }
         if let Some(ref model) = self.config.model {
@@ -644,9 +683,16 @@ The PR title should include the issue ID: {}
             args.push("--append-system-prompt".to_string());
             args.push(instructions.clone());
         }
-        for perm in &self.config.permissions {
-            args.push("--allowedTools".to_string());
-            args.push(perm.clone());
+        if structured {
+            for perm in &self.config.permissions {
+                args.push("--allowedTools".to_string());
+                args.push(perm.clone());
+            }
+        } else {
+            for perm in READ_ONLY_TOOLS {
+                args.push("--allowedTools".to_string());
+                args.push((*perm).to_string());
+            }
         }
         args.push("--print".to_string());
         args.push(prompt.to_string());
@@ -1778,9 +1824,56 @@ impl AgentRunner for ClaudeAgentRunner {
         project_dir: &Path,
     ) -> Result<AgentResult> {
         let (env, label) = self.prepare_env_and_label(issue);
-        self.execute_with_env_and_attempt(prompt, label, env, attempt_id, project_dir)
+        self.execute_with_env_and_attempt(prompt, label, env, attempt_id, project_dir, true)
             .await
     }
+
+    async fn answer_question(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<String> {
+        self.run_answer(issue, context, project_dir).await
+    }
+}
+
+/// Build the prompt for a read-only, RAG-grounded answer to a question.
+///
+/// `context` is the formatted code-search context retrieved from the RAG index.
+fn build_answer_prompt(issue: &Issue, context: &str) -> String {
+    let question = issue
+        .description
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or(&issue.title);
+
+    format!(
+        r#"You are a senior engineer answering a technical question from {source}.
+
+Answer the question below using the provided code context AND by reading the
+relevant code in this repository. Ground every claim in the actual code: cite
+the file paths (and line numbers where helpful) you relied on.
+
+STRICT RULES:
+- This is read-only. Do NOT modify any files, do NOT run write commands, and do
+  NOT create branches, commits, or pull requests.
+- If the answer is not determinable from the available code, say so plainly
+  rather than guessing.
+- Be precise and technical. Prefer concrete references over generalities.
+
+Retrieved code context:
+{context}
+
+Question:
+{question}
+
+Write the answer as clear Markdown. End with a short "Sources" list of the files
+you referenced."#,
+        source = issue.source,
+        context = context,
+        question = question,
+    )
 }
 
 #[cfg(test)]

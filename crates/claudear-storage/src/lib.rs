@@ -126,6 +126,15 @@ pub trait AttemptTracker: Send + Sync {
     /// Mark an issue as cannot be fixed (max retries reached).
     fn mark_cannot_fix(&self, source: &str, issue_id: &str, reason: &str) -> Result<()>;
 
+    /// Mark an issue as answered (it was a question, not a fix request).
+    ///
+    /// Default no-op; persistent trackers should set the attempt status to
+    /// `answered` so it is not retried or re-polled.
+    fn mark_answered(&self, source: &str, issue_id: &str, summary: &str) -> Result<()> {
+        let _ = (source, issue_id, summary);
+        Ok(())
+    }
+
     /// Get issues that are eligible for retry (failed/closed with retry_count < max_retries).
     fn get_retryable_issues(&self, max_retries: u32) -> Result<Vec<FixAttempt>>;
 

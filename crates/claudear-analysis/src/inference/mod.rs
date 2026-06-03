@@ -605,7 +605,7 @@ impl RepoInferrer {
 
         let new_embeddings: Vec<RepoEmbedding> = new_repos
             .iter()
-            .zip(vectors.into_iter())
+            .zip(vectors)
             .map(|(repo, vector)| RepoEmbedding {
                 name: repo.name.clone(),
                 embedding: vector,
@@ -1661,7 +1661,7 @@ pub async fn build_repo_embeddings(
 
     let vectors = embedding_client.embed_batch(&text_refs).await?;
 
-    for (repo, vector) in repos.iter().zip(vectors.into_iter()) {
+    for (repo, vector) in repos.iter().zip(vectors) {
         embeddings.push(RepoEmbedding {
             name: repo.name.clone(),
             embedding: vector,

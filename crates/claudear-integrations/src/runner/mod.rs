@@ -54,6 +54,22 @@ pub trait AgentRunner: Send + Sync {
         attempt_id: Option<i64>,
         project_dir: &Path,
     ) -> Result<AgentResult>;
+
+    /// Answer a question in read-only mode, grounded in `context` (RAG code
+    /// search) and the repository at `project_dir`. Returns the answer text.
+    ///
+    /// Default: not supported. Providers that can run read-only (e.g. Claude)
+    /// override this.
+    async fn answer_question(
+        &self,
+        _issue: &Issue,
+        _context: &str,
+        _project_dir: &Path,
+    ) -> Result<String> {
+        Err(claudear_core::error::Error::runner(
+            "answer_question is not supported by this provider",
+        ))
+    }
 }
 
 /// Best-effort detection for rate limit failures (generic, not provider-specific).

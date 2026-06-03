@@ -3405,7 +3405,9 @@ Create a PR with your changes.{custom_instructions}"#,
         // Save issue info before move for post-processing
         let issue_short_id = issue.short_id.clone();
 
-        // Build IssueProcessor and delegate to shared pipeline
+        // Build IssueProcessor and delegate to shared pipeline. The processor
+        // internally routes pure questions to a read-only Q&A answer path and
+        // everything else to the fix pipeline.
         let processor = IssueProcessor {
             config: self.config.clone(),
             tracker: Arc::clone(&self.tracker),
@@ -4478,6 +4480,7 @@ mod tests {
             chat: claudear_config::config::ChatConfig::default(),
             tls: claudear_config::config::TlsConfig::default(),
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
+            qa: claudear_config::config::QaConfig::default(),
         }
     }
 

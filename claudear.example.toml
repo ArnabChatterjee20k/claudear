@@ -831,6 +831,26 @@ pool_size = 0
 sub_batch_size = 0
 
 # ============================================
+# Question / Answer
+# ============================================
+# When enabled, incoming messages from chat sources (e.g. Discord) are first
+# classified as a question vs a fix/feature request (via the local LLM). Pure
+# questions are answered with RAG-grounded code context by the agent in a
+# read-only mode — no branch or PR. Anything ambiguous falls back to the normal
+# issue-resolution path. Requires the local LLM ([llm]) for classification and
+# the code index ([code_index]) for grounding.
+
+[qa]
+# Enable question/answer handling (default: false)
+enabled = false
+
+# Number of code chunks retrieved to ground the answer (default: 8)
+max_context_chunks = 8
+
+# Timeout for generating an answer, in seconds (default: 600)
+answer_timeout_secs = 600
+
+# ============================================
 # Code Indexing
 # ============================================
 # Tree-sitter based code indexing for semantic search across repositories.

@@ -480,4 +480,15 @@ impl AgentRunner for InstrumentedRunner {
             }
         }
     }
+
+    async fn answer_question(
+        &self,
+        issue: &Issue,
+        context: &str,
+        project_dir: &Path,
+    ) -> Result<String> {
+        self.inner
+            .answer_question(issue, context, project_dir)
+            .await
+    }
 }
