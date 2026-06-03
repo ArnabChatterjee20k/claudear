@@ -487,6 +487,8 @@ impl AgentRunner for InstrumentedRunner {
         context: &str,
         project_dir: &Path,
     ) -> Result<String> {
-        self.inner.answer_question(issue, context, project_dir).await
+        self.inner
+            .answer_question(issue, context, project_dir)
+            .await
     }
 }
