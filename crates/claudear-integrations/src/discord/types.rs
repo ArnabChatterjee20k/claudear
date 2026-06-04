@@ -94,6 +94,10 @@ pub struct DiscordMessage {
     /// Message embeds.
     #[serde(default)]
     pub embeds: Vec<DiscordEmbed>,
+    /// Users explicitly mentioned in the message (Discord's parsed `mentions`
+    /// array). Used to detect when the bot itself is tagged.
+    #[serde(default)]
+    pub mentions: Vec<DiscordUser>,
 }
 
 /// A Discord embed object (subset of fields used for identification).
@@ -616,6 +620,7 @@ mod tests {
             thread: None,
             webhook_id: None,
             embeds: vec![],
+            mentions: vec![],
         };
         let json = serde_json::to_string(&message).unwrap();
         assert!(json.contains("Hello world"));
@@ -1065,6 +1070,7 @@ mod tests {
             thread: None,
             webhook_id: None,
             embeds: vec![],
+            mentions: vec![],
         };
         let json = serde_json::to_string(&message).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1095,6 +1101,7 @@ mod tests {
             thread: None,
             webhook_id: Some("wh-123".to_string()),
             embeds: vec![],
+            mentions: vec![],
         };
         let json = serde_json::to_string(&message).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1213,6 +1220,7 @@ mod tests {
             thread: None,
             webhook_id: Some("wh-rt".to_string()),
             embeds: vec![],
+            mentions: vec![],
         };
         let json = serde_json::to_string(&message).unwrap();
         let deserialized: DiscordMessage = serde_json::from_str(&json).unwrap();

@@ -252,6 +252,10 @@ pub struct DiscordSourceConfig {
     pub guild_id: Option<String>,
     /// Polling interval in milliseconds (overrides global).
     pub poll_interval_ms: Option<u64>,
+    /// Bot user ID. When set, only messages that @-mention this bot are
+    /// ingested (engage only when tagged). When unset, every message in the
+    /// listen channel is ingested (legacy behaviour).
+    pub bot_id: Option<String>,
 }
 
 /// Discord notifier-only configuration (for outbound notifications).
@@ -1103,6 +1107,10 @@ pub struct DiscordConfig {
     pub guild_id: Option<String>,
     /// Polling interval in milliseconds for Discord source (overrides global).
     pub poll_interval_ms: Option<u64>,
+    /// Bot user ID. When set, the Discord source only ingests messages that
+    /// @-mention this bot (so it engages only when tagged). When unset, every
+    /// message in the listen channel is ingested (the legacy behaviour).
+    pub bot_id: Option<String>,
 }
 
 /// Email (SMTP) notification configuration.
@@ -2992,6 +3000,8 @@ impl Config {
                 .clone()
                 .or_else(|| src.and_then(|s| s.guild_id.clone())),
             poll_interval_ms: src.and_then(|s| s.poll_interval_ms),
+            // bot_id gates the source (configured under issues.discord).
+            bot_id: src.and_then(|s| s.bot_id.clone()),
         }
     }
 
