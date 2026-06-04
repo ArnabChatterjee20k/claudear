@@ -462,6 +462,13 @@ listen_channel_id = ""
 # Guild (server) ID for constructing message URLs
 guild_id = ""
 
+# Bot user ID. When set, the source only ingests messages that @-mention this
+# bot, so Claudear engages (answers questions / opens fixes) only when tagged.
+# When unset, every message in the listen channel is ingested (reply to all).
+# Detection uses Discord's parsed `mentions` array, falling back to scanning
+# message content for <@ID> / <@!ID>.
+bot_id = ""
+
 # Polling interval in milliseconds (overrides global)
 poll_interval_ms = 300000
 
