@@ -75,6 +75,32 @@ impl DiscordSource {
         false
     }
 
+    /// Whether `msg` @-mentions the given bot user id.
+    ///
+    /// Prefers Discord's parsed `mentions` array (authoritative — set by Discord
+    /// only for genuine mentions), and falls back to scanning the raw content for
+    /// the mention token `<@ID>` / `<@!ID>` in case `mentions` wasn't populated.
+    fn mentions_bot(msg: &DiscordMessage, bot_id: &str) -> bool {
+        if bot_id.is_empty() {
+            return false;
+        }
+        if msg.mentions.iter().any(|u| u.id == bot_id) {
+            return true;
+        }
+        msg.content.contains(&format!("<@{}>", bot_id))
+            || msg.content.contains(&format!("<@!{}>", bot_id))
+    }
+
+    /// Whether a message is eligible for ingestion given the configured
+    /// `bot_id` gate: if a `bot_id` is set, the message must @-mention the bot;
+    /// otherwise every message qualifies (legacy "reply to all" behaviour).
+    fn passes_mention_gate(&self, msg: &DiscordMessage) -> bool {
+        match self.config.bot_id.as_deref() {
+            Some(bot_id) if !bot_id.is_empty() => Self::mentions_bot(msg, bot_id),
+            _ => true,
+        }
+    }
+
     /// Strip Discord user mentions (<@123>, <@!123>) from text.
     fn strip_mentions(content: &str) -> String {
         let mut result = content.to_string();
@@ -188,12 +214,15 @@ impl IssueSource for DiscordSource {
                     *lock = Some(latest.id.clone());
                 }
 
-                // Filter out bot messages, our own notifications, and empty content
+                // Filter out bot messages, our own notifications, and empty
+                // content. When a bot_id is configured, also require the message
+                // to @-mention the bot (engage only when tagged).
                 let issues: Vec<Issue> = messages
                     .iter()
                     .filter(|msg| !Self::is_bot_message(msg))
                     .filter(|msg| !Self::is_own_notification(msg))
                     .filter(|msg| !msg.content.trim().is_empty())
+                    .filter(|msg| self.passes_mention_gate(msg))
                     .map(|msg| self.message_to_issue(msg))
                     .collect();
 
@@ -336,6 +365,7 @@ mod tests {
             thread: None,
             webhook_id: None,
             embeds: vec![],
+            mentions: vec![],
         }
     }
 
@@ -374,6 +404,7 @@ mod tests {
             thread: None,
             webhook_id: None,
             embeds: vec![],
+            mentions: vec![],
         };
         // Webhook messages have author.bot=true but should NOT be filtered
         let mut webhook_msg = make_message("4", "hello", true);
@@ -459,6 +490,63 @@ mod tests {
         let issue = Issue::new("1", "D-1", "Test", "http://test.com", "discord");
         let result = source.matches_criteria(&issue);
         assert!(result.matches);
+    }
+
+    // --- Bot-mention gate ---
+
+    #[test]
+    fn test_mentions_bot_via_structured_mentions() {
+        // The authoritative path: Discord's parsed `mentions` array contains
+        // the bot, even if the raw content has no `<@id>` token.
+        let mut msg = make_message("1", "how do I paginate?", false);
+        msg.mentions = vec![DiscordUser {
+            id: "999".to_string(),
+            username: "claudear".to_string(),
+            discriminator: "0".to_string(),
+            avatar: None,
+            bot: true,
+        }];
+        assert!(DiscordSource::mentions_bot(&msg, "999"));
+        // A different user mentioned is not the bot.
+        assert!(!DiscordSource::mentions_bot(&msg, "111"));
+    }
+
+    #[test]
+    fn test_mentions_bot_content_fallback() {
+        // Fallback when `mentions` wasn't populated: scan raw content for the
+        // mention token in both forms.
+        let plain = make_message("1", "hey <@999> how do I paginate?", false);
+        let nick = make_message("2", "<@!999> help", false);
+        let other = make_message("3", "hey <@111> look", false);
+        let none = make_message("4", "how do I paginate?", false);
+
+        assert!(DiscordSource::mentions_bot(&plain, "999"));
+        assert!(DiscordSource::mentions_bot(&nick, "999"));
+        assert!(!DiscordSource::mentions_bot(&other, "999"));
+        assert!(!DiscordSource::mentions_bot(&none, "999"));
+        // Empty bot id never matches.
+        assert!(!DiscordSource::mentions_bot(&plain, ""));
+    }
+
+    #[test]
+    fn test_passes_mention_gate_requires_tag_when_bot_id_set() {
+        let mut config = make_config();
+        config.bot_id = Some("999".to_string());
+        let source = DiscordSource::new(config);
+
+        let tagged = make_message("1", "<@999> what is query not equal syntax?", false);
+        let untagged = make_message("2", "what is query not equal syntax?", false);
+
+        assert!(source.passes_mention_gate(&tagged));
+        assert!(!source.passes_mention_gate(&untagged));
+    }
+
+    #[test]
+    fn test_passes_mention_gate_allows_all_when_bot_id_unset() {
+        // Default config has no bot_id → legacy "reply to all" behaviour.
+        let source = DiscordSource::new(make_config());
+        let untagged = make_message("1", "no mention here", false);
+        assert!(source.passes_mention_gate(&untagged));
     }
 
     #[tokio::test]
