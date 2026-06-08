@@ -15,8 +15,9 @@ use claudear_config::config::Config;
 use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
-    ActivityLogEntry, AskRequest, BlockingQuestion, FixAttemptStats, FixAttemptStatus, Issue,
-    IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric, RegressionWatch,
+    ActivityLogEntry, AskRequest, BlockingQuestion, FixAttempt, FixAttemptStats, FixAttemptStatus,
+    Issue, IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric,
+    RegressionWatch, ReplyKind,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
@@ -2487,6 +2488,81 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Check for merged PRs and trigger cascade processing.
+    /// After a fix merges, post a human-sounding "fix shipped" reply back to the
+    /// originating ticket. Opt-in via `[reply]`; only tracker-style sources receive
+    /// a ticket comment (conversational sources are notified via their channel).
+    async fn maybe_send_fix_shipped_reply(&self, attempt: &FixAttempt) {
+        if !self.config.reply().enabled {
+            return;
+        }
+        if matches!(
+            attempt.source.as_str(),
+            "discord" | "slack" | "telegram" | "whatsapp"
+        ) {
+            return;
+        }
+        let Some(source) = self.sources.iter().find(|s| s.name() == attempt.source) else {
+            return;
+        };
+
+        // Fetch the real issue for grounding; fall back to a synthetic one.
+        let issue = match source.get_issue(&attempt.issue_id).await {
+            Ok(i) => i,
+            Err(_) => Issue::new(
+                &attempt.issue_id,
+                &attempt.short_id,
+                "Issue resolved",
+                attempt.pr_url.as_deref().unwrap_or(""),
+                &attempt.source,
+            ),
+        };
+
+        let inbox_key = issue
+            .get_metadata::<String>("mailbox_id")
+            .unwrap_or_else(|| attempt.source.clone());
+        let guideline = self.config.reply().template_for(Some(&inbox_key));
+        let context = match attempt.pr_url.as_deref() {
+            Some(pr) => format!("The fix shipped in PR: {pr}"),
+            None => String::new(),
+        };
+
+        let scratch = std::env::temp_dir().join("claudear-qa");
+        let _ = std::fs::create_dir_all(&scratch);
+
+        let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
+        let reply = match tokio::time::timeout(
+            timeout,
+            self.agent
+                .generate_reply(&issue, &context, guideline, ReplyKind::FixShipped, &scratch),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::warn!(short_id = %attempt.short_id, error = %e, "Failed to generate fix-shipped reply");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(short_id = %attempt.short_id, "Fix-shipped reply generation timed out");
+                return;
+            }
+        };
+
+        if let Err(e) = source.add_comment(&attempt.issue_id, &reply).await {
+            tracing::warn!(short_id = %attempt.short_id, error = %e, "Failed to post fix-shipped reply");
+            return;
+        }
+        let summary: String = reply.chars().take(500).collect();
+        let _ = self.tracker.record_action_run(
+            &attempt.source,
+            &attempt.issue_id,
+            &attempt.short_id,
+            "reply",
+            "fix_shipped",
+            &summary,
+        );
+    }
+
     async fn check_pr_merges_and_cascade(&self) -> Result<()> {
         let github_client = self.github_client.as_ref();
         let scm_provider = self.scm_provider.as_ref();
@@ -2624,6 +2700,10 @@ Create a PR with your changes.{custom_instructions}"#,
                             }
                         }
                     }
+
+                    // Action pipeline: once the fix is live, post a human-sounding
+                    // "fix shipped" reply back to the originating ticket.
+                    self.maybe_send_fix_shipped_reply(attempt).await;
 
                     // Record feedback outcome
                     self.record_feedback_outcome_from_attempt(attempt, Outcome::Merged)
@@ -2933,16 +3013,14 @@ Create a PR with your changes.{custom_instructions}"#,
             let intents: Vec<Intent> = tokio::task::spawn_blocking(move || {
                 issues_for_intent
                     .iter()
-                    .map(|issue| match analyzer.classify_intent(issue) {
-                        Some(Intent::Question) => Intent::Question,
-                        _ => Intent::FixRequest,
-                    })
+                    .map(|issue| analyzer.classify_intent(issue).unwrap_or(Intent::Fix))
                     .collect()
             })
             .await
-            .unwrap_or_else(|_| vec![Intent::FixRequest; ordered_len]);
+            .unwrap_or_else(|_| vec![Intent::Fix; ordered_len]);
 
-            // Partition preserving prioritisation order within each bucket.
+            // Partition preserving prioritisation order within each bucket. Only
+            // pure questions take the QA bucket; bug/security/fix are processed.
             let mut questions: Vec<(Issue, MatchResult, Option<Intent>)> = Vec::new();
             let mut fixes: Vec<(Issue, MatchResult, Option<Intent>)> = Vec::new();
             for ((issue, match_result), intent) in ordered.into_iter().zip(intents) {
@@ -2950,9 +3028,7 @@ Create a PR with your changes.{custom_instructions}"#,
                     Intent::Question => {
                         questions.push((issue, match_result, Some(Intent::Question)))
                     }
-                    Intent::FixRequest => {
-                        fixes.push((issue, match_result, Some(Intent::FixRequest)))
-                    }
+                    other => fixes.push((issue, match_result, Some(other))),
                 }
             }
             questions.truncate(source_max_qa);
@@ -3373,7 +3449,9 @@ Create a PR with your changes.{custom_instructions}"#,
 
         let intent_label = match intent {
             Some(Intent::Question) => "question",
-            Some(Intent::FixRequest) => "fix",
+            Some(Intent::Bug) => "bug",
+            Some(Intent::Security) => "security",
+            Some(Intent::Fix) => "fix",
             None => "unclassified",
         };
         tracing::info!("");
@@ -4155,6 +4233,68 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         Ok(())
+    }
+
+    /// Run a single, explicitly-chosen action (reply/verify/resolve) against an
+    /// issue, bypassing classification. Backs the `claudear action ...` CLI.
+    pub async fn run_action(
+        &self,
+        action: claudear_core::types::ActionKind,
+        source_name: &str,
+        issue_id: &str,
+    ) -> Result<crate::processing::ProcessingOutcome> {
+        use crate::processing::{IssueProcessor, ProcessingInput};
+
+        let source = self
+            .sources
+            .iter()
+            .find(|s| s.name() == source_name)
+            .ok_or_else(|| claudear_core::error::Error::source(source_name, "Unknown source"))?;
+
+        let issue = source.get_issue(issue_id).await?;
+        let match_result = MatchResult::matched("Manual action", MatchPriority::Urgent);
+        let resolution =
+            resolve_repo_for_issue(self.inferrer.as_ref(), &issue, Some(&self.tracker));
+        let attempt_id = self
+            .tracker
+            .get_attempt(source.name(), &issue.id)
+            .ok()
+            .flatten()
+            .map(|a| a.id);
+
+        let processor = IssueProcessor {
+            config: self.config.clone(),
+            tracker: Arc::clone(&self.tracker),
+            notifier: Arc::clone(&self.notifier),
+            agent: Arc::clone(&self.agent),
+            inferrer: self.inferrer.clone(),
+            embedding_client: self.embedding_client.clone(),
+            issue_embedding_service: self.issue_embedding_service.clone(),
+            code_search_service: self.code_search_service.clone(),
+            feedback_analyzer: Arc::new(tokio::sync::Mutex::new(
+                FeedbackAnalyzer::new().with_tracker(self.tracker.clone()),
+            )),
+            review_watcher: self.review_watcher.clone(),
+            user_registry: self.user_registry.clone(),
+            github_client: self.github_client.clone(),
+            llm_analyzer: self.llm_analyzer.clone(),
+        };
+
+        let input = ProcessingInput {
+            issue,
+            source_name: source.name().to_string(),
+            match_result,
+            resolution,
+            attempt_id,
+            review_feedback: None,
+            existing_pr_branch: None,
+            intent: None,
+        };
+
+        let context_provider = crate::processing::SourceContext(source.as_ref());
+        Ok(processor
+            .run_single_action(action, input, &context_provider)
+            .await)
     }
 
     /// Reset a failed attempt to allow retry.
