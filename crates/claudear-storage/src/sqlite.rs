@@ -1600,6 +1600,36 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::get_repo_leaderboard(self)
     }
 
+    fn get_commit_trend(
+        &self,
+        days: usize,
+    ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
+        SqliteTracker::get_commit_trend(self, days)
+    }
+
+    fn list_support_replies(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::SupportReply>> {
+        SqliteTracker::list_support_replies(self, limit)
+    }
+
+    fn record_reply_rating(
+        &self,
+        action_run_id: i64,
+        rating: i32,
+        note: Option<&str>,
+        rated_by: &str,
+    ) -> Result<()> {
+        SqliteTracker::record_reply_rating(self, action_run_id, rating, note, rated_by)
+    }
+
+    fn get_support_rating_summary(
+        &self,
+    ) -> Result<claudear_core::types::SupportRatingSummary> {
+        SqliteTracker::get_support_rating_summary(self)
+    }
+
     fn get_complexity_time_savings(
         &self,
         since_iso: &str,
@@ -5501,6 +5531,8 @@ impl SqliteTracker {
             cost_estimate: None,
             mttr_trend: Vec::new(),
             repo_leaderboard: Vec::new(),
+            commit_trend: Vec::new(),
+            support_rating: None,
         })
     }
 
@@ -6481,6 +6513,188 @@ impl SqliteTracker {
             })
         })?;
         Ok(rows.flatten().collect())
+    }
+
+    /// Daily commit-production trend over the last `days` days.
+    ///
+    /// Counts `claude_executions` that actually produced a commit (the commit
+    /// hash advanced), bucketed by the day the execution started. This is an
+    /// approximation of "≥1 commit per execution" — multi-commit runs only
+    /// expose before/after endpoints, so they count once.
+    pub fn get_commit_trend(
+        &self,
+        days: usize,
+    ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
+        let conn = self.acquire_lock()?;
+        let modifier = format!("-{} days", days);
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                date(started_at) as day,
+                COUNT(*) as commits
+            FROM claude_executions
+            WHERE started_at IS NOT NULL
+              AND started_at >= datetime('now', ?1)
+              AND git_commit_after IS NOT NULL
+              AND (git_commit_before IS NULL OR git_commit_after != git_commit_before)
+            GROUP BY day
+            ORDER BY day ASC
+            "#,
+        )?;
+        let rows = stmt.query_map(params![modifier], |row| {
+            Ok(claudear_core::types::CommitTrendPoint {
+                period_start: row.get(0)?,
+                commits: row.get(1)?,
+            })
+        })?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Map a joined `action_runs` + rating row to a `SupportReply`.
+    ///
+    /// Column order: id, source, short_id, status(kind), detail, created_at,
+    /// response_mins, rating, note, rated_by.
+    fn row_to_support_reply(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<claudear_core::types::SupportReply> {
+        Ok(claudear_core::types::SupportReply {
+            action_run_id: row.get(0)?,
+            source: row.get(1)?,
+            short_id: row.get(2)?,
+            kind: row.get(3)?,
+            detail: row.get(4)?,
+            created_at: Self::parse_datetime(&row.get::<_, String>(5)?)?,
+            response_time_mins: row.get(6)?,
+            rating: row.get(7)?,
+            note: row.get(8)?,
+            rated_by: row.get(9)?,
+        })
+    }
+
+    /// List recent support replies (QA channels + HelpScout) with any rating.
+    ///
+    /// Response time is derived by joining back to the originating `fix_attempts`
+    /// row (received → reply sent); it is `NULL` when the attempt predates the
+    /// reply record or cannot be matched.
+    pub fn list_support_replies(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::SupportReply>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                ar.id,
+                ar.source,
+                ar.short_id,
+                ar.status,
+                ar.detail,
+                ar.created_at,
+                (julianday(ar.created_at) - julianday(fa.attempted_at)) * 24.0 * 60.0 AS response_mins,
+                r.rating,
+                r.note,
+                r.rated_by
+            FROM action_runs ar
+            LEFT JOIN support_reply_ratings r ON r.action_run_id = ar.id
+            LEFT JOIN fix_attempts fa ON fa.source = ar.source AND fa.issue_id = ar.issue_id
+            WHERE ar.action_kind = 'reply'
+              AND ar.source IN ('discord','slack','telegram','whatsapp','helpscout')
+            ORDER BY ar.created_at DESC
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt.query_map(params![limit as i64], Self::row_to_support_reply)?;
+        Ok(rows.flatten().collect())
+    }
+
+    /// Record (or update) an admin's 1..5 rating for a support reply.
+    pub fn record_reply_rating(
+        &self,
+        action_run_id: i64,
+        rating: i32,
+        note: Option<&str>,
+        rated_by: &str,
+    ) -> Result<()> {
+        if !(1..=5).contains(&rating) {
+            return Err(claudear_core::error::Error::Other(format!(
+                "rating must be between 1 and 5, got {rating}"
+            )));
+        }
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO support_reply_ratings (action_run_id, rating, note, rated_by)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(action_run_id) DO UPDATE SET
+                rating = excluded.rating,
+                note = excluded.note,
+                rated_by = excluded.rated_by,
+                updated_at = datetime('now')
+            "#,
+            params![action_run_id, rating, note, rated_by],
+        )?;
+        Ok(())
+    }
+
+    /// Aggregate support-reply rating + response-time summary (QA + HelpScout).
+    pub fn get_support_rating_summary(
+        &self,
+    ) -> Result<claudear_core::types::SupportRatingSummary> {
+        let conn = self.acquire_lock()?;
+
+        // Headline aggregates over all rateable replies.
+        let (total_replies, rated_count, avg_rating, avg_response_time_mins) = conn.query_row(
+            r#"
+            SELECT
+                COUNT(*) AS total_replies,
+                COUNT(r.rating) AS rated_count,
+                AVG(r.rating) AS avg_rating,
+                AVG((julianday(ar.created_at) - julianday(fa.attempted_at)) * 24.0 * 60.0) AS avg_response_mins
+            FROM action_runs ar
+            LEFT JOIN support_reply_ratings r ON r.action_run_id = ar.id
+            LEFT JOIN fix_attempts fa ON fa.source = ar.source AND fa.issue_id = ar.issue_id
+            WHERE ar.action_kind = 'reply'
+              AND ar.source IN ('discord','slack','telegram','whatsapp','helpscout')
+            "#,
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                ))
+            },
+        )?;
+
+        // Average rating per source.
+        let mut by_source = std::collections::HashMap::new();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT ar.source, AVG(r.rating) AS avg_rating
+            FROM action_runs ar
+            JOIN support_reply_ratings r ON r.action_run_id = ar.id
+            WHERE ar.action_kind = 'reply'
+              AND ar.source IN ('discord','slack','telegram','whatsapp','helpscout')
+            GROUP BY ar.source
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
+        })?;
+        for row in rows.flatten() {
+            if let (source, Some(avg)) = row {
+                by_source.insert(source, avg);
+            }
+        }
+
+        Ok(claudear_core::types::SupportRatingSummary {
+            total_replies,
+            rated_count,
+            avg_rating,
+            avg_response_time_mins,
+            avg_rating_by_source: by_source,
+        })
     }
 
     /// Complexity-based engineering time savings estimate.
@@ -14977,6 +15191,96 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
         let board = tracker.get_repo_leaderboard().unwrap();
         assert!(board.is_empty());
+    }
+
+    #[test]
+    fn test_get_commit_trend_counts_commit_producing_executions() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.record_attempt("linear", "1", "L-1").unwrap();
+        let attempt = tracker.get_attempt("linear", "1").unwrap().unwrap();
+
+        // Produced a commit (hash advanced) -> counted.
+        let mut e1 = AgentExecution::new().with_attempt_id(attempt.id);
+        e1.git_commit_before = Some("aaa".to_string());
+        e1.git_commit_after = Some("bbb".to_string());
+        tracker.record_execution(&e1).unwrap();
+
+        // No commit (hash unchanged) -> not counted.
+        let mut e2 = AgentExecution::new().with_attempt_id(attempt.id);
+        e2.git_commit_before = Some("ccc".to_string());
+        e2.git_commit_after = Some("ccc".to_string());
+        tracker.record_execution(&e2).unwrap();
+
+        // No commit recorded at all -> not counted.
+        let e3 = AgentExecution::new().with_attempt_id(attempt.id);
+        tracker.record_execution(&e3).unwrap();
+
+        let trend = tracker.get_commit_trend(30).unwrap();
+        assert_eq!(trend.len(), 1, "all executions are today => one bucket");
+        assert_eq!(trend[0].commits, 1, "only the hash-advancing exec counts");
+    }
+
+    #[test]
+    fn test_get_commit_trend_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        assert!(tracker.get_commit_trend(30).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_support_replies_listing_and_rating() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // An attempt provides the "received" timestamp for response-time calc.
+        tracker.record_attempt("helpscout", "42", "HS-7").unwrap();
+        // A reply was sent for it.
+        tracker
+            .record_action_run("helpscout", "42", "HS-7", "reply", "answer", "Here's the fix")
+            .unwrap();
+        // A non-reply action and a non-support source should be excluded.
+        tracker
+            .record_action_run("helpscout", "42", "HS-7", "verify", "reproduced", "repro")
+            .unwrap();
+        tracker
+            .record_action_run("github", "9", "GH-9", "reply", "answer", "ignored")
+            .unwrap();
+
+        let replies = tracker.list_support_replies(50).unwrap();
+        assert_eq!(replies.len(), 1, "only helpscout reply is rateable");
+        let reply = &replies[0];
+        assert_eq!(reply.source, "helpscout");
+        assert_eq!(reply.kind, "answer");
+        assert!(reply.rating.is_none(), "not rated yet");
+
+        // Rate it as an admin.
+        tracker
+            .record_reply_rating(reply.action_run_id, 4, Some("solid"), "admin@x.io")
+            .unwrap();
+
+        // Upsert: re-rating replaces the value.
+        tracker
+            .record_reply_rating(reply.action_run_id, 5, None, "admin@x.io")
+            .unwrap();
+
+        let replies = tracker.list_support_replies(50).unwrap();
+        assert_eq!(replies[0].rating, Some(5));
+        assert_eq!(replies[0].rated_by.as_deref(), Some("admin@x.io"));
+
+        let summary = tracker.get_support_rating_summary().unwrap();
+        assert_eq!(summary.total_replies, 1);
+        assert_eq!(summary.rated_count, 1);
+        assert_eq!(summary.avg_rating, Some(5.0));
+        assert_eq!(summary.avg_rating_by_source.get("helpscout"), Some(&5.0));
+    }
+
+    #[test]
+    fn test_record_reply_rating_rejects_out_of_range() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_action_run("slack", "1", "S-1", "reply", "answer", "hi")
+            .unwrap();
+        let id = tracker.list_support_replies(10).unwrap()[0].action_run_id;
+        assert!(tracker.record_reply_rating(id, 0, None, "a@x.io").is_err());
+        assert!(tracker.record_reply_rating(id, 6, None, "a@x.io").is_err());
+        assert!(tracker.record_reply_rating(id, 3, None, "a@x.io").is_ok());
     }
 
     #[test]
