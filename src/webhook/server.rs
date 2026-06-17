@@ -262,6 +262,15 @@ impl WebhookServer {
                 indexing_rx,
                 None,
             );
+            // Apply the dashboard middleware (cookies, CSRF, CORS, security
+            // headers) to the dashboard routes only — not the webhook routes,
+            // whose inbound POSTs carry no CSRF token. Without this the
+            // CookieManagerLayer is absent and dashboard login 500s with
+            // "Can't extract cookies. Is `CookieManagerLayer` enabled?".
+            let dashboard_routes = claudear_engine::api::apply_dashboard_middleware(
+                dashboard_routes,
+                state.config.tls.enabled,
+            );
             webhook_routes.merge(dashboard_routes)
         } else {
             webhook_routes
