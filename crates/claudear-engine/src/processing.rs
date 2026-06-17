@@ -1140,7 +1140,7 @@ impl IssueProcessor {
         // Handle result
         if claude_result.success {
             // For review reruns, resolve the effective PR URL
-            let effective_pr_url = if existing_pr_branch.is_some() {
+            let mut effective_pr_url = if existing_pr_branch.is_some() {
                 let stored_url = self
                     .tracker
                     .get_attempt(source_name, &issue.id)
@@ -1169,6 +1169,30 @@ impl IssueProcessor {
             } else {
                 claude_result.pr_url.clone()
             };
+
+            if let Some(ref url) = effective_pr_url {
+                if claudear_storage::parse_pr_url(url).is_none() {
+                    match self.ensure_real_pr(url, issue, source_name).await {
+                        Some(real_url) => {
+                            tracing::info!(
+                                short_id = %issue.short_id,
+                                intent_url = %url,
+                                pr_url = %real_url,
+                                "Opened real PR from pushed-branch link"
+                            );
+                            effective_pr_url = Some(real_url);
+                        }
+                        None => {
+                            tracing::warn!(
+                                short_id = %issue.short_id,
+                                url = %url,
+                                "Agent returned a non-PR link and no real PR could be created; not marking resolved"
+                            );
+                            effective_pr_url = None;
+                        }
+                    }
+                }
+            }
 
             if let Some(ref pr_url) = effective_pr_url {
                 tracing::info!(short_id = %issue.short_id, pr_url = %pr_url, "Success! PR created");
@@ -1629,6 +1653,56 @@ impl IssueProcessor {
                 context_provider,
             )
             .await
+        }
+    }
+
+    /// Turn a "create a PR" diff/compare link (branch pushed, no PR opened) into
+    /// a real PR by opening it via the GitHub API. Returns the real PR URL, or
+    /// `None` if it can't (no GitHub client/token, the link isn't a recognizable
+    /// compare/pull-new page, the base branch can't be resolved, or the API call
+    /// fails).
+    async fn ensure_real_pr(&self, url: &str, issue: &Issue, source_name: &str) -> Option<String> {
+        let intent = claudear_storage::parse_pr_intent_url(url)?;
+        let gh = self.github_client.as_ref()?;
+
+        // Compare links name their base; pull/new links don't, so fall back to
+        // the repo's default branch.
+        let base = match intent.base.clone() {
+            Some(b) => b,
+            None => match gh.get_default_branch(&intent.repo).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        repo = %intent.repo,
+                        error = %e,
+                        "Could not resolve default branch to open PR"
+                    );
+                    return None;
+                }
+            },
+        };
+
+        let title = format!("Fix: {}", issue.title);
+        let body = format!(
+            "Resolves {} ({}).\n\n_PR opened automatically by claudear from pushed branch `{}`._",
+            issue.short_id, source_name, intent.head
+        );
+
+        match gh
+            .create_pr(&intent.repo, &intent.head, &base, &title, &body)
+            .await
+        {
+            Ok(real_url) => Some(real_url),
+            Err(e) => {
+                tracing::warn!(
+                    repo = %intent.repo,
+                    head = %intent.head,
+                    base = %base,
+                    error = %e,
+                    "Failed to auto-create PR from pushed branch"
+                );
+                None
+            }
         }
     }
 
