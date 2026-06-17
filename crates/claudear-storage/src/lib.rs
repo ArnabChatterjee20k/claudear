@@ -281,6 +281,40 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Daily commit-production trend over the last `_days` days.
+    fn get_commit_trend(
+        &self,
+        _days: usize,
+    ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
+        Ok(Vec::new())
+    }
+
+    /// List recent support replies (QA channels + HelpScout) with any existing rating.
+    fn list_support_replies(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<claudear_core::types::SupportReply>> {
+        Ok(Vec::new())
+    }
+
+    /// Record (or update) an admin's 1..5 rating for a support reply.
+    fn record_reply_rating(
+        &self,
+        _action_run_id: i64,
+        _rating: i32,
+        _note: Option<&str>,
+        _rated_by: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Aggregate support-reply rating + response-time summary.
+    fn get_support_rating_summary(
+        &self,
+    ) -> Result<claudear_core::types::SupportRatingSummary> {
+        Ok(claudear_core::types::SupportRatingSummary::default())
+    }
+
     /// Complexity-based engineering time savings estimate.
     fn get_complexity_time_savings(
         &self,
