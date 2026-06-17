@@ -309,9 +309,7 @@ pub trait ActivityStore: Send + Sync {
     }
 
     /// Aggregate support-reply rating + response-time summary.
-    fn get_support_rating_summary(
-        &self,
-    ) -> Result<claudear_core::types::SupportRatingSummary> {
+    fn get_support_rating_summary(&self) -> Result<claudear_core::types::SupportRatingSummary> {
         Ok(claudear_core::types::SupportRatingSummary::default())
     }
 

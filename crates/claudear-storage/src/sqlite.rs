@@ -1600,10 +1600,7 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::get_repo_leaderboard(self)
     }
 
-    fn get_commit_trend(
-        &self,
-        days: usize,
-    ) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
+    fn get_commit_trend(&self, days: usize) -> Result<Vec<claudear_core::types::CommitTrendPoint>> {
         SqliteTracker::get_commit_trend(self, days)
     }
 
@@ -1624,9 +1621,7 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::record_reply_rating(self, action_run_id, rating, note, rated_by)
     }
 
-    fn get_support_rating_summary(
-        &self,
-    ) -> Result<claudear_core::types::SupportRatingSummary> {
+    fn get_support_rating_summary(&self) -> Result<claudear_core::types::SupportRatingSummary> {
         SqliteTracker::get_support_rating_summary(self)
     }
 
@@ -6637,9 +6632,7 @@ impl SqliteTracker {
     }
 
     /// Aggregate support-reply rating + response-time summary (QA + HelpScout).
-    pub fn get_support_rating_summary(
-        &self,
-    ) -> Result<claudear_core::types::SupportRatingSummary> {
+    pub fn get_support_rating_summary(&self) -> Result<claudear_core::types::SupportRatingSummary> {
         let conn = self.acquire_lock()?;
 
         // Headline aggregates over all rateable replies.
@@ -15233,7 +15226,14 @@ mod tests {
         tracker.record_attempt("helpscout", "42", "HS-7").unwrap();
         // A reply was sent for it.
         tracker
-            .record_action_run("helpscout", "42", "HS-7", "reply", "answer", "Here's the fix")
+            .record_action_run(
+                "helpscout",
+                "42",
+                "HS-7",
+                "reply",
+                "answer",
+                "Here's the fix",
+            )
             .unwrap();
         // A non-reply action and a non-support source should be excluded.
         tracker
