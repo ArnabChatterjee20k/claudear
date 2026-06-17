@@ -121,6 +121,11 @@ pub fn create_api_router_full(
         .route("/api/issues", get(issues_handler))
         .route("/api/prs", get(prs_handler))
         .route("/api/prs/analytics", get(pr_analytics_handler))
+        .route("/api/support/replies", get(support_replies_handler))
+        .route(
+            "/api/support/replies/{action_run_id}/rating",
+            axum::routing::post(rate_reply_handler),
+        )
         .route("/api/feedback", get(feedback_handler))
         .route("/api/regressions", get(regressions_handler))
         .route(
@@ -1315,8 +1320,55 @@ async fn analytics_summary_handler(
         .ok();
     summary.mttr_trend = state.tracker.get_mttr_trend(8).unwrap_or_default();
     summary.repo_leaderboard = state.tracker.get_repo_leaderboard().unwrap_or_default();
+    summary.commit_trend = state.tracker.get_commit_trend(30).unwrap_or_default();
+    summary.support_rating = state.tracker.get_support_rating_summary().ok();
 
     Ok(Json(summary))
+}
+
+/// List recent support replies (QA channels + HelpScout) with any existing rating.
+async fn support_replies_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<claudear_core::types::SupportReply>>, StatusCode> {
+    state
+        .tracker
+        .list_support_replies(100)
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+#[derive(Deserialize)]
+struct RateReplyRequest {
+    rating: i32,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Record (or update) an admin's 1..5 rating for a support reply.
+async fn rate_reply_handler(
+    admin: AdminUser,
+    State(state): State<ApiState>,
+    Path(action_run_id): Path<i64>,
+    Json(body): Json<RateReplyRequest>,
+) -> Result<StatusCode, StatusCode> {
+    if !(1..=5).contains(&body.rating) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let note = body.note.as_deref().filter(|s| !s.trim().is_empty());
+    state
+        .tracker
+        .record_reply_rating(action_run_id, body.rating, note, &admin.0.email)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn metrics_handler(

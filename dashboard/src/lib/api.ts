@@ -236,6 +236,34 @@ export interface AnalyticsSummary {
   cost_estimate?: CostEstimate | null;
   mttr_trend?: MttrDataPoint[];
   repo_leaderboard?: RepoLeaderboardEntry[];
+  commit_trend?: CommitTrendPoint[];
+  support_rating?: SupportRatingSummary | null;
+}
+
+export interface CommitTrendPoint {
+  period_start: string;
+  commits: number;
+}
+
+export interface SupportReply {
+  action_run_id: number;
+  source: string;
+  short_id: string;
+  kind: string;
+  detail?: string | null;
+  created_at: string;
+  response_time_mins?: number | null;
+  rating?: number | null;
+  note?: string | null;
+  rated_by?: string | null;
+}
+
+export interface SupportRatingSummary {
+  total_replies: number;
+  rated_count: number;
+  avg_rating: number | null;
+  avg_response_time_mins: number | null;
+  avg_rating_by_source: Record<string, number>;
 }
 
 export interface ProcessingMetric {
@@ -626,6 +654,17 @@ export function setOnUnauthorized(cb: () => void) {
   onUnauthorized = cb
 }
 
+/**
+ * Read the CSRF token from the readable `claudear_csrf` cookie. The backend
+ * sets this cookie on every request and requires mutating requests (POST/PUT/
+ * DELETE) to echo it back in the `x-csrf-token` header (double-submit cookie
+ * pattern). Returns an empty string if the cookie isn't present yet.
+ */
+export function getCsrfToken(): string {
+  const match = document.cookie.match(/(?:^|;\s*)claudear_csrf=([^;]*)/)
+  return match ? decodeURIComponent(match[1]) : ''
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url)
   if (res.status === 401) {
@@ -644,7 +683,10 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
   Sentry.addBreadcrumb({ category: 'api', message: `POST ${url}`, level: 'info' })
   const res = await fetch(url, {
     method: 'POST',
-    headers: body ? { 'Content-Type': 'application/json' } : {},
+    headers: {
+      'x-csrf-token': getCsrfToken(),
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
     body: body ? JSON.stringify(body) : undefined,
   })
   if (res.status === 401) {
@@ -664,7 +706,10 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
   Sentry.addBreadcrumb({ category: 'api', message: `PUT ${url}`, level: 'info' })
   const res = await fetch(url, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-csrf-token': getCsrfToken(),
+    },
     body: JSON.stringify(body),
   })
   if (res.status === 401) {
@@ -681,7 +726,10 @@ async function putJson<T>(url: string, body: unknown): Promise<T> {
 
 async function deleteRequest(url: string): Promise<void> {
   Sentry.addBreadcrumb({ category: 'api', message: `DELETE ${url}`, level: 'info' })
-  const res = await fetch(url, { method: 'DELETE' })
+  const res = await fetch(url, {
+    method: 'DELETE',
+    headers: { 'x-csrf-token': getCsrfToken() },
+  })
   if (res.status === 401) {
     onUnauthorized?.()
     throw new Error('Unauthorized')
@@ -784,6 +832,18 @@ export async function fetchMetrics(params?: {
 
 export async function fetchErrors(limit = 50): Promise<ErrorPattern[]> {
   return fetchJson(`${API_BASE}/errors?limit=${limit}`);
+}
+
+export async function fetchSupportReplies(): Promise<SupportReply[]> {
+  return fetchJson(`${API_BASE}/support/replies`);
+}
+
+export async function rateReply(
+  actionRunId: number,
+  rating: number,
+  note?: string,
+): Promise<void> {
+  await postJson(`${API_BASE}/support/replies/${actionRunId}/rating`, { rating, note });
 }
 
 export async function fetchPrs(params?: {

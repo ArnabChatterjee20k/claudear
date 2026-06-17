@@ -1493,6 +1493,12 @@ pub struct AnalyticsSummary {
     /// Per-repo leaderboard.
     #[serde(default)]
     pub repo_leaderboard: Vec<RepoLeaderboardEntry>,
+    /// Daily commit-production trend (commits per day).
+    #[serde(default)]
+    pub commit_trend: Vec<CommitTrendPoint>,
+    /// Support-reply rating + response-time summary (QA channels + HelpScout).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub support_rating: Option<SupportRatingSummary>,
 }
 
 /// PR rejection/review-change reason category.
@@ -1528,6 +1534,68 @@ pub struct RepoLeaderboardEntry {
     pub success_rate: f64,
     pub merge_rate: f64,
     pub avg_time_to_merge_mins: Option<f64>,
+}
+
+/// A single point in the daily commit-production trend.
+///
+/// Derived from `claude_executions`: counts executions that actually produced
+/// a commit (commit hash changed) on a given day. This approximates "≥1 commit
+/// per execution" since multi-commit runs only expose before/after endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitTrendPoint {
+    /// Day bucket (YYYY-MM-DD).
+    pub period_start: String,
+    /// Number of commit-producing executions that day.
+    pub commits: i64,
+}
+
+/// A support reply (QA channel or HelpScout) eligible for an admin quality rating.
+///
+/// Backed by an `action_runs` row of kind `reply`; `action_run_id` is the join key
+/// for the optional `support_reply_ratings` record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupportReply {
+    /// The originating `action_runs.id` (also the rating key).
+    pub action_run_id: i64,
+    /// Source channel (discord/slack/telegram/whatsapp/helpscout).
+    pub source: String,
+    /// Human-facing short id (e.g. "HS-7").
+    pub short_id: String,
+    /// Reply kind: answer | need_repro | fix_shipped (the action_runs status).
+    pub kind: String,
+    /// Truncated reply text preview.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// When the reply was sent.
+    pub created_at: DateTime<Utc>,
+    /// Minutes from issue/conversation received to reply sent, if derivable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_time_mins: Option<f64>,
+    /// Admin rating (1..5), if rated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<i32>,
+    /// Optional free-text note from the rater.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Email of the admin who rated, if rated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rated_by: Option<String>,
+}
+
+/// Aggregate support-reply rating + response-time summary for the dashboard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SupportRatingSummary {
+    /// Total rateable replies (QA + HelpScout).
+    pub total_replies: i64,
+    /// How many of those have been rated.
+    pub rated_count: i64,
+    /// Average rating across rated replies (1..5).
+    pub avg_rating: Option<f64>,
+    /// Average response time in minutes across replies with a derivable time.
+    pub avg_response_time_mins: Option<f64>,
+    /// Average rating per source.
+    #[serde(default)]
+    pub avg_rating_by_source: HashMap<String, f64>,
 }
 
 /// Engineering time savings estimate.
@@ -5638,11 +5706,24 @@ mod tests {
                 merge_rate: 0.8,
                 avg_time_to_merge_mins: Some(60.0),
             }],
+            commit_trend: vec![CommitTrendPoint {
+                period_start: "2026-01-01".into(),
+                commits: 7,
+            }],
+            support_rating: Some(SupportRatingSummary {
+                total_replies: 10,
+                rated_count: 4,
+                avg_rating: Some(4.25),
+                avg_response_time_mins: Some(15.0),
+                avg_rating_by_source: HashMap::new(),
+            }),
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: AnalyticsSummary = serde_json::from_str(&json).unwrap();
         assert!((parsed.success_rate - 0.85).abs() < f64::EPSILON);
         assert_eq!(parsed.repo_leaderboard.len(), 1);
+        assert_eq!(parsed.commit_trend.len(), 1);
+        assert_eq!(parsed.support_rating.unwrap().rated_count, 4);
         assert!(parsed.cost_estimate.is_some());
     }
 
