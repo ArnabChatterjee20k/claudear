@@ -67,6 +67,67 @@ pub fn parse_pr_url(url: &str) -> Option<(String, i64)> {
     None
 }
 
+/// A GitHub "create a PR" link the agent sometimes returns *instead of* a real
+/// PR: either the compare page (`/compare/<base>...<head>`) or the pull/new page
+/// (`/pull/new/<branch>`). These mean a branch was pushed but no PR was opened.
+/// Carries enough to open the actual PR via the API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrIntentUrl {
+    /// `owner/repo`.
+    pub repo: String,
+    /// Head branch (the pushed branch the PR should be opened from).
+    pub head: String,
+    /// Base branch. `Some` for a compare link (it names the base); `None` for a
+    /// pull/new link (caller should fall back to the repo's default branch).
+    pub base: Option<String>,
+}
+
+/// Parse a GitHub "create a PR" intent link (compare or pull/new) into its
+/// parts. Returns `None` for real PR URLs (use [`parse_pr_url`]) and for any
+/// link that isn't a recognizable compare/pull-new page.
+pub fn parse_pr_intent_url(url: &str) -> Option<PrIntentUrl> {
+    if url.len() > MAX_PR_URL_LENGTH {
+        return None;
+    }
+    // Take everything after the host, then drop any query/fragment.
+    let after_host = url.split("github.com/").nth(1)?;
+    let after_host = after_host.split(['?', '#']).next().unwrap_or(after_host);
+
+    // .../pull/new/<branch>  (branch may contain slashes)
+    if let Some(idx) = after_host.find("/pull/new/") {
+        let repo = &after_host[..idx];
+        let head = after_host[idx + "/pull/new/".len()..].trim_end_matches('/');
+        if repo.matches('/').count() == 1 && !repo.is_empty() && !head.is_empty() {
+            return Some(PrIntentUrl {
+                repo: repo.to_string(),
+                head: head.to_string(),
+                base: None,
+            });
+        }
+        return None;
+    }
+
+    // .../compare/<base>...<head>  (git refs cannot contain "..", so the split is safe)
+    if let Some(idx) = after_host.find("/compare/") {
+        let repo = &after_host[..idx];
+        if repo.matches('/').count() != 1 || repo.is_empty() {
+            return None;
+        }
+        let spec = after_host[idx + "/compare/".len()..].trim_end_matches('/');
+        let (base, head) = spec.split_once("...").or_else(|| spec.split_once(".."))?;
+        if base.is_empty() || head.is_empty() {
+            return None;
+        }
+        return Some(PrIntentUrl {
+            repo: repo.to_string(),
+            head: head.to_string(),
+            base: Some(base.to_string()),
+        });
+    }
+
+    None
+}
+
 /// Core fix attempt lifecycle methods (all required, no defaults).
 pub trait AttemptTracker: Send + Sync {
     /// Check if an issue has already been attempted.
@@ -3296,6 +3357,45 @@ mod tests {
     fn test_parse_pr_url_github() {
         let result = parse_pr_url("https://github.com/owner/repo/pull/42");
         assert_eq!(result, Some(("owner/repo".to_string(), 42)));
+    }
+
+    #[test]
+    fn test_parse_pr_intent_compare_link() {
+        let got = parse_pr_intent_url(
+            "https://github.com/appwrite/appwrite/compare/main...fix/pool-not-found-error",
+        );
+        assert_eq!(
+            got,
+            Some(PrIntentUrl {
+                repo: "appwrite/appwrite".to_string(),
+                head: "fix/pool-not-found-error".to_string(),
+                base: Some("main".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_intent_pull_new_link() {
+        let got = parse_pr_intent_url(
+            "https://github.com/appwrite-labs/cloud/pull/new/fix/orphaned-invoices-mysql-timeout",
+        );
+        assert_eq!(
+            got,
+            Some(PrIntentUrl {
+                repo: "appwrite-labs/cloud".to_string(),
+                head: "fix/orphaned-invoices-mysql-timeout".to_string(),
+                base: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_pr_intent_rejects_real_pr_and_unrelated() {
+        // A real PR URL is not an "intent" link.
+        assert!(parse_pr_intent_url("https://github.com/owner/repo/pull/42").is_none());
+        // Unrelated links.
+        assert!(parse_pr_intent_url("https://github.com/owner/repo").is_none());
+        assert!(parse_pr_intent_url("https://example.com/compare/a...b").is_none());
     }
 
     #[test]
