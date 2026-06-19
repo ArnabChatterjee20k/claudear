@@ -65,14 +65,6 @@ pub trait IssueSource: Send + Sync {
         Ok(())
     }
 
-    /// Add an internal note (not customer-facing) to an issue. Defaults to
-    /// `add_comment`; sources with a distinct internal-note concept (e.g.
-    /// HelpScout) override this to always post privately, regardless of how
-    /// regular replies are delivered.
-    async fn add_note(&self, issue_id: &str, note: &str) -> Result<()> {
-        self.add_comment(issue_id, note).await
-    }
-
     /// Get the current status of an issue from the remote source.
     /// Returns the raw status string from the source (e.g., "completed", "resolved", "ignored").
     async fn get_issue_status(&self, issue_id: &str) -> Result<String> {

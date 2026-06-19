@@ -41,14 +41,6 @@ pub trait ContextProvider: Send + Sync {
             "post_reply is not supported by this context".to_string(),
         ))
     }
-
-    /// Post an internal note (triage/verification details) on the ticket. Never
-    /// customer-facing. Default: not supported (e.g. webhook contexts).
-    async fn post_note(&self, _issue_id: &str, _body: &str) -> Result<()> {
-        Err(claudear_core::error::Error::Other(
-            "post_note is not supported by this context".to_string(),
-        ))
-    }
 }
 
 #[async_trait]
@@ -59,10 +51,6 @@ impl<T: claudear_integrations::source::IssueSource + ?Sized> ContextProvider for
 
     async fn post_reply(&self, issue_id: &str, body: &str) -> Result<()> {
         claudear_integrations::source::IssueSource::add_comment(self, issue_id, body).await
-    }
-
-    async fn post_note(&self, issue_id: &str, body: &str) -> Result<()> {
-        claudear_integrations::source::IssueSource::add_note(self, issue_id, body).await
     }
 }
 
@@ -78,10 +66,6 @@ impl ContextProvider for SourceContext<'_> {
 
     async fn post_reply(&self, issue_id: &str, body: &str) -> Result<()> {
         self.0.add_comment(issue_id, body).await
-    }
-
-    async fn post_note(&self, issue_id: &str, body: &str) -> Result<()> {
-        self.0.add_note(issue_id, body).await
     }
 }
 
@@ -1864,17 +1848,18 @@ impl IssueProcessor {
             json!({ "reproduced": verdict.reproduced, "summary": verdict.summary }),
         );
 
-        // Post the verification findings as an internal note so the support team
-        // can see what was checked and why. Only when the agent produced real
-        // details (skips the conservative timeout/unsupported fallbacks) and only
-        // for tracker-style sources — conversational sources would expose internal
-        // triage in-channel.
+        // Post the verification findings back to the ticket (via the same path as
+        // replies, so it honours the source's configured delivery — e.g. an
+        // internal HelpScout note vs. a customer reply). Only when the agent
+        // produced real details (skips the conservative timeout/unsupported
+        // fallbacks) and only for tracker-style sources — conversational sources
+        // would expose internal triage in-channel.
         let has_details = !verdict.impact.trim().is_empty()
             || !verdict.root_cause.trim().is_empty()
             || !verdict.suggested_fix.trim().is_empty();
         if verdict.reproduced && has_details && !qa_eligible_source(source_name) {
             let note = build_verification_note(issue, &verdict, resolution, source_name);
-            if let Err(e) = context_provider.post_note(&issue.id, &note).await {
+            if let Err(e) = context_provider.post_reply(&issue.id, &note).await {
                 tracing::debug!(short_id = %issue.short_id, error = %e, "Could not post verification note");
             }
         }
