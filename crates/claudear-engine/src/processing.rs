@@ -41,6 +41,14 @@ pub trait ContextProvider: Send + Sync {
             "post_reply is not supported by this context".to_string(),
         ))
     }
+
+    /// Post an internal note (triage/verification details) on the ticket. Never
+    /// customer-facing. Default: not supported (e.g. webhook contexts).
+    async fn post_note(&self, _issue_id: &str, _body: &str) -> Result<()> {
+        Err(claudear_core::error::Error::Other(
+            "post_note is not supported by this context".to_string(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -51,6 +59,10 @@ impl<T: claudear_integrations::source::IssueSource + ?Sized> ContextProvider for
 
     async fn post_reply(&self, issue_id: &str, body: &str) -> Result<()> {
         claudear_integrations::source::IssueSource::add_comment(self, issue_id, body).await
+    }
+
+    async fn post_note(&self, issue_id: &str, body: &str) -> Result<()> {
+        claudear_integrations::source::IssueSource::add_note(self, issue_id, body).await
     }
 }
 
@@ -66,6 +78,10 @@ impl ContextProvider for SourceContext<'_> {
 
     async fn post_reply(&self, issue_id: &str, body: &str) -> Result<()> {
         self.0.add_comment(issue_id, body).await
+    }
+
+    async fn post_note(&self, issue_id: &str, body: &str) -> Result<()> {
+        self.0.add_note(issue_id, body).await
     }
 }
 
@@ -83,6 +99,48 @@ impl ContextProvider for WebhookContext<'_> {
 /// handling. Tracker-style sources (Sentry, Linear, GitHub, etc.) are not.
 pub(crate) fn qa_eligible_source(source: &str) -> bool {
     matches!(source, "discord" | "slack" | "telegram" | "whatsapp")
+}
+
+/// Build the internal verification-details note posted after a bug/security
+/// report is reproduced. Records the source and repo that were checked, the
+/// verdict, and the agent's impact / root-cause / suggested-fix findings so the
+/// support team has the full triage context. Sections with no content are
+/// omitted.
+fn build_verification_note(
+    issue: &Issue,
+    verdict: &VerifyResult,
+    resolution: &RepoResolution,
+    source_name: &str,
+) -> String {
+    let repo = resolution
+        .repo_name()
+        .or_else(|| resolution.scm_url())
+        .unwrap_or("(unresolved)");
+
+    let mut out = format!("claudear verification — {}\n\n", issue.short_id);
+    out.push_str(&format!("Source verified: {source_name}\n"));
+    out.push_str(&format!("Repo checked: {repo}\n"));
+    out.push_str(&format!(
+        "Verdict: {}\n",
+        if verdict.reproduced {
+            "reproduced"
+        } else {
+            "could not reproduce"
+        }
+    ));
+
+    let mut section = |label: &str, body: &str| {
+        let body = body.trim();
+        if !body.is_empty() {
+            out.push_str(&format!("\n{label}:\n{body}\n"));
+        }
+    };
+    section("Summary", &verdict.summary);
+    section("Why it's an issue", &verdict.impact);
+    section("Root cause", &verdict.root_cause);
+    section("Potential fix", &verdict.suggested_fix);
+    section("Evidence", &verdict.evidence);
+    out
 }
 
 /// Heuristic bug/security detection used as a fallback when the LLM classifier is
@@ -1555,7 +1613,12 @@ impl IssueProcessor {
         match action {
             ActionKind::Verify => {
                 let verdict = self
-                    .run_verify(&input.issue, &input.resolution, &input.source_name)
+                    .run_verify(
+                        &input.issue,
+                        &input.resolution,
+                        &input.source_name,
+                        context_provider,
+                    )
                     .await;
                 ProcessingOutcome::CompletedNoPr {
                     reason: format!(
@@ -1616,7 +1679,12 @@ impl IssueProcessor {
         if is_bug_or_security {
             // Verify before spending an expensive fix run.
             let verdict = self
-                .run_verify(&input.issue, &input.resolution, &input.source_name)
+                .run_verify(
+                    &input.issue,
+                    &input.resolution,
+                    &input.source_name,
+                    context_provider,
+                )
                 .await;
             if verdict.reproduced {
                 return match self.run_inner(input, context_provider).await {
@@ -1726,6 +1794,7 @@ impl IssueProcessor {
         issue: &Issue,
         resolution: &RepoResolution,
         source_name: &str,
+        context_provider: &dyn ContextProvider,
     ) -> VerifyResult {
         let project_dir = self.action_project_dir(resolution);
         let context = self.build_rag_context(issue).await;
@@ -1750,6 +1819,9 @@ impl IssueProcessor {
             Ok(Err(e)) => VerifyResult {
                 reproduced: true,
                 summary: "Verification unsupported/failed; proceeding to resolve".to_string(),
+                impact: String::new(),
+                root_cause: String::new(),
+                suggested_fix: String::new(),
                 evidence: e.to_string(),
             },
             Err(_) => VerifyResult {
@@ -1758,6 +1830,9 @@ impl IssueProcessor {
                     "Verification timed out after {}s; proceeding to resolve",
                     self.config.reply().verify_timeout_secs
                 ),
+                impact: String::new(),
+                root_cause: String::new(),
+                suggested_fix: String::new(),
                 evidence: String::new(),
             },
         };
@@ -1788,6 +1863,22 @@ impl IssueProcessor {
             ),
             json!({ "reproduced": verdict.reproduced, "summary": verdict.summary }),
         );
+
+        // Post the verification findings as an internal note so the support team
+        // can see what was checked and why. Only when the agent produced real
+        // details (skips the conservative timeout/unsupported fallbacks) and only
+        // for tracker-style sources — conversational sources would expose internal
+        // triage in-channel.
+        let has_details = !verdict.impact.trim().is_empty()
+            || !verdict.root_cause.trim().is_empty()
+            || !verdict.suggested_fix.trim().is_empty();
+        if verdict.reproduced && has_details && !qa_eligible_source(source_name) {
+            let note = build_verification_note(issue, &verdict, resolution, source_name);
+            if let Err(e) = context_provider.post_note(&issue.id, &note).await {
+                tracing::debug!(short_id = %issue.short_id, error = %e, "Could not post verification note");
+            }
+        }
+
         verdict
     }
 

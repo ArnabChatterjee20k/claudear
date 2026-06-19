@@ -451,6 +451,35 @@ impl<H: HttpClient + 'static> IssueSource for HelpScoutSource<H> {
             ))
         }
     }
+
+    async fn add_note(&self, issue_id: &str, note: &str) -> Result<()> {
+        // Internal notes (e.g. verification details) are always posted privately
+        // via the notes endpoint, ignoring `reply_as` — they must never reach
+        // the customer.
+        let token = self.access_token().await?;
+        let text =
+            serde_json::to_string(note).map_err(|e| Error::Other(format!("JSON error: {e}")))?;
+
+        let resp = self
+            .http
+            .post(
+                &format!("{HELPSCOUT_API_BASE}/v2/conversations/{issue_id}/notes"),
+                vec![
+                    ("Authorization", format!("Bearer {token}")),
+                    ("Content-Type", "application/json".to_string()),
+                ],
+                &format!("{{\"text\":{text}}}"),
+            )
+            .await?;
+        if resp.is_success() {
+            Ok(())
+        } else {
+            Err(Error::source(
+                "helpscout",
+                format!("post note failed ({}): {}", resp.status, resp.body),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -613,6 +642,23 @@ mod tests {
         let source = HelpScoutSource::with_http_client(test_config(), mock);
         source
             .add_comment("42", "Thanks for the report!")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_add_note_always_posts_internal_note_even_when_reply_as_reply() {
+        // Internal notes (e.g. verification details) must hit the /notes endpoint
+        // regardless of `reply_as`, so they never reach the customer.
+        let mut config = test_config();
+        config.reply_as = ReplyAs::Reply;
+        let mock = MockHttpClient::new(vec![
+            ("/v2/oauth2/token", 200, TOKEN_BODY),
+            ("/notes", 201, ""),
+        ]);
+        let source = HelpScoutSource::with_http_client(config, mock);
+        source
+            .add_note("42", "claudear verification — HS-7")
             .await
             .unwrap();
     }

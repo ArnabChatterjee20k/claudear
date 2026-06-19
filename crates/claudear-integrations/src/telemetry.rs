@@ -105,6 +105,19 @@ impl IssueSource for InstrumentedSource {
         }
     }
 
+    async fn add_note(&self, issue_id: &str, note: &str) -> Result<()> {
+        match self.inner.add_note(issue_id, note).await {
+            Ok(v) => {
+                tracing::info!(component = self.inner.name(), issue_id = %issue_id, "Added note");
+                Ok(v)
+            }
+            Err(e) => {
+                tracing::warn!(component = self.inner.name(), issue_id = %issue_id, error = %e, "Failed to add note");
+                Err(e)
+            }
+        }
+    }
+
     async fn create_issue(
         &self,
         title: &str,
