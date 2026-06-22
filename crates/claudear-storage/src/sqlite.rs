@@ -8302,7 +8302,7 @@ impl SqliteTracker {
     /// Save Discord message chunks, returning the inserted row ids (in order).
     pub fn save_discord_chunks(
         &self,
-        chunks: &[claudear_core::types::DiscordChunk],
+        chunks: &[claudear_core::types::DiscordMessageChunk],
     ) -> Result<Vec<i64>> {
         let mut conn = self.acquire_lock()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -8311,19 +8311,21 @@ impl SqliteTracker {
         {
             let mut stmt = tx.prepare(
                 r#"
-                INSERT INTO discord_message_chunks (guild_id, channel_id, thread_id, start_message_id, end_message_id, participant_ids, start_message_time, end_message_time, chunk_text, context_text, content_hash)
+                INSERT INTO discord_message_chunks (guild_id, channel_id, channel_kind, start_message_id, end_message_id, participant_ids, start_message_time, end_message_time, chunk_text, context_text, content_hash)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 "#,
             )?;
 
             for chunk in chunks {
+                // Persist participant ids as a comma-separated list (snowflake ids never contain commas).
+                let participants = chunk.participant_ids.as_ref().map(|v| v.join(","));
                 stmt.execute(params![
                     chunk.guild_id.as_deref(),
                     &chunk.channel_id,
-                    chunk.thread_id.as_deref(),
+                    chunk.channel_kind.as_i64(),
                     &chunk.start_message_id,
                     &chunk.end_message_id,
-                    chunk.participant_ids.as_deref(),
+                    participants,
                     &chunk.start_message_time,
                     &chunk.end_message_time,
                     &chunk.chunk_text,
@@ -8444,13 +8446,13 @@ impl SqliteTracker {
     }
 
     /// Search Discord message chunks by vector similarity using the HNSW index.
-    pub fn search_discord_chunks(
+    pub fn search_discord_message_chunks(
         &self,
         query_embedding: &[f32],
         channel_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
-        use claudear_core::types::{DiscordChunk, DiscordSearchResult};
+        use claudear_core::types::{DiscordChannelKind, DiscordMessageChunk, DiscordSearchResult};
 
         if query_embedding.is_empty() || limit == 0 {
             return Ok(Vec::new());
@@ -8481,7 +8483,7 @@ impl SqliteTracker {
                 WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
             )
             SELECT c.similarity,
-                   ch.id, ch.guild_id, ch.channel_id, ch.thread_id,
+                   ch.id, ch.guild_id, ch.channel_id, ch.channel_kind,
                    ch.start_message_id, ch.end_message_id, ch.participant_ids,
                    ch.start_message_time, ch.end_message_time,
                    ch.chunk_text, ch.context_text, ch.content_hash
@@ -8513,15 +8515,22 @@ impl SqliteTracker {
             ],
             |row| {
                 let similarity: f64 = row.get(0)?;
+                let kind_int: i64 = row.get(4)?;
+                let participants: Option<String> = row.get(7)?;
                 Ok(DiscordSearchResult {
-                    chunk: DiscordChunk {
+                    chunk: DiscordMessageChunk {
                         id: row.get(1)?,
                         guild_id: row.get(2)?,
                         channel_id: row.get(3)?,
-                        thread_id: row.get(4)?,
+                        channel_kind: DiscordChannelKind::from_i64(kind_int),
                         start_message_id: row.get(5)?,
                         end_message_id: row.get(6)?,
-                        participant_ids: row.get(7)?,
+                        participant_ids: participants.map(|s| {
+                            s.split(',')
+                                .filter(|x| !x.is_empty())
+                                .map(String::from)
+                                .collect()
+                        }),
                         start_message_time: row.get(8)?,
                         end_message_time: row.get(9)?,
                         chunk_text: row.get(10)?,
@@ -17416,15 +17425,15 @@ mod tests {
     fn sample_discord_chunk(
         channel_id: &str,
         start_id: &str,
-    ) -> claudear_core::types::DiscordChunk {
-        claudear_core::types::DiscordChunk {
+    ) -> claudear_core::types::DiscordMessageChunk {
+        claudear_core::types::DiscordMessageChunk {
             id: None,
             guild_id: Some("guild1".to_string()),
             channel_id: channel_id.to_string(),
-            thread_id: None,
+            channel_kind: claudear_core::types::DiscordChannelKind::Channel,
             start_message_id: start_id.to_string(),
             end_message_id: start_id.to_string(),
-            participant_ids: Some("u1,u2".to_string()),
+            participant_ids: Some(vec!["u1".to_string(), "u2".to_string()]),
             start_message_time: "2024-01-01T00:00:00Z".to_string(),
             end_message_time: "2024-01-01T00:05:00Z".to_string(),
             chunk_text: "hello world".to_string(),
@@ -17461,7 +17470,9 @@ mod tests {
     #[test]
     fn test_search_discord_chunks_empty_embedding() {
         let tracker = SqliteTracker::in_memory().unwrap();
-        let results = tracker.search_discord_chunks(&[], None, 10).unwrap();
+        let results = tracker
+            .search_discord_message_chunks(&[], None, 10)
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -17469,7 +17480,7 @@ mod tests {
     fn test_search_discord_chunks_zero_limit() {
         let tracker = SqliteTracker::in_memory().unwrap();
         let results = tracker
-            .search_discord_chunks(&[0.1, 0.2, 0.3, 0.4], None, 0)
+            .search_discord_message_chunks(&[0.1, 0.2, 0.3, 0.4], None, 0)
             .unwrap();
         assert!(results.is_empty());
     }
@@ -17493,17 +17504,21 @@ mod tests {
         // nearest match (channel "100") comes back; when it is not, search
         // degrades to empty results — both are valid outcomes.
         let results = tracker
-            .search_discord_chunks(&[0.9f32, 0.1, 0.0, 0.0], None, 5)
+            .search_discord_message_chunks(&[0.9f32, 0.1, 0.0, 0.0], None, 5)
             .unwrap();
         if let Some(top) = results.first() {
             assert_eq!(top.chunk.channel_id, "100");
             assert_eq!(top.chunk.start_message_id, "1001");
+            assert_eq!(
+                top.chunk.participant_ids.as_deref(),
+                Some(["u1".to_string(), "u2".to_string()].as_slice())
+            );
             assert!(top.score >= results.last().unwrap().score);
         }
 
         // The optional channel_id filter must restrict results to that channel.
         let filtered = tracker
-            .search_discord_chunks(&[0.0f32, 0.9, 0.0, 0.0], Some("200"), 5)
+            .search_discord_message_chunks(&[0.0f32, 0.9, 0.0, 0.0], Some("200"), 5)
             .unwrap();
         for r in &filtered {
             assert_eq!(r.chunk.channel_id, "200");
