@@ -1336,51 +1336,51 @@ pub trait DiscordStore: Send + Sync {
     /// Search chunks by vector similarity.
     fn search_discord_message_chunks(
         &self,
-        query_embedding: &[f32],
-        channel_id: Option<i64>,
-        limit: usize,
+        _query_embedding: &[f32],
+        _channel_id: Option<i64>,
+        _limit: usize,
     ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
         Ok(Vec::new())
     }
 
-    fn discord_chunk_hash_matches(&self, channel_id: i64, content_hash: &str) -> Result<bool> {
+    fn discord_chunk_hash_matches(&self, _channel_id: i64, _content_hash: &str) -> Result<bool> {
         Ok(false)
     }
 
-    fn delete_discor_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
+    fn delete_discord_message_data_for_channel(&self, _channel_id: &str) -> Result<()> {
         Ok(())
     }
 
     /// Delete code chunks by IDs.
-    fn delete_discord_message_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
+    fn delete_discord_message_chunks_by_ids(&self, _chunk_ids: &[i64]) -> Result<()> {
         Ok(())
     }
 
-    fn cleanup_stale_discord_message_data(&self, channel_id: &str) -> Result<()> {
+    fn cleanup_stale_discord_message_data(&self, _channel_id: &str) -> Result<()> {
         Ok(())
     }
 
-    fn get_discord_message_index_meta(&self, channel_id: &str) -> Result<Option<String>> {
+    fn get_discord_message_index_meta(&self, _channel_id: &str) -> Result<Option<String>> {
         Ok(None)
     }
 
     fn set_discrod_message_index_meta(
         &self,
-        channel_id: &str,
-        key: &str,
-        value: &str,
+        _channel_id: &str,
+        _key: &str,
+        _value: &str,
     ) -> Result<()> {
         Ok(())
     }
 
     /// Get the embedding model name used for a repo's code chunks.
     /// Returns `None` if no embeddings exist for the repo.
-    fn get_code_embedding_model(&self, repo_id: i64) -> Result<Option<String>> {
+    fn get_code_embedding_model(&self, _channel_id: &str) -> Result<Option<String>> {
         Ok(None)
     }
 
     /// Delete all code data (symbols, chunks, embeddings) for a repo.
-    fn delete_all_discord_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
+    fn delete_all_discord_message_data_for_channel(&self, _channel_id: &str) -> Result<()> {
         Ok(())
     }
 }
