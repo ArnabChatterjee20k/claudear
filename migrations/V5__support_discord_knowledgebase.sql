@@ -1,12 +1,12 @@
 CREATE TABLE IF NOT EXISTS discord_message_chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id TEXT,
-    channel_id TEXT NOT NULL,
-    thread_id TEXT,
+    channel_id TEXT NOT NULL,                -- channel or thread id (a thread is itself a channel)
+    channel_kind INTEGER NOT NULL DEFAULT 0, -- mirrors Discord channel_type: 0 = channel, 4 = category, 11 = thread
 
     start_message_id TEXT NOT NULL,
     end_message_id TEXT NOT NULL,
-    participant_ids TEXT,
+    participant_ids TEXT,                     -- comma-separated author ids in the span
 
     start_message_time TEXT NOT NULL,
     end_message_time TEXT NOT NULL,
