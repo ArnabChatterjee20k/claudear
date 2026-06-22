@@ -39,6 +39,9 @@ const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
 const CODE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
+const DISCORD_MESSAGE_CHUNK_VECTOR_TABLE: &str = "discord_message_chunk_vectors";
+const DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
+const DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
 /// Maximum allowed embedding dimension to prevent malformed data from generating
 /// unbounded DDL strings. Covers all common embedding models (up to 8192-dim).
@@ -8290,6 +8293,257 @@ impl SqliteTracker {
             match row {
                 Ok(r) => results.push(r),
                 Err(e) => tracing::debug!(error = %e, "Failed to read code chunk vector row"),
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Save Discord message chunks, returning the inserted row ids (in order).
+    pub fn save_discord_chunks(
+        &self,
+        chunks: &[claudear_core::types::DiscordChunk],
+    ) -> Result<Vec<i64>> {
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let mut ids = Vec::with_capacity(chunks.len());
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO discord_message_chunks (guild_id, channel_id, thread_id, start_message_id, end_message_id, participant_ids, start_message_time, end_message_time, chunk_text, context_text, content_hash)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+            )?;
+
+            for chunk in chunks {
+                stmt.execute(params![
+                    chunk.guild_id.as_deref(),
+                    &chunk.channel_id,
+                    chunk.thread_id.as_deref(),
+                    &chunk.start_message_id,
+                    &chunk.end_message_id,
+                    chunk.participant_ids.as_deref(),
+                    &chunk.start_message_time,
+                    &chunk.end_message_time,
+                    &chunk.chunk_text,
+                    &chunk.context_text,
+                    chunk.content_hash.as_deref(),
+                ])?;
+                ids.push(tx.last_insert_rowid());
+            }
+        }
+
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Save embeddings for Discord message chunks and insert into the HNSW vector index.
+    pub fn save_discord_chunk_embeddings(
+        &self,
+        pairs: &[(i64, &[f32])],
+        model_name: &str,
+    ) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.acquire_lock()?;
+
+        let dimension = pairs[0].1.len();
+        let _ = Self::ensure_discord_chunk_vector_table(&conn, dimension);
+
+        let has_vector_table = Self::table_exists(&conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)?;
+
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO discord_message_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
+            )?;
+
+            for &(chunk_id, embedding) in pairs {
+                let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+                stmt.execute(params![chunk_id, blob, model_name])?;
+
+                if has_vector_table {
+                    let emb_id = tx.last_insert_rowid();
+                    let insert_sql = format!(
+                        "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
+                        DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+                    );
+                    if let Err(e) = tx.execute(&insert_sql, params![emb_id, blob]) {
+                        tracing::warn!(error = %e, chunk_id, "Failed to insert into discord chunk vector table — aborting batch");
+                        // Drop tx without commit to roll back the entire batch,
+                        // so embeddings and vector index stay consistent.
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Lazily create the HNSW vector table for Discord message chunk embeddings.
+    fn ensure_discord_chunk_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
+        if dimension == 0 {
+            return Ok(false);
+        }
+        validate_dimension(dimension)?;
+
+        if !is_vectorlite_available(conn) {
+            match try_load_vectorlite(conn) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Unable to load vectorlite for discord chunk search");
+                    return Ok(false);
+                }
+            }
+        }
+
+        if Self::table_exists(conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)? {
+            return Ok(true);
+        }
+
+        let sql = format!(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
+                embedding float32[{dimension}] cosine,
+                hnsw(max_elements=100000, ef_construction=200, M=16)
+            )
+            "#,
+            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE,
+            dimension = dimension
+        );
+
+        match conn.execute_batch(&sql) {
+            Ok(()) => {
+                // Backfill existing embeddings.
+                let backfill = format!(
+                    r#"
+                    INSERT INTO {table}(rowid, embedding)
+                    SELECT id, embedding
+                    FROM discord_message_chunk_embeddings
+                    WHERE length(embedding) = ?1
+                    "#,
+                    table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+                );
+                if let Err(e) = conn.execute(&backfill, params![(dimension * 4) as i64]) {
+                    tracing::debug!(error = %e, "Failed to backfill discord chunk vector embeddings");
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to create discord chunk vector table");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Search Discord message chunks by vector similarity using the HNSW index.
+    pub fn search_discord_chunks(
+        &self,
+        query_embedding: &[f32],
+        channel_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
+        use claudear_core::types::{DiscordChunk, DiscordSearchResult};
+
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Clamp limit to prevent excessive memory usage from the HNSW candidate multiplier.
+        let limit = limit.min(1000);
+
+        let conn = self.acquire_lock()?;
+
+        if !Self::ensure_discord_chunk_vector_table(&conn, query_embedding.len())? {
+            // Vectorlite unavailable — fall back to empty results.
+            return Ok(Vec::new());
+        }
+
+        let query_blob: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let candidate_limit = limit * DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER;
+
+        let sql = format!(
+            r#"
+            WITH candidates AS (
+                SELECT rowid AS emb_id,
+                       MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
+                FROM {table}
+                WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
+            )
+            SELECT c.similarity,
+                   ch.id, ch.guild_id, ch.channel_id, ch.thread_id,
+                   ch.start_message_id, ch.end_message_id, ch.participant_ids,
+                   ch.start_message_time, ch.end_message_time,
+                   ch.chunk_text, ch.context_text, ch.content_hash
+            FROM candidates c
+            JOIN discord_message_chunk_embeddings e ON e.id = c.emb_id
+            JOIN discord_message_chunks ch ON ch.id = e.chunk_id
+            WHERE (?4 IS NULL OR ch.channel_id = ?4)
+            ORDER BY c.similarity DESC
+            LIMIT ?5
+            "#,
+            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to prepare discord chunk vector search");
+                return Ok(Vec::new());
+            }
+        };
+
+        let rows = match stmt.query_map(
+            params![
+                query_blob,
+                candidate_limit as i64,
+                DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH as i64,
+                channel_id,
+                limit as i64,
+            ],
+            |row| {
+                let similarity: f64 = row.get(0)?;
+                Ok(DiscordSearchResult {
+                    chunk: DiscordChunk {
+                        id: row.get(1)?,
+                        guild_id: row.get(2)?,
+                        channel_id: row.get(3)?,
+                        thread_id: row.get(4)?,
+                        start_message_id: row.get(5)?,
+                        end_message_id: row.get(6)?,
+                        participant_ids: row.get(7)?,
+                        start_message_time: row.get(8)?,
+                        end_message_time: row.get(9)?,
+                        chunk_text: row.get(10)?,
+                        context_text: row.get(11)?,
+                        content_hash: row.get(12)?,
+                    },
+                    score: similarity,
+                })
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "Discord chunk vector search failed");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(r) => results.push(r),
+                Err(e) => tracing::debug!(error = %e, "Failed to read discord chunk vector row"),
             }
         }
 
@@ -17155,6 +17409,105 @@ mod tests {
     fn test_save_code_chunk_embeddings_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker.save_code_chunk_embeddings(&[], "test").unwrap();
+    }
+
+    // --- Discord message chunks (vectorlite) ---
+
+    fn sample_discord_chunk(
+        channel_id: &str,
+        start_id: &str,
+    ) -> claudear_core::types::DiscordChunk {
+        claudear_core::types::DiscordChunk {
+            id: None,
+            guild_id: Some("guild1".to_string()),
+            channel_id: channel_id.to_string(),
+            thread_id: None,
+            start_message_id: start_id.to_string(),
+            end_message_id: start_id.to_string(),
+            participant_ids: Some("u1,u2".to_string()),
+            start_message_time: "2024-01-01T00:00:00Z".to_string(),
+            end_message_time: "2024-01-01T00:05:00Z".to_string(),
+            chunk_text: "hello world".to_string(),
+            context_text: "channel general\nhello world".to_string(),
+            content_hash: Some(format!("hash-{}", start_id)),
+        }
+    }
+
+    #[test]
+    fn test_save_discord_chunks_returns_ids() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let chunks = vec![
+            sample_discord_chunk("100", "1001"),
+            sample_discord_chunk("100", "1002"),
+        ];
+        let ids = tracker.save_discord_chunks(&chunks).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn test_save_discord_chunks_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ids = tracker.save_discord_chunks(&[]).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_save_discord_chunk_embeddings_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.save_discord_chunk_embeddings(&[], "test").unwrap();
+    }
+
+    #[test]
+    fn test_search_discord_chunks_empty_embedding() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let results = tracker.search_discord_chunks(&[], None, 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_discord_chunks_zero_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let results = tracker
+            .search_discord_chunks(&[0.1, 0.2, 0.3, 0.4], None, 0)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_save_discord_chunk_embeddings_and_search() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let chunks = vec![
+            sample_discord_chunk("100", "1001"),
+            sample_discord_chunk("200", "2001"),
+        ];
+        let ids = tracker.save_discord_chunks(&chunks).unwrap();
+
+        let emb_a = vec![1.0f32, 0.0, 0.0, 0.0];
+        let emb_b = vec![0.0f32, 1.0, 0.0, 0.0];
+        tracker
+            .save_discord_chunk_embeddings(&[(ids[0], &emb_a), (ids[1], &emb_b)], "test-model")
+            .unwrap();
+
+        // Query nearest to the first chunk. When vectorlite is available the
+        // nearest match (channel "100") comes back; when it is not, search
+        // degrades to empty results — both are valid outcomes.
+        let results = tracker
+            .search_discord_chunks(&[0.9f32, 0.1, 0.0, 0.0], None, 5)
+            .unwrap();
+        if let Some(top) = results.first() {
+            assert_eq!(top.chunk.channel_id, "100");
+            assert_eq!(top.chunk.start_message_id, "1001");
+            assert!(top.score >= results.last().unwrap().score);
+        }
+
+        // The optional channel_id filter must restrict results to that channel.
+        let filtered = tracker
+            .search_discord_chunks(&[0.0f32, 0.9, 0.0, 0.0], Some("200"), 5)
+            .unwrap();
+        for r in &filtered {
+            assert_eq!(r.chunk.channel_id, "200");
+        }
     }
 
     #[test]

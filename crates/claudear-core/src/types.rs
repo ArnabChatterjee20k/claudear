@@ -2551,6 +2551,32 @@ pub struct CodeSearchResult {
     pub score: f64,
 }
 
+/// A range-based Discord message chunk for embedding (a span of consecutive
+/// messages in a channel/thread). Mirrors the `discord_message_chunks` table.
+#[derive(Debug, Clone)]
+pub struct DiscordChunk {
+    pub id: Option<i64>,
+    pub guild_id: Option<String>,
+    pub channel_id: String,
+    pub thread_id: Option<String>,
+    pub start_message_id: String,
+    pub end_message_id: String,
+    /// Author ids participating in the span (storage format is opaque here).
+    pub participant_ids: Option<String>,
+    pub start_message_time: String,
+    pub end_message_time: String,
+    pub chunk_text: String,
+    pub context_text: String,
+    pub content_hash: Option<String>,
+}
+
+/// A Discord chunk search result with similarity score.
+#[derive(Debug, Clone)]
+pub struct DiscordSearchResult {
+    pub chunk: DiscordChunk,
+    pub score: f64,
+}
+
 /// Statistics from a code indexing run.
 #[derive(Debug, Clone, Default)]
 pub struct CodeIndexStats {
