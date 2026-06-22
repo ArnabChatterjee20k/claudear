@@ -30,3 +30,17 @@ CREATE TABLE IF NOT EXISTS discord_message_chunk_metadata (
     value TEXT NOT NULL,
     PRIMARY KEY (key)
 );
+
+CREATE TABLE IF NOT EXISTS discord_channels (
+    channel_id TEXT NOT NULL,
+    guild_id TEXT,
+    parent_id TEXT,                          -- category id (NULL for categories / uncategorised)
+    name TEXT,
+    channel_type INTEGER,                    -- raw Discord channel type (0/5 text, 10/11/12 threads, 4 category)
+    kind INTEGER NOT NULL DEFAULT 0,         -- our classification: 0 = channel, 1 = active thread, 2 = archived thread
+    last_indexed_message_id TEXT,
+    last_indexed_at TEXT,
+    PRIMARY KEY (channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_discord_channels_guild ON discord_channels(guild_id);
+CREATE INDEX IF NOT EXISTS idx_discord_channels_parent ON discord_channels(parent_id);
