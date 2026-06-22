@@ -36,6 +36,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "support_reply_ratings",
         sql: include_str!("../../../migrations/V4__support_reply_ratings.sql"),
     },
+    Migration {
+        version: 5,
+        name: "support_discord_knowledgebase",
+        sql: include_str!("../../../migrations/V5__support_discord_knowledgebase.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
