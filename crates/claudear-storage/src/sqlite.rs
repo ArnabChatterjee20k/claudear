@@ -8559,6 +8559,26 @@ impl SqliteTracker {
         Ok(results)
     }
 
+    /// Returns true when a chunk with this `(channel_id, content_hash)` already
+    /// exists and every matching chunk already has an embedding — used to skip
+    /// re-embedding unchanged content.
+    pub fn discord_chunk_hash_matches(&self, channel_id: &str, content_hash: &str) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let (chunk_count, embedded_count): (i64, i64) = conn.query_row(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM discord_message_chunks
+                 WHERE channel_id = ?1 AND content_hash = ?2),
+                (SELECT COUNT(*) FROM discord_message_chunks c
+                 JOIN discord_message_chunk_embeddings e ON e.chunk_id = c.id
+                 WHERE c.channel_id = ?1 AND c.content_hash = ?2)
+            "#,
+            params![channel_id, content_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(chunk_count > 0 && chunk_count == embedded_count)
+    }
+
     /// Find code symbols by name (substring match).
     pub fn find_code_symbols(
         &self,
