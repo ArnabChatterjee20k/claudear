@@ -1090,3 +1090,16 @@ https_port = 443
 
 # HTTP port for HTTP→HTTPS redirect (default: 80, set to 0 to disable)
 http_redirect_port = 80
+
+[knowledgebases.discord]
+enabled=false
+bot_token = ""
+guild_id = ""
+# final channels = channels from categories - ignore_channels from the categories
+categories = []
+ignore_channels = []
+# 0 means full history
+# in days
+backfill_days = 0
+# How often (in hours) to pull and re-index all repositories (default: 6.0, 0 = disable)
+reindex_interval_hours = 6.0

@@ -412,6 +412,9 @@ pub struct Config {
     /// RAG-grounded question answering configuration.
     #[serde(default)]
     pub qa: QaConfig,
+    /// knowledgebase configuration
+    #[serde(default)]
+    pub knowledgebase: KnowledgebasesConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
@@ -602,6 +605,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             embedding: EmbeddingModelConfig::default(),
             qa: QaConfig::default(),
+            knowledgebase: KnowledgebasesConfig::default(),
         }
     }
 }
@@ -1887,6 +1891,23 @@ impl Default for RegressionConfig {
             package_names: std::collections::HashMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KnowledgebasesConfig {
+    pub discord: Option<DiscordKnowledgebaseConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscordKnowledgebaseConfig {
+    pub enabled: bool,
+    pub bot_token: Option<SecretValue>,
+    pub categories: Vec<String>,
+    pub ignore_channels: Vec<String>,
+    pub backfill_days: Option<u64>,
+    pub reindex_interval_hours: f64,
 }
 
 impl Config {
