@@ -1316,7 +1316,7 @@ pub trait RepoStore: Send + Sync {
 }
 
 pub trait DiscordStore: Send + Sync {
-    /// Batch-save chunks
+    /// Batch-save range-based message chunks. Returns the assigned row ids.
     fn save_discord_chunks(
         &self,
         _chunks: &[claudear_core::types::DiscordMessageChunk],
@@ -1324,7 +1324,7 @@ pub trait DiscordStore: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// Save embeddings for code chunks.
+    /// Save embeddings for message chunks and insert them into the HNSW index.
     fn save_discord_chunk_embeddings(
         &self,
         _pairs: &[(i64, &[f32])],
@@ -1333,54 +1333,86 @@ pub trait DiscordStore: Send + Sync {
         Ok(())
     }
 
-    /// Search chunks by vector similarity.
+    /// Search message chunks by vector similarity, optionally scoped to one channel.
     fn search_discord_message_chunks(
         &self,
         _query_embedding: &[f32],
-        _channel_id: Option<i64>,
+        _channel_id: Option<&str>,
         _limit: usize,
     ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
         Ok(Vec::new())
     }
 
-    fn discord_chunk_hash_matches(&self, _channel_id: i64, _content_hash: &str) -> Result<bool> {
+    fn discord_chunk_hash_matches(&self, _channel_id: &str, _content_hash: &str) -> Result<bool> {
         Ok(false)
     }
 
+    /// Delete all chunks (and CASCADE-deleted embeddings) for a channel/thread.
     fn delete_discord_message_data_for_channel(&self, _channel_id: &str) -> Result<()> {
         Ok(())
     }
 
-    /// Delete code chunks by IDs.
+    /// Delete message chunks (and CASCADE-deleted embeddings) by chunk id.
     fn delete_discord_message_chunks_by_ids(&self, _chunk_ids: &[i64]) -> Result<()> {
         Ok(())
     }
 
-    fn cleanup_stale_discord_message_data(&self, _channel_id: &str) -> Result<()> {
-        Ok(())
-    }
-
-    fn get_discord_message_index_meta(&self, _channel_id: &str) -> Result<Option<String>> {
-        Ok(None)
-    }
-
-    fn set_discrod_message_index_meta(
+    /// Drop chunks for a channel whose `content_hash` is no longer in
+    /// `current_hashes` (messages edited/deleted since last index).
+    fn cleanup_stale_discord_message_data(
         &self,
         _channel_id: &str,
-        _key: &str,
-        _value: &str,
+        _current_hashes: &[String],
     ) -> Result<()> {
         Ok(())
     }
 
-    /// Get the embedding model name used for a repo's code chunks.
-    /// Returns `None` if no embeddings exist for the repo.
-    fn get_code_embedding_model(&self, _channel_id: &str) -> Result<Option<String>> {
+    /// Delete all Discord chunks/embeddings across every channel (full reset).
+    fn delete_all_discord_message_data(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Embedding model name used for the stored Discord chunks (None if none yet).
+    fn get_discord_message_embedding_model(&self) -> Result<Option<String>> {
         Ok(None)
     }
 
-    /// Delete all code data (symbols, chunks, embeddings) for a repo.
-    fn delete_all_discord_message_data_for_channel(&self, _channel_id: &str) -> Result<()> {
+    /// Get a global value from the discord_message_chunk_metadata table.
+    fn get_discord_message_index_meta(&self, _key: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Set (upsert) a global value in the discord_message_chunk_metadata table.
+    fn set_discord_message_index_meta(&self, _key: &str, _value: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Register or refresh a discovered channel/thread (cursor left untouched).
+    fn upsert_discord_channel(
+        &self,
+        _channel_id: &str,
+        _guild_id: Option<&str>,
+        _parent_id: Option<&str>,
+        _name: Option<&str>,
+        _channel_type: Option<i64>,
+        _kind: claudear_core::types::DiscordChannelKind,
+        _archived: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Incremental cursor for a channel/thread (None => never indexed, backfill).
+    fn get_discord_channel_cursor(&self, _channel_id: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Advance the incremental cursor for a channel/thread.
+    fn set_discord_channel_cursor(
+        &self,
+        _channel_id: &str,
+        _last_message_id: &str,
+        _indexed_at: &str,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -1591,6 +1623,7 @@ pub trait FixAttemptTracker:
     + UserStore
     + RegressionStore
     + ChatStore
+    + DiscordStore
 {
 }
 
@@ -1607,6 +1640,7 @@ impl<T> FixAttemptTracker for T where
         + UserStore
         + RegressionStore
         + ChatStore
+        + DiscordStore
 {
 }
 
@@ -1696,6 +1730,7 @@ impl RepoStore for NoopTracker {}
 impl UserStore for NoopTracker {}
 impl RegressionStore for NoopTracker {}
 impl ChatStore for NoopTracker {}
+impl DiscordStore for NoopTracker {}
 
 #[cfg(test)]
 mod tests {
@@ -1879,6 +1914,7 @@ mod tests {
         impl UserStore for FullTracker {}
         impl RegressionStore for FullTracker {}
         impl ChatStore for FullTracker {}
+        impl DiscordStore for FullTracker {}
 
         #[test]
         fn test_blanket_impl_auto_satisfies_fix_attempt_tracker() {

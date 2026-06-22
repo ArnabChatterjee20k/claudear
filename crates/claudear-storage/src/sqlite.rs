@@ -7,8 +7,8 @@ use super::types::{
 };
 use super::{
     is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
-    EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
-    SimilarityStore, UserStore, WebhookStore,
+    DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
+    RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
 };
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
@@ -23,6 +23,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::channel;
 use std::sync::Mutex;
 
 const DEFAULT_LOG_DIR: &str = "./logs";
@@ -4297,6 +4298,103 @@ impl SimilarityStore for SqliteTracker {
     }
 }
 
+impl DiscordStore for SqliteTracker {
+    fn save_discord_chunks(
+        &self,
+        chunks: &[claudear_core::types::DiscordMessageChunk],
+    ) -> Result<Vec<i64>> {
+        SqliteTracker::save_discord_chunks(self, chunks)
+    }
+
+    fn save_discord_chunk_embeddings(
+        &self,
+        pairs: &[(i64, &[f32])],
+        model_name: &str,
+    ) -> Result<()> {
+        SqliteTracker::save_discord_chunk_embeddings(self, pairs, model_name)
+    }
+
+    fn search_discord_message_chunks(
+        &self,
+        query_embedding: &[f32],
+        channel_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
+        SqliteTracker::search_discord_message_chunks(self, query_embedding, channel_id, limit)
+    }
+
+    fn discord_chunk_hash_matches(&self, channel_id: &str, content_hash: &str) -> Result<bool> {
+        SqliteTracker::discord_chunk_hash_matches(self, channel_id, content_hash)
+    }
+
+    fn delete_discord_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
+        SqliteTracker::delete_discord_message_data_for_channel(self, channel_id)
+    }
+
+    fn delete_discord_message_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
+        SqliteTracker::delete_discord_message_chunks_by_ids(self, chunk_ids)
+    }
+
+    fn cleanup_stale_discord_message_data(
+        &self,
+        channel_id: &str,
+        current_hashes: &[String],
+    ) -> Result<()> {
+        SqliteTracker::cleanup_stale_discord_message_data(self, channel_id, current_hashes)
+    }
+
+    fn delete_all_discord_message_data(&self) -> Result<()> {
+        SqliteTracker::delete_all_discord_message_data(self)
+    }
+
+    fn get_discord_message_embedding_model(&self) -> Result<Option<String>> {
+        SqliteTracker::get_discord_message_embedding_model(self)
+    }
+
+    fn get_discord_message_index_meta(&self, key: &str) -> Result<Option<String>> {
+        SqliteTracker::get_discord_message_index_meta(self, key)
+    }
+
+    fn set_discord_message_index_meta(&self, key: &str, value: &str) -> Result<()> {
+        SqliteTracker::set_discord_message_index_meta(self, key, value)
+    }
+
+    fn upsert_discord_channel(
+        &self,
+        channel_id: &str,
+        guild_id: Option<&str>,
+        parent_id: Option<&str>,
+        name: Option<&str>,
+        channel_type: Option<i64>,
+        kind: claudear_core::types::DiscordChannelKind,
+        archived: bool,
+    ) -> Result<()> {
+        SqliteTracker::upsert_discord_channel(
+            self,
+            channel_id,
+            guild_id,
+            parent_id,
+            name,
+            channel_type,
+            kind,
+            archived,
+        )
+    }
+
+    fn get_discord_channel_cursor(&self, channel_id: &str) -> Result<Option<String>> {
+        SqliteTracker::get_discord_channel_cursor(self, channel_id)
+    }
+
+    fn set_discord_channel_cursor(
+        &self,
+        channel_id: &str,
+        last_message_id: &str,
+        indexed_at: &str,
+    ) -> Result<()> {
+        SqliteTracker::set_discord_channel_cursor(self, channel_id, last_message_id, indexed_at)
+    }
+}
+
 impl SqliteTracker {
     /// Record an activity to the activity log.
     /// Persist a single action-pipeline run.
@@ -8559,9 +8657,6 @@ impl SqliteTracker {
         Ok(results)
     }
 
-    /// Returns true when a chunk with this `(channel_id, content_hash)` already
-    /// exists and every matching chunk already has an embedding — used to skip
-    /// re-embedding unchanged content.
     pub fn discord_chunk_hash_matches(&self, channel_id: &str, content_hash: &str) -> Result<bool> {
         let conn = self.acquire_lock()?;
         let (chunk_count, embedded_count): (i64, i64) = conn.query_row(
@@ -8577,6 +8672,207 @@ impl SqliteTracker {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok(chunk_count > 0 && chunk_count == embedded_count)
+    }
+
+    /// Delete all indexed chunks (and CASCADE-deleted embeddings) for a channel/thread.
+    pub fn delete_discord_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+
+        // embeddings will be deleted via the cascade delete
+        conn.execute(
+            "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete Discord message chunks (and their CASCADE-deleted embeddings) by chunk IDs.
+    pub fn delete_discord_message_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
+        if chunk_ids.is_empty() {
+            return Ok(());
+        };
+        let conn = self.acquire_lock()?;
+        let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "DELETE FROM discord_message_chunks WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        // embeddings will be deleted via the cascade delete
+        conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    /// Remove indexed chunks for a channel whose `content_hash` is no longer in current_hashes
+    pub fn cleanup_stale_discord_message_data(
+        &self,
+        channel_id: &str,
+        current_hashes: &[String],
+    ) -> Result<()> {
+        let mut conn = self.acquire_lock()?;
+
+        if current_hashes.is_empty() {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+
+        let indexed: Vec<(i64, Option<String>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
+            )?;
+            let rows: Vec<(i64, Option<String>)> = stmt
+                .query_map(params![channel_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+
+        let current_set: std::collections::HashSet<&str> =
+            current_hashes.iter().map(|s| s.as_str()).collect();
+
+        let stale_ids: Vec<i64> = indexed
+            .into_iter()
+            .filter_map(|(id, hash)| match hash {
+                Some(h) if !current_set.contains(h.as_str()) => Some(id),
+                _ => None,
+            })
+            .collect();
+
+        if !stale_ids.is_empty() {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for id in &stale_ids {
+                tx.execute(
+                    "DELETE FROM discord_message_chunks WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_all_discord_message_data(&self) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        // Embeddings CASCADE via the discord_message_chunks FK.
+        conn.execute("DELETE FROM discord_message_chunks", [])?;
+        Ok(())
+    }
+
+    /// Embedding model name used for the stored Discord chunks (None if none yet).
+    pub fn get_discord_message_embedding_model(&self) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT embedding_model FROM discord_message_chunk_embeddings LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn get_discord_message_index_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT value FROM discord_message_chunk_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Set (upsert) a global value in the discord_message_chunk_metadata table.
+    pub fn set_discord_message_index_meta(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO discord_message_chunk_metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Register or refresh a discovered channel/thread in the `discord_channels`
+    /// registry. Leaves the incremental cursor (`last_indexed_*`) untouched.
+    pub fn upsert_discord_channel(
+        &self,
+        channel_id: &str,
+        guild_id: Option<&str>,
+        parent_id: Option<&str>,
+        name: Option<&str>,
+        channel_type: Option<i64>,
+        kind: claudear_core::types::DiscordChannelKind,
+        archived: bool,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO discord_channels (channel_id, guild_id, parent_id, name, channel_type, kind, archived)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                guild_id = excluded.guild_id,
+                parent_id = excluded.parent_id,
+                name = excluded.name,
+                channel_type = excluded.channel_type,
+                kind = excluded.kind,
+                archived = excluded.archived
+            "#,
+            params![
+                channel_id,
+                guild_id,
+                parent_id,
+                name,
+                channel_type,
+                kind.as_i64(),
+                archived as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Incremental cursor for a channel/thread: the last message id indexed.
+    /// `None` means the channel has never been indexed (do a backfill).
+    pub fn get_discord_channel_cursor(&self, channel_id: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<Option<String>> = conn
+            .query_row(
+                "SELECT last_indexed_message_id FROM discord_channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(result.flatten())
+    }
+
+    /// Advance the incremental cursor for a channel/thread to `last_message_id`.
+    pub fn set_discord_channel_cursor(
+        &self,
+        channel_id: &str,
+        last_message_id: &str,
+        indexed_at: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO discord_channels (channel_id, last_indexed_message_id, last_indexed_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                last_indexed_message_id = excluded.last_indexed_message_id,
+                last_indexed_at = excluded.last_indexed_at
+            "#,
+            params![channel_id, last_message_id, indexed_at],
+        )?;
+        Ok(())
     }
 
     /// Find code symbols by name (substring match).
