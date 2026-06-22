@@ -1910,8 +1910,12 @@ Reported issue:
 Title: {title}
 {body}
 
+When `reproduced=true`, also explain WHY it's a problem, the root cause you
+traced, and a proposed fix direction (do NOT apply it). Leave those fields as
+empty strings when `reproduced=false`.
+
 Respond with ONLY a single JSON object on its own, no prose:
-{{"reproduced": true|false, "summary": "<one sentence verdict>", "evidence": "<files/line refs and the code path that confirms or refutes the report>"}}"#,
+{{"reproduced": true|false, "summary": "<one sentence verdict>", "impact": "<user-facing impact / why it's an issue>", "root_cause": "<the underlying cause in the code>", "suggested_fix": "<proposed fix direction>", "evidence": "<files/line refs and the code path that confirms or refutes the report>"}}"#,
         source = issue.source,
         context = context,
         title = issue.title,
@@ -2029,6 +2033,9 @@ fn parse_verify_result(output: &str) -> VerifyResult {
         } else {
             "Could not parse a verdict; treated as not reproduced".to_string()
         },
+        impact: String::new(),
+        root_cause: String::new(),
+        suggested_fix: String::new(),
         evidence: trimmed.chars().take(2000).collect(),
     }
 }
