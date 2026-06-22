@@ -305,6 +305,37 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         Ok(messages)
     }
 
+    /// List messages from a channel before a given message ID (for incremental polling during indexing).
+    /// Messages are returned in ascending order (oldest first).
+    pub async fn list_channel_messages_before(
+        &self,
+        channel_id: &str,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscordMessage>> {
+        let clamped_limit = limit.clamp(1, 100);
+        let url = format!(
+            "{}/channels/{}/messages?before={}&limit={}",
+            DISCORD_API_BASE, channel_id, before, clamped_limit
+        );
+        let response = self.http.get(&url).await?;
+
+        if !response.is_success() {
+            return Err(Error::notifier(
+                "discord",
+                format!(
+                    "Failed to list channel messages ({}): {}",
+                    response.status, response.body
+                ),
+            ));
+        }
+
+        // Discord returns messages newest-first; reverse to get chronological order
+        let mut messages: Vec<DiscordMessage> = response.json()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// Add a reaction emoji to a message.
     pub async fn add_reaction(
         &self,
@@ -373,8 +404,29 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
     }
 
     /// List active threads in a channel.
-    pub async fn list_active_threads(&self, guild_id: &str) -> Result<Vec<DiscordThread>> {
-        let url = format!("{}/guilds/{}/threads/active", DISCORD_API_BASE, guild_id);
+    pub async fn list_active_threads(
+        &self,
+        guild_id: &str,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<Vec<DiscordThread>> {
+        let mut url = format!("{}/guilds/{}/threads/active", DISCORD_API_BASE, guild_id);
+
+        let mut query = Vec::new();
+
+        if let Some(before) = before {
+            query.push(format!("before={}", before));
+        }
+
+        if let Some(after) = after {
+            query.push(format!("after={}", after));
+        }
+
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query.join("&"));
+        }
+
         let response = self.http.get(&url).await?;
 
         if !response.is_success() {
@@ -394,6 +446,25 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
 
         let threads_response: ThreadsResponse = response.json()?;
         Ok(threads_response.threads)
+    }
+
+    pub async fn list_guild_channels(&self, guild_id: &str) -> Result<Vec<DiscordChannel>> {
+        let url = format!("{}/guilds/{}/channels", DISCORD_API_BASE, guild_id);
+        let response = self.http.get(&url).await?;
+
+        if !response.is_success() {
+            return Err(Error::notifier(
+                "discord",
+                format!(
+                    "Failed to list channels ({}): {}",
+                    response.status, response.body
+                ),
+            ));
+        }
+
+        // TODO: store these in the db as well so that we dont have to fetch everything
+        let channels_response: Vec<DiscordChannel> = response.json()?;
+        Ok(channels_response)
     }
 }
 
@@ -857,7 +928,10 @@ mod tests {
         );
 
         let client = DiscordClient::with_http_client("token", mock).unwrap();
-        let threads = client.list_active_threads("guild1").await.unwrap();
+        let threads = client
+            .list_active_threads("guild1", None, None)
+            .await
+            .unwrap();
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].id, "456");
     }
@@ -872,7 +946,7 @@ mod tests {
         );
 
         let client = DiscordClient::with_http_client("token", mock).unwrap();
-        let result = client.list_active_threads("guild1").await;
+        let result = client.list_active_threads("guild1", None, None).await;
         assert!(result.is_err());
     }
 
@@ -886,7 +960,10 @@ mod tests {
         );
 
         let client = DiscordClient::with_http_client("token", mock).unwrap();
-        let threads = client.list_active_threads("guild1").await.unwrap();
+        let threads = client
+            .list_active_threads("guild1", None, None)
+            .await
+            .unwrap();
         assert!(threads.is_empty());
     }
 
@@ -922,6 +999,97 @@ mod tests {
         let params = CreateMessageParams::text("Hello");
         assert_eq!(params.content, "Hello".to_string());
         assert!(params.embeds.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_channel_messages_before_success() {
+        let mock = MockDiscordClient::new();
+        let msg1 = r#"{"id": "1001", "channel_id": "123", "content": "First", "timestamp": "2024-01-01T00:01:00Z", "author": {"id": "222", "username": "user1"}}"#;
+        let msg2 = r#"{"id": "1002", "channel_id": "123", "content": "Second", "timestamp": "2024-01-01T00:02:00Z", "author": {"id": "222", "username": "user1"}}"#;
+        // Discord API returns newest first
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/messages?before=2000&limit=50",
+            200,
+            format!("[{}, {}]", msg2, msg1),
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let messages = client
+            .list_channel_messages_before("123", "2000", 50)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        // Should be reversed to chronological order
+        assert_eq!(messages[0].id, "1001");
+        assert_eq!(messages[1].id, "1002");
+    }
+
+    #[tokio::test]
+    async fn test_list_channel_messages_before_error() {
+        let mock = MockDiscordClient::new();
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/messages?before=2000&limit=50",
+            403,
+            "Forbidden",
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let result = client.list_channel_messages_before("123", "2000", 50).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_guild_channels_success() {
+        let mock = MockDiscordClient::new();
+        let chan = r#"{"id": "100", "type": 0, "guild_id": "guild1", "name": "general", "parent_id": "900"}"#;
+        let category = r#"{"id": "900", "type": 4, "guild_id": "guild1", "name": "Text Channels", "parent_id": null}"#;
+        mock.mock_get(
+            "https://discord.com/api/v10/guilds/guild1/channels",
+            200,
+            format!("[{}, {}]", chan, category),
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let channels = client.list_guild_channels("guild1").await.unwrap();
+        assert_eq!(channels.len(), 2);
+        assert_eq!(channels[0].id, "100");
+        assert_eq!(channels[0].channel_type, 0);
+        assert_eq!(channels[0].parent_id.as_deref(), Some("900"));
+        assert_eq!(channels[1].id, "900");
+        assert_eq!(channels[1].channel_type, 4);
+        assert_eq!(channels[1].parent_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_list_guild_channels_empty() {
+        let mock = MockDiscordClient::new();
+        mock.mock_get(
+            "https://discord.com/api/v10/guilds/guild1/channels",
+            200,
+            "[]",
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let channels = client.list_guild_channels("guild1").await.unwrap();
+        assert!(channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_guild_channels_error() {
+        let mock = MockDiscordClient::new();
+        mock.mock_get(
+            "https://discord.com/api/v10/guilds/guild1/channels",
+            403,
+            "Forbidden",
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let result = client.list_guild_channels("guild1").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Failed to list channels"));
     }
 
     #[test]

@@ -526,6 +526,50 @@ impl ReplyKind {
     }
 }
 
+/// Classification of a Discord entity tracked in the `discord_channels` table.
+/// The integer values mirror Discord's own `channel_type` codes
+/// for easy cross-reference against the raw `channel_type` column: `Channel` = 0
+/// (GUILD_TEXT), `Category` = 4 (GUILD_CATEGORY), `Thread` = 11 (PUBLIC_THREAD,
+/// the representative thread type). Whether a thread is archived is tracked
+/// separately by the `discord_channels.archived` flag, not by this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordChannelKind {
+    /// A regular text/forum channel (Discord type 0).
+    Channel,
+    /// A thread (Discord thread type 10/11/12). Archived state is a separate flag.
+    Thread,
+    /// A category (Discord type 4) — groups channels; not indexable itself, but
+    /// tracked so `categories` config selections can be resolved.
+    Category,
+}
+
+impl DiscordChannelKind {
+    /// Integer value persisted in the `discord_channels.kind` column. Mirrors
+    /// Discord `channel_type` codes (see type docs).
+    pub fn as_i64(&self) -> i64 {
+        match self {
+            DiscordChannelKind::Channel => 0,
+            DiscordChannelKind::Category => 4,
+            DiscordChannelKind::Thread => 11,
+        }
+    }
+
+    /// Parse from the persisted integer; unknown values fall back to `Channel`.
+    pub fn from_i64(value: i64) -> Self {
+        match value {
+            4 => DiscordChannelKind::Category,
+            11 => DiscordChannelKind::Thread,
+            _ => DiscordChannelKind::Channel,
+        }
+    }
+
+    /// Whether this entity is a thread rather than a channel or category.
+    pub fn is_thread(&self) -> bool {
+        matches!(self, DiscordChannelKind::Thread)
+    }
+}
+
 /// Outcome of a `Verify` action: whether the agent reproduced the reported issue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyResult {

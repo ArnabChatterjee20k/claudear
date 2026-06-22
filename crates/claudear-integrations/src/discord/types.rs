@@ -1,5 +1,6 @@
 //! Discord API types for thread management.
 
+use claudear_core::types::DiscordChannelKind;
 use serde::{Deserialize, Serialize};
 
 /// A Discord user.
@@ -35,6 +36,20 @@ pub struct DiscordChannel {
     pub parent_id: Option<String>,
 }
 
+impl DiscordChannel {
+    /// Classify this channel for the `discord_channels` registry by its raw
+    /// Discord `channel_type`: type 4 is a `Category`; thread types (10
+    /// announcement, 11 public, 12 private) map to `Thread`; everything else is
+    /// a `Channel`. Archived state is tracked separately, not by `kind`.
+    pub fn kind(&self) -> DiscordChannelKind {
+        match self.channel_type {
+            4 => DiscordChannelKind::Category,
+            10 | 11 | 12 => DiscordChannelKind::Thread,
+            _ => DiscordChannelKind::Channel,
+        }
+    }
+}
+
 /// A Discord thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordThread {
@@ -67,6 +82,13 @@ impl DiscordThread {
     /// Check if the thread is still active (not archived or locked).
     pub fn is_active(&self) -> bool {
         !self.archived && !self.locked
+    }
+
+    /// Classify this thread for the `discord_channels` registry. A thread always
+    /// has `kind = Thread`; its archived state is carried by the `archived`
+    /// field (persisted to the `discord_channels.archived` flag), not by `kind`.
+    pub fn kind(&self) -> DiscordChannelKind {
+        DiscordChannelKind::Thread
     }
 }
 
