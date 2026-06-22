@@ -23,7 +23,6 @@ use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::channel;
 use std::sync::Mutex;
 
 const DEFAULT_LOG_DIR: &str = "./logs";
