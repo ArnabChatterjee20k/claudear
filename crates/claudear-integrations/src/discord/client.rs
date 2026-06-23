@@ -466,6 +466,53 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         let channels_response: Vec<DiscordChannel> = response.json()?;
         Ok(channels_response)
     }
+
+    /// List public archived threads under a channel (for knowledge indexing of
+    /// past conversations). Mirrors `list_active_threads`'s `{ "threads": [...] }`
+    /// response shape; supports `before` (ISO8601 timestamp) / `limit` paging.
+    pub async fn list_public_archived_threads(
+        &self,
+        channel_id: &str,
+        before: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<DiscordThread>> {
+        let mut url = format!(
+            "{}/channels/{}/threads/archived/public",
+            DISCORD_API_BASE, channel_id
+        );
+
+        let mut query = Vec::new();
+        if let Some(before) = before {
+            query.push(format!("before={}", before));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={}", limit.clamp(1, 100)));
+        }
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query.join("&"));
+        }
+
+        let response = self.http.get(&url).await?;
+
+        if !response.is_success() {
+            return Err(Error::notifier(
+                "discord",
+                format!(
+                    "Failed to list archived threads ({}): {}",
+                    response.status, response.body
+                ),
+            ));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ThreadsResponse {
+            threads: Vec<DiscordThread>,
+        }
+
+        let threads_response: ThreadsResponse = response.json()?;
+        Ok(threads_response.threads)
+    }
 }
 
 /// Mock HTTP client for testing (only available in tests).
@@ -965,6 +1012,56 @@ mod tests {
             .await
             .unwrap();
         assert!(threads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_public_archived_threads_success() {
+        let mock = MockDiscordClient::new();
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/threads/archived/public",
+            200,
+            r#"{"threads": [{"id": "456", "type": 11, "name": "old-thread", "parent_id": "123", "owner_id": "789", "archived": true}]}"#,
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let threads = client
+            .list_public_archived_threads("123", None, None)
+            .await
+            .unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, "456");
+        assert!(threads[0].archived);
+    }
+
+    #[tokio::test]
+    async fn test_list_public_archived_threads_paged_query() {
+        let mock = MockDiscordClient::new();
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/threads/archived/public?before=2024-01-01T00:00:00Z&limit=50",
+            200,
+            r#"{"threads": []}"#,
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let threads = client
+            .list_public_archived_threads("123", Some("2024-01-01T00:00:00Z"), Some(50))
+            .await
+            .unwrap();
+        assert!(threads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_public_archived_threads_error() {
+        let mock = MockDiscordClient::new();
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/threads/archived/public",
+            403,
+            "Forbidden",
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let result = client.list_public_archived_threads("123", None, None).await;
+        assert!(result.is_err());
     }
 
     #[test]

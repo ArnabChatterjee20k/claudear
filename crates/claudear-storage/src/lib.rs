@@ -1416,6 +1416,24 @@ pub trait DiscordStore: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Backfill state `(backfill_complete, backfill_cursor)` for a channel/thread.
+    /// Defaults to `(false, None)` when backfill has not started.
+    fn get_discord_channel_backfill(&self, _channel_id: &str) -> Result<(bool, Option<String>)> {
+        Ok((false, None))
+    }
+
+    /// Record backfill progress: whether full history is scraped (`complete`)
+    /// and the oldest indexed id (`backfill_cursor`).
+    fn set_discord_channel_backfill(
+        &self,
+        _channel_id: &str,
+        _complete: bool,
+        _backfill_cursor: Option<&str>,
+        _indexed_at: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// User management, sessions, channels, regression, experiments, diagnostics,

@@ -703,6 +703,8 @@ struct WatcherDeps {
     review_watcher: Option<Arc<ReviewWatcher>>,
     issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     code_search_service: Option<Arc<claudear::repo::code_index::CodeSearchService>>,
+    discord_search_service: Option<Arc<claudear::knowledgebase::DiscordSearchService>>,
+    discord_index_orchestrator: Option<Arc<claudear::discord_index::DiscordIndexOrchestrator>>,
     agent: Arc<dyn AgentRunner>,
     classification_agent: Option<Arc<dyn AgentRunner>>,
     llm_engine: Option<Arc<claudear::chat::llm::LlmEngine>>,
@@ -781,6 +783,52 @@ async fn build_watcher_deps(
         })
     } else {
         None
+    };
+
+    // Discord knowledge source: search service (read side) + index orchestrator
+    // (write side). Bot token falls back to the merged notifier/issue Discord
+    // config; the guild id comes from there (the knowledgebase config has none).
+    let (discord_search_service, discord_index_orchestrator) = {
+        let kb = config.knowledgebase.discord.as_ref();
+        if kb.map(|d| d.enabled).unwrap_or(false) {
+            let merged = config.discord_merged();
+            let bot_token = kb
+                .and_then(|d| d.bot_token.as_ref())
+                .or(merged.bot_token.as_ref())
+                .map(|s| s.expose().to_string());
+            let guild_id = merged.guild_id.clone();
+
+            match (embedding_client.as_ref(), bot_token, guild_id) {
+                (Some(emb), Some(token), Some(guild)) => {
+                    let search = Arc::new(claudear::knowledgebase::DiscordSearchService::new(
+                        tracker.clone(),
+                        emb.clone(),
+                    ));
+                    let indexer = Arc::new(claudear::knowledgebase::DiscordIndexer::new(
+                        tracker.clone(),
+                        emb.clone(),
+                    ));
+                    let orchestrator = claudear::discord_index::DiscordIndexOrchestrator::new(
+                        &token,
+                        guild,
+                        indexer,
+                        tracker.clone(),
+                    )
+                    .map(Arc::new)
+                    .ok();
+                    (Some(search), orchestrator)
+                }
+                _ => {
+                    tracing::warn!(
+                        "Discord knowledgebase enabled but missing embedding client, \
+                         bot_token, or guild_id; skipping"
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        }
     };
 
     // Generic SCM provider for PR merge detection (GitLab, etc.)
@@ -970,6 +1018,8 @@ async fn build_watcher_deps(
         review_watcher,
         issue_embedding_service,
         code_search_service,
+        discord_search_service,
+        discord_index_orchestrator,
         agent,
         classification_agent,
         llm_engine,
@@ -3236,6 +3286,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             review_watcher: deps.review_watcher.clone(),
             issue_embedding_service: deps.issue_embedding_service.clone(),
             code_search_service: deps.code_search_service.clone(),
+            discord_search_service: deps.discord_search_service.clone(),
+            discord_index_orchestrator: deps.discord_index_orchestrator.clone(),
             relationships: deps.relationships,
             github_client: deps.github_client,
             scm_provider: deps.scm_provider,
@@ -3364,6 +3416,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let review_watcher_clone = deps.review_watcher.clone();
         let issue_embedding_service_clone = deps.issue_embedding_service.clone();
         let code_search_service_clone = deps.code_search_service.clone();
+        let discord_search_service_clone = deps.discord_search_service.clone();
         let agent_clone = deps.agent.clone();
         let http_future = async move {
             if enable_webhooks {
@@ -3388,6 +3441,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 server.set_embedding_client(embedding_client_clone);
                 server.set_issue_embedding_service(issue_embedding_service_clone);
                 server.set_code_search_service(code_search_service_clone);
+                server.set_discord_search_service(discord_search_service_clone);
                 server.set_review_watcher(review_watcher_clone);
                 if enable_dashboard {
                     server.set_dashboard(std::path::PathBuf::from(config_path.clone()));
@@ -3784,6 +3838,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             review_watcher,
             issue_embedding_service,
             code_search_service,
+            discord_search_service: None,
+            discord_index_orchestrator: None,
             relationships: None,
             github_client: None,
             scm_provider: None,
@@ -3989,6 +4045,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 review_watcher: deps.review_watcher.clone(),
                 issue_embedding_service: deps.issue_embedding_service.clone(),
                 code_search_service: deps.code_search_service.clone(),
+                discord_search_service: deps.discord_search_service.clone(),
+                discord_index_orchestrator: deps.discord_index_orchestrator.clone(),
                 relationships: deps.relationships,
                 github_client: deps.github_client,
                 scm_provider: deps.scm_provider,
@@ -4014,6 +4072,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             server.set_embedding_client(deps.embedding_client.clone());
             server.set_issue_embedding_service(deps.issue_embedding_service);
             server.set_code_search_service(deps.code_search_service);
+            server.set_discord_search_service(deps.discord_search_service);
             server.set_review_watcher(deps.review_watcher);
 
             // Start regression monitoring background task
@@ -4276,6 +4335,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 review_watcher,
                 issue_embedding_service,
                 code_search_service,
+                discord_search_service: None,
+                discord_index_orchestrator: None,
                 relationships: None,
                 github_client: if config.is_github_enabled() {
                     Some(Arc::new(GitHubClient::new(config.github().clone())))

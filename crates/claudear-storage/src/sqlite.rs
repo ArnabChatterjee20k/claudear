@@ -4392,6 +4392,26 @@ impl DiscordStore for SqliteTracker {
     ) -> Result<()> {
         SqliteTracker::set_discord_channel_cursor(self, channel_id, last_message_id, indexed_at)
     }
+
+    fn get_discord_channel_backfill(&self, channel_id: &str) -> Result<(bool, Option<String>)> {
+        SqliteTracker::get_discord_channel_backfill(self, channel_id)
+    }
+
+    fn set_discord_channel_backfill(
+        &self,
+        channel_id: &str,
+        complete: bool,
+        backfill_cursor: Option<&str>,
+        indexed_at: &str,
+    ) -> Result<()> {
+        SqliteTracker::set_discord_channel_backfill(
+            self,
+            channel_id,
+            complete,
+            backfill_cursor,
+            indexed_at,
+        )
+    }
 }
 
 impl SqliteTracker {
@@ -8871,6 +8891,48 @@ impl SqliteTracker {
                 last_indexed_at = excluded.last_indexed_at
             "#,
             params![channel_id, last_message_id, indexed_at],
+        )?;
+        Ok(())
+    }
+
+    /// Backfill state for a channel/thread: `(backfill_complete, backfill_cursor)`.
+    /// Defaults to `(false, None)` when the channel has no row yet — i.e. backfill
+    /// has not started, so it is not complete and there is no progress cursor.
+    pub fn get_discord_channel_backfill(&self, channel_id: &str) -> Result<(bool, Option<String>)> {
+        let conn = self.acquire_lock()?;
+        let result: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT backfill_complete, backfill_cursor FROM discord_channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(result
+            .map(|(complete, cursor)| (complete != 0, cursor))
+            .unwrap_or((false, None)))
+    }
+
+    /// Record backfill progress for a channel/thread: whether the full history is
+    /// now scraped (`complete`) and the oldest indexed id (`backfill_cursor`,
+    /// the point to page *before* on the next backfill step).
+    pub fn set_discord_channel_backfill(
+        &self,
+        channel_id: &str,
+        complete: bool,
+        backfill_cursor: Option<&str>,
+        indexed_at: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO discord_channels (channel_id, backfill_complete, backfill_cursor, last_indexed_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                backfill_complete = excluded.backfill_complete,
+                backfill_cursor = excluded.backfill_cursor,
+                last_indexed_at = excluded.last_indexed_at
+            "#,
+            params![channel_id, complete as i64, backfill_cursor, indexed_at],
         )?;
         Ok(())
     }
@@ -17839,6 +17901,51 @@ mod tests {
         for r in &filtered {
             assert_eq!(r.chunk.channel_id, "200");
         }
+    }
+
+    #[test]
+    fn test_discord_channel_backfill_defaults_when_absent() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // No row yet => not complete, no progress cursor.
+        let (complete, cursor) = tracker.get_discord_channel_backfill("chan-x").unwrap();
+        assert!(!complete);
+        assert_eq!(cursor, None);
+        // Forward cursor also absent.
+        assert_eq!(tracker.get_discord_channel_cursor("chan-x").unwrap(), None);
+    }
+
+    #[test]
+    fn test_discord_channel_backfill_roundtrip() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Mid-backfill: progress recorded, not complete.
+        tracker
+            .set_discord_channel_backfill("c1", false, Some("900"), "2024-01-01T00:00:00Z")
+            .unwrap();
+        let (complete, cursor) = tracker.get_discord_channel_backfill("c1").unwrap();
+        assert!(!complete);
+        assert_eq!(cursor.as_deref(), Some("900"));
+
+        // Forward cursor is independent of backfill progress.
+        tracker
+            .set_discord_channel_cursor("c1", "1000", "2024-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            tracker.get_discord_channel_cursor("c1").unwrap().as_deref(),
+            Some("1000")
+        );
+
+        // Completing backfill flips the flag without disturbing the forward cursor.
+        tracker
+            .set_discord_channel_backfill("c1", true, Some("1"), "2024-01-02T00:00:00Z")
+            .unwrap();
+        let (complete, cursor) = tracker.get_discord_channel_backfill("c1").unwrap();
+        assert!(complete);
+        assert_eq!(cursor.as_deref(), Some("1"));
+        assert_eq!(
+            tracker.get_discord_channel_cursor("c1").unwrap().as_deref(),
+            Some("1000")
+        );
     }
 
     #[test]

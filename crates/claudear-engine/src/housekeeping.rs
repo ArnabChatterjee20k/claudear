@@ -55,6 +55,9 @@ impl HousekeepingWorker {
         let reindex_interval = self.watcher.reindex_interval();
         let mut last_reindex = Instant::now();
 
+        let discord_reindex_interval = self.watcher.discord_reindex_interval();
+        let mut last_discord_reindex = Instant::now();
+
         while self.watcher.is_running() {
             timer.tick().await;
             if !self.watcher.is_running() {
@@ -87,6 +90,14 @@ impl HousekeepingWorker {
                 if last_reindex.elapsed() >= reindex_dur {
                     self.watcher.pull_and_reindex_all_repos().await;
                     last_reindex = Instant::now();
+                }
+            }
+
+            // Periodically re-index the Discord knowledge source
+            if let Some(discord_dur) = discord_reindex_interval {
+                if last_discord_reindex.elapsed() >= discord_dur {
+                    self.watcher.reindex_discord_knowledgebase().await;
+                    last_discord_reindex = Instant::now();
                 }
             }
 

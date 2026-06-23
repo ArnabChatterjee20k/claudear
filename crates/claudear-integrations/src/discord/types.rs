@@ -44,7 +44,7 @@ impl DiscordChannel {
     pub fn kind(&self) -> DiscordChannelKind {
         match self.channel_type {
             4 => DiscordChannelKind::Category,
-            10 | 11 | 12 => DiscordChannelKind::Thread,
+            10..=12 => DiscordChannelKind::Thread,
             _ => DiscordChannelKind::Channel,
         }
     }
