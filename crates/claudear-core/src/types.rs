@@ -2604,6 +2604,38 @@ impl std::fmt::Display for CodeIndexStats {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DiscordIndexStats {
+    pub messages_processed: usize,
+    pub messages_skipped: usize,
+    pub messages_failed: usize,
+
+    pub channels_processed: usize,
+    pub channels_skipped: usize,
+    pub channels_failed: usize,
+
+    pub threads_processed: usize,
+    pub threads_skipped: usize,
+    pub threads_failed: usize,
+}
+
+impl std::fmt::Display for DiscordIndexStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "messages(processed={}, skipped={}, failed={}), channels(processed={}, skipped={}, failed={}), threads(processed={}, skipped={}, failed={})",
+            self.messages_processed,
+            self.messages_skipped,
+            self.messages_failed,
+            self.channels_processed,
+            self.channels_skipped,
+            self.channels_failed,
+            self.threads_processed,
+            self.threads_skipped,
+            self.threads_failed,
+        )
+    }
+}
 /// Complexity metrics for a single function.
 #[derive(Debug, Clone, Default)]
 pub struct FunctionComplexity {
