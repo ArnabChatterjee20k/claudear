@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use claudear_core::error::Result;
-use claudear_core::types::FixAttemptStatus;
+use claudear_core::types::{FixAttemptStatus, Issue};
 use claudear_storage::FixAttemptTracker;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -17,6 +17,79 @@ pub struct RecurringIssue {
     pub count: usize,
     /// Sources where this pattern appears
     pub sources: Vec<String>,
+}
+
+/// A single repetitive, non-actionable Sentry issue in the weekly digest.
+///
+/// These are issues the agent gave up on (`FixAttemptStatus::CannotFix`) that
+/// are still firing frequently in Sentry — i.e. recurring operational noise a
+/// human needs to look at because the agent cannot produce a code fix.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepetitiveEntry {
+    /// Source issue id (Sentry fingerprint).
+    pub issue_id: String,
+    /// Human-readable id (e.g. "SENTRY-ABC").
+    pub short_id: String,
+    /// Issue title.
+    pub title: String,
+    /// URL to view the issue in Sentry.
+    pub url: String,
+    /// Current Sentry event count (recurrence signal).
+    pub event_count: i64,
+    /// Whether Sentry currently flags the issue as escalating.
+    pub is_escalating: bool,
+    /// Why the agent gave up (from the fix attempt's `error_message`).
+    pub last_error: Option<String>,
+    /// Target repo the agent attempted, if known.
+    pub repo: Option<String>,
+}
+
+/// A weekly digest of repetitive, non-actionable Sentry issues.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepetitiveDigest {
+    /// Human-readable period description.
+    pub period: String,
+    /// Start of the digest period.
+    pub from: DateTime<Utc>,
+    /// End of the digest period.
+    pub to: DateTime<Utc>,
+    /// The repetitive issues, most-recurring first.
+    pub entries: Vec<RepetitiveEntry>,
+}
+
+impl RepetitiveDigest {
+    /// Whether the digest has any entries worth sending.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Format the digest as a plain text summary (fallback rendering).
+    pub fn format_text(&self) -> String {
+        let mut text = String::new();
+        text.push_str(&format!(
+            "# Repetitive Sentry issues the agent can't fix ({})\n",
+            self.period
+        ));
+        text.push_str(&format!(
+            "{} issue(s) recurred this week and need a human.\n\n",
+            self.entries.len()
+        ));
+        for entry in &self.entries {
+            let escalating = if entry.is_escalating {
+                " \u{1F4C8} escalating"
+            } else {
+                ""
+            };
+            text.push_str(&format!(
+                "- {} ({} events{}): {}\n  {}\n",
+                entry.short_id, entry.event_count, escalating, entry.title, entry.url
+            ));
+            if let Some(err) = &entry.last_error {
+                text.push_str(&format!("  last: {}\n", err));
+            }
+        }
+        text
+    }
 }
 
 /// A generated report.
@@ -251,6 +324,84 @@ impl ReportGenerator {
         let to = Utc::now();
         let from = DateTime::from_timestamp(0, 0).unwrap_or(to);
         self.generate(from, to)
+    }
+
+    /// Generate a digest of repetitive, non-actionable Sentry issues over the
+    /// last 7 days.
+    ///
+    /// An issue is included when it is **both**:
+    /// 1. a Sentry issue the agent gave up on — a root (`cascade_repo == None`)
+    ///    `CannotFix` attempt with `attempted_at` in the last 7 days; and
+    /// 2. currently high-recurrence in Sentry — present in `sentry_issues` with
+    ///    `event_count >= min_event_count` **or** flagged escalating.
+    ///
+    /// `sentry_issues` is the live snapshot from the Sentry source; the recurrence
+    /// signal (`event_count`, `is_escalating`) lives only in `Issue.metadata`, so
+    /// it must be supplied here rather than read from storage. Entries are sorted
+    /// most-recurring first.
+    pub fn generate_repetitive_digest(
+        &self,
+        sentry_issues: &[Issue],
+        min_event_count: i64,
+    ) -> Result<RepetitiveDigest> {
+        let to = Utc::now();
+        let from = to - Duration::days(7);
+
+        // Map source issue id -> live recurrence info from Sentry.
+        let recurrence: HashMap<&str, &Issue> = sentry_issues
+            .iter()
+            .map(|issue| (issue.id.as_str(), issue))
+            .collect();
+
+        let cannot_fix = self
+            .tracker
+            .get_attempts_by_status(FixAttemptStatus::CannotFix)?;
+
+        let mut entries: Vec<RepetitiveEntry> = Vec::new();
+        for attempt in cannot_fix {
+            // Only root Sentry attempts within the window.
+            if attempt.source != "sentry" || attempt.cascade_repo.is_some() {
+                continue;
+            }
+            if attempt.attempted_at < from || attempt.attempted_at > to {
+                continue;
+            }
+
+            // Must still be surfaced by Sentry (i.e. recurring), and high-recurrence.
+            let Some(issue) = recurrence.get(attempt.issue_id.as_str()) else {
+                continue;
+            };
+            let event_count = issue.get_metadata::<i64>("event_count").unwrap_or(0);
+            let is_escalating = issue.get_metadata::<bool>("is_escalating").unwrap_or(false);
+            if event_count < min_event_count && !is_escalating {
+                continue;
+            }
+
+            entries.push(RepetitiveEntry {
+                issue_id: attempt.issue_id.clone(),
+                short_id: attempt.short_id.clone(),
+                title: issue.title.clone(),
+                url: issue.url.clone(),
+                event_count,
+                is_escalating,
+                last_error: attempt.error_message.clone(),
+                repo: attempt.scm_repo.clone(),
+            });
+        }
+
+        // Most-recurring first; escalating breaks ties.
+        entries.sort_by(|a, b| {
+            b.event_count
+                .cmp(&a.event_count)
+                .then(b.is_escalating.cmp(&a.is_escalating))
+        });
+
+        Ok(RepetitiveDigest {
+            period: Self::describe_period(from, to),
+            from,
+            to,
+            entries,
+        })
     }
 
     /// Describe the time period in human-readable form.
@@ -780,6 +931,82 @@ mod tests {
         let report = generator.generate_all_time().unwrap();
 
         assert!(report.pending_count >= 1);
+    }
+
+    fn sentry_issue(id: &str, event_count: i64, is_escalating: bool) -> Issue {
+        let mut issue = Issue::new(
+            id,
+            format!("SENTRY-{}", id),
+            format!("Issue {}", id),
+            format!("https://sentry.io/{}", id),
+            "sentry",
+        );
+        issue.set_metadata("event_count", event_count);
+        issue.set_metadata("is_escalating", is_escalating);
+        issue
+    }
+
+    #[test]
+    fn test_repetitive_digest_intersects_cannot_fix_and_high_recurrence() {
+        let (_temp, tracker) = create_test_tracker();
+
+        // A: cannot_fix + high event count -> included
+        tracker.record_attempt("sentry", "A", "SENTRY-A").unwrap();
+        tracker
+            .mark_cannot_fix("sentry", "A", "pool sizing")
+            .unwrap();
+        // B: cannot_fix but low event count, not escalating -> excluded
+        tracker.record_attempt("sentry", "B", "SENTRY-B").unwrap();
+        tracker.mark_cannot_fix("sentry", "B", "rare").unwrap();
+        // C: cannot_fix but not currently surfaced by Sentry -> excluded
+        tracker.record_attempt("sentry", "C", "SENTRY-C").unwrap();
+        tracker.mark_cannot_fix("sentry", "C", "gone").unwrap();
+        // D: cannot_fix + escalating (low count) -> included
+        tracker.record_attempt("sentry", "D", "SENTRY-D").unwrap();
+        tracker.mark_cannot_fix("sentry", "D", "spike").unwrap();
+        // E: non-sentry cannot_fix -> excluded
+        tracker.record_attempt("linear", "E", "LIN-E").unwrap();
+        tracker.mark_cannot_fix("linear", "E", "n/a").unwrap();
+        // F: sentry but succeeded (not cannot_fix) -> excluded
+        tracker.record_attempt("sentry", "F", "SENTRY-F").unwrap();
+        tracker
+            .mark_success("sentry", "F", "https://github.com/o/r/pull/1")
+            .unwrap();
+
+        let sentry_issues = vec![
+            sentry_issue("A", 100, false),
+            sentry_issue("B", 5, false),
+            sentry_issue("D", 5, true),
+            sentry_issue("F", 999, false),
+        ];
+
+        let generator = ReportGenerator::new(tracker);
+        let digest = generator
+            .generate_repetitive_digest(&sentry_issues, 50)
+            .unwrap();
+
+        let ids: Vec<&str> = digest.entries.iter().map(|e| e.short_id.as_str()).collect();
+        assert_eq!(ids, vec!["SENTRY-A", "SENTRY-D"]); // sorted by event_count desc
+        assert_eq!(digest.entries[0].event_count, 100);
+        assert_eq!(digest.entries[0].title, "Issue A");
+        assert_eq!(digest.entries[0].url, "https://sentry.io/A");
+        assert_eq!(digest.entries[0].last_error.as_deref(), Some("pool sizing"));
+        assert!(digest.entries[1].is_escalating);
+    }
+
+    #[test]
+    fn test_repetitive_digest_empty_when_nothing_qualifies() {
+        let (_temp, tracker) = create_test_tracker();
+        tracker.record_attempt("sentry", "X", "SENTRY-X").unwrap();
+        tracker.mark_cannot_fix("sentry", "X", "low").unwrap();
+
+        let generator = ReportGenerator::new(tracker);
+        // Issue is low-recurrence and not escalating -> excluded.
+        let digest = generator
+            .generate_repetitive_digest(&[sentry_issue("X", 1, false)], 50)
+            .unwrap();
+        assert!(digest.is_empty());
+        assert!(digest.period.contains("7 Days"));
     }
 
     #[test]
