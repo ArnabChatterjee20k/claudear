@@ -1,12 +1,12 @@
 CREATE TABLE IF NOT EXISTS discord_message_chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id TEXT,
-    channel_id TEXT NOT NULL,                -- channel or thread id (a thread is itself a channel)
+    channel_id TEXT NOT NULL,
     channel_kind INTEGER NOT NULL DEFAULT 0, -- mirrors Discord channel_type: 0 = channel, 4 = category, 11 = thread
 
     start_message_id TEXT NOT NULL,
     end_message_id TEXT NOT NULL,
-    participant_ids TEXT,                     -- comma-separated author ids in the span
+    participant_ids TEXT,
 
     start_message_time TEXT NOT NULL,
     end_message_time TEXT NOT NULL,
@@ -39,8 +39,10 @@ CREATE TABLE IF NOT EXISTS discord_channels (
     channel_type INTEGER,                    -- raw Discord channel type (0/5 text, 10/11/12 threads, 4 category)
     kind INTEGER NOT NULL DEFAULT 0,         -- classification mirroring Discord channel_type: 0 = channel, 4 = category, 11 = thread
     archived INTEGER NOT NULL DEFAULT 0,     -- 1 when this is an archived thread
-    last_indexed_message_id TEXT,
+    last_indexed_message_id TEXT,            -- forward cursor: newest indexed id (incremental resumes after this)
     last_indexed_at TEXT,
+    backfill_complete INTEGER NOT NULL DEFAULT 0, -- 1 once full history (within backfill_days) is scraped
+    backfill_cursor TEXT,                    -- backfill progress: oldest indexed id (page *before* this next)
     PRIMARY KEY (channel_id)
 );
 CREATE INDEX IF NOT EXISTS idx_discord_channels_guild ON discord_channels(guild_id);
