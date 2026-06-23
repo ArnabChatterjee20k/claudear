@@ -792,11 +792,24 @@ async fn build_watcher_deps(
         let kb = config.knowledgebase.discord.as_ref();
         if kb.map(|d| d.enabled).unwrap_or(false) {
             let merged = config.discord_merged();
+            // Treat blank strings (from copied example config) as unset so the
+            // notifier/issue Discord fallback actually applies.
+            let nonempty = |s: String| if s.trim().is_empty() { None } else { Some(s) };
             let bot_token = kb
                 .and_then(|d| d.bot_token.as_ref())
-                .or(merged.bot_token.as_ref())
-                .map(|s| s.expose().to_string());
-            let guild_id = merged.guild_id.clone();
+                .map(|s| s.expose().to_string())
+                .and_then(nonempty)
+                .or_else(|| {
+                    merged
+                        .bot_token
+                        .as_ref()
+                        .map(|s| s.expose().to_string())
+                        .and_then(nonempty)
+                });
+            let guild_id = kb
+                .and_then(|d| d.guild_id.clone())
+                .and_then(nonempty)
+                .or_else(|| merged.guild_id.clone().and_then(nonempty));
 
             match (embedding_client.as_ref(), bot_token, guild_id) {
                 (Some(emb), Some(token), Some(guild)) => {

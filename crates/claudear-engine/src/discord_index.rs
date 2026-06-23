@@ -48,6 +48,7 @@ impl DiscordIndexOrchestrator {
             tracing::info!("Discord knowledgebase has no categories configured — skipping");
             return Ok(stats);
         }
+        self.indexer.prepare().await?;
 
         let channels = self.client.list_guild_channels(&self.guild_id).await?;
         // Active threads are listed guild-wide; group them by parent below.

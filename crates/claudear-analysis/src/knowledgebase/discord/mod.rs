@@ -60,6 +60,32 @@ impl DiscordIndexer {
         }
     }
 
+    pub async fn prepare(&self) -> Result<bool> {
+        let mut needs_full_reindex = false;
+
+        if let Ok(Some(stored_model)) = self.tracker.get_discord_message_embedding_model() {
+            if stored_model != self.embedding_client.model() {
+                needs_full_reindex = true;
+            }
+        }
+        if let Ok(Some(stored_ver)) = self.tracker.get_discord_message_index_meta("index_version") {
+            if stored_ver != DISCORD_INDEX_VERSION {
+                needs_full_reindex = true;
+            }
+        }
+
+        if needs_full_reindex {
+            tracing::info!(
+                "Discord index version or embedding model changed — forcing full re-index"
+            );
+            self.tracker.delete_all_discord_message_data()?;
+        }
+
+        self.tracker
+            .set_discord_message_index_meta("index_version", DISCORD_INDEX_VERSION)?;
+        Ok(needs_full_reindex)
+    }
+
     pub async fn index(
         &self,
         channel_id: &str,
@@ -73,28 +99,11 @@ impl DiscordIndexer {
             "Starting Discord channel indexing"
         );
 
+        // The global version/model freshness gate runs once per orchestrator pass
+        // in `prepare()` (called before any channel is indexed) — not here — so a
+        // forced full re-index can also reset every channel's cursor before the
+        // backfill/incremental path is chosen. See `prepare`.
         let mut stats = DiscordIndexStats::default();
-        let mut needs_full_reindex = false;
-        if let Ok(Some(stored_model)) = self.tracker.get_discord_message_embedding_model() {
-            let current_model = self.embedding_client.model();
-            if stored_model != current_model {
-                needs_full_reindex = true;
-            }
-        }
-
-        if let Ok(Some(stored_ver)) = self.tracker.get_discord_message_index_meta("index_version") {
-            if stored_ver != DISCORD_INDEX_VERSION {
-                needs_full_reindex = true;
-            }
-        }
-
-        if needs_full_reindex {
-            tracing::info!(
-                channel = %channel_id,
-                "Discord index version or embedding model changed — forcing full re-index"
-            );
-            self.tracker.delete_all_discord_message_data()?;
-        }
 
         // grouping by 10min window buckets
         let mut buckets: Vec<Vec<DiscordMessageInput>> = vec![Vec::new()];
@@ -242,6 +251,11 @@ impl DiscordIndexer {
                 {
                     tracing::warn!(error = %del_err, "Failed to delete unembedded Discord chunks");
                 }
+                // Propagate the failure so callers don't advance their cursor past
+                // these messages — otherwise a transient embedding outage would
+                // permanently skip them (the chunks were just deleted).
+                chunks.clear();
+                return Err(e);
             }
         }
 
@@ -458,6 +472,52 @@ mod tests {
         let stats2 = indexer.index("chan1", false, inputs).await.unwrap();
         assert_eq!(stats2.messages_processed, 0);
         assert_eq!(stats2.messages_skipped, 3);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_wipes_on_version_change() {
+        let Some(embedding_client) = try_embedding_client() else {
+            return;
+        };
+        let tracker: Arc<dyn FixAttemptTracker> =
+            Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
+        let indexer = DiscordIndexer::new(tracker.clone(), embedding_client);
+
+        // Index some data and register a channel that has finished backfill.
+        indexer
+            .index(
+                "chan1",
+                false,
+                vec![input("1", "alice", "2024-01-01T10:00:00Z")],
+            )
+            .await
+            .unwrap();
+        tracker
+            .set_discord_channel_backfill("chan1", true, Some("1"), "2024-01-01T00:00:00Z")
+            .unwrap();
+
+        // Simulate a pipeline-version change since the last run.
+        tracker
+            .set_discord_message_index_meta("index_version", "stale")
+            .unwrap();
+
+        // prepare() must detect the change, wipe data, and reset channel cursors.
+        let wiped = indexer.prepare().await.unwrap();
+        assert!(wiped);
+        assert!(!tracker.discord_chunk_hash_matches("chan1", "any").unwrap());
+        let (complete, cursor) = tracker.get_discord_channel_backfill("chan1").unwrap();
+        assert!(!complete, "backfill flag reset so channel re-backfills");
+        assert_eq!(cursor, None);
+        assert_eq!(
+            tracker
+                .get_discord_message_index_meta("index_version")
+                .unwrap()
+                .as_deref(),
+            Some(DISCORD_INDEX_VERSION)
+        );
+
+        // A second prepare() with matching version is a no-op (no wipe).
+        assert!(!indexer.prepare().await.unwrap());
     }
 
     #[tokio::test]

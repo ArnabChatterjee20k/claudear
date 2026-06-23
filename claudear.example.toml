@@ -1091,9 +1091,11 @@ https_port = 443
 # HTTP port for HTTP→HTTPS redirect (default: 80, set to 0 to disable)
 http_redirect_port = 80
 
-[knowledgebases.discord]
-enabled=false
+[knowledgebase.discord]
+enabled = false
+# Falls back to the notifier/issue Discord bot_token when empty.
 bot_token = ""
+# Guild to index. Falls back to the notifier/issue Discord guild_id when empty.
 guild_id = ""
 # final channels = channels from categories - ignore_channels from the categories
 categories = []

@@ -467,51 +467,74 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
         Ok(channels_response)
     }
 
-    /// List public archived threads under a channel (for knowledge indexing of
-    /// past conversations). Mirrors `list_active_threads`'s `{ "threads": [...] }`
-    /// response shape; supports `before` (ISO8601 timestamp) / `limit` paging.
+    /// List **all** public archived threads under a channel (for knowledge
+    /// indexing of past conversations), following Discord's `has_more` pagination
+    /// to completion. Mirrors `list_active_threads`'s `{ "threads": [...] }` shape
+    /// plus a `has_more` flag; pages with `before` = the last thread's
+    /// `archive_timestamp`. `before` seeds the first page; `limit` is the page size.
     pub async fn list_public_archived_threads(
         &self,
         channel_id: &str,
         before: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<DiscordThread>> {
-        let mut url = format!(
-            "{}/channels/{}/threads/archived/public",
-            DISCORD_API_BASE, channel_id
-        );
-
-        let mut query = Vec::new();
-        if let Some(before) = before {
-            query.push(format!("before={}", before));
-        }
-        if let Some(limit) = limit {
-            query.push(format!("limit={}", limit.clamp(1, 100)));
-        }
-        if !query.is_empty() {
-            url.push('?');
-            url.push_str(&query.join("&"));
-        }
-
-        let response = self.http.get(&url).await?;
-
-        if !response.is_success() {
-            return Err(Error::notifier(
-                "discord",
-                format!(
-                    "Failed to list archived threads ({}): {}",
-                    response.status, response.body
-                ),
-            ));
-        }
-
         #[derive(serde::Deserialize)]
         struct ThreadsResponse {
             threads: Vec<DiscordThread>,
+            #[serde(default)]
+            has_more: bool,
         }
 
-        let threads_response: ThreadsResponse = response.json()?;
-        Ok(threads_response.threads)
+        let mut all = Vec::new();
+        let mut before = before.map(|s| s.to_string());
+
+        loop {
+            let mut url = format!(
+                "{}/channels/{}/threads/archived/public",
+                DISCORD_API_BASE, channel_id
+            );
+            let mut query = Vec::new();
+            if let Some(before) = &before {
+                query.push(format!("before={}", before));
+            }
+            if let Some(limit) = limit {
+                query.push(format!("limit={}", limit.clamp(1, 100)));
+            }
+            if !query.is_empty() {
+                url.push('?');
+                url.push_str(&query.join("&"));
+            }
+
+            let response = self.http.get(&url).await?;
+            if !response.is_success() {
+                return Err(Error::notifier(
+                    "discord",
+                    format!(
+                        "Failed to list archived threads ({}): {}",
+                        response.status, response.body
+                    ),
+                ));
+            }
+
+            let page: ThreadsResponse = response.json()?;
+            // Next page starts before the oldest thread's archive timestamp.
+            let next_before = page.threads.last().and_then(|t| {
+                t.archive_timestamp()
+                    .map(|s| s.to_string())
+                    .or_else(|| t.thread_metadata.as_ref().map(|_| String::new()))
+            });
+            let empty = page.threads.is_empty();
+            all.extend(page.threads);
+
+            // Stop when the API says there's no more, the page was empty, or we
+            // have no cursor to advance with (avoids an infinite loop).
+            match next_before {
+                Some(ts) if page.has_more && !empty && !ts.is_empty() => before = Some(ts),
+                _ => break,
+            }
+        }
+
+        Ok(all)
     }
 }
 
@@ -1048,6 +1071,40 @@ mod tests {
             .await
             .unwrap();
         assert!(threads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_public_archived_threads_follows_has_more() {
+        let mock = MockDiscordClient::new();
+        // Page 1: has_more=true, oldest thread carries an archive_timestamp cursor.
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/threads/archived/public?limit=2",
+            200,
+            r#"{"has_more": true, "threads": [
+                {"id": "1", "type": 11, "name": "t1", "parent_id": "123", "thread_metadata": {"archive_timestamp": "2024-06-02T00:00:00Z"}},
+                {"id": "2", "type": 11, "name": "t2", "parent_id": "123", "thread_metadata": {"archive_timestamp": "2024-06-01T00:00:00Z"}}
+            ]}"#,
+        );
+        // Page 2: fetched with before = page-1 oldest archive_timestamp; has_more=false.
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/threads/archived/public?before=2024-06-01T00:00:00Z&limit=2",
+            200,
+            r#"{"has_more": false, "threads": [
+                {"id": "3", "type": 11, "name": "t3", "parent_id": "123", "thread_metadata": {"archive_timestamp": "2024-05-30T00:00:00Z"}}
+            ]}"#,
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let threads = client
+            .list_public_archived_threads("123", None, Some(2))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = threads.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["1", "2", "3"],
+            "should follow has_more across pages"
+        );
     }
 
     #[tokio::test]

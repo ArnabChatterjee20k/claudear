@@ -8524,7 +8524,32 @@ impl SqliteTracker {
         }
 
         if Self::table_exists(conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)? {
-            return Ok(true);
+            // Reuse the existing table only if its declared dimension matches.
+            // After an embedding-model upgrade the vector length can change, so a
+            // stale `float32[N]` table must be dropped and recreated — otherwise
+            // inserts of the new blobs fail and searches see stale vectors.
+            let existing_sql: Option<String> = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![DISCORD_MESSAGE_CHUNK_VECTOR_TABLE],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let matches = existing_sql
+                .as_deref()
+                .map(|sql| sql.contains(&format!("float32[{}]", dimension)))
+                .unwrap_or(false);
+            if matches {
+                return Ok(true);
+            }
+            tracing::info!(
+                dimension,
+                "Discord chunk vector table dimension changed — recreating"
+            );
+            conn.execute_batch(&format!(
+                "DROP TABLE IF EXISTS {}",
+                DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+            ))?;
         }
 
         let sql = format!(
@@ -8782,6 +8807,16 @@ impl SqliteTracker {
         let conn = self.acquire_lock()?;
         // Embeddings CASCADE via the discord_message_chunks FK.
         conn.execute("DELETE FROM discord_message_chunks", [])?;
+        // Reset the channel registry/cursors so a forced full re-index re-backfills
+        // history instead of resuming incrementally from a now-stale cursor.
+        conn.execute("DELETE FROM discord_channels", [])?;
+        // Drop the HNSW vector table so it is recreated fresh — clears stale vectors
+        // and lets a new embedding model's dimension take effect. Best-effort: it may
+        // not exist, or vectorlite may be unavailable on this connection.
+        let _ = conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {}",
+            DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+        ));
         Ok(())
     }
 
@@ -17912,6 +17947,43 @@ mod tests {
         assert_eq!(cursor, None);
         // Forward cursor also absent.
         assert_eq!(tracker.get_discord_channel_cursor("chan-x").unwrap(), None);
+    }
+
+    #[test]
+    fn test_delete_all_discord_message_data_resets_channels() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // A chunk + a channel with completed backfill and a forward cursor.
+        tracker
+            .save_discord_chunks(&[sample_discord_chunk("100", "1001")])
+            .unwrap();
+        tracker
+            .upsert_discord_channel(
+                "100",
+                Some("g"),
+                None,
+                Some("general"),
+                Some(0),
+                claudear_core::types::DiscordChannelKind::Channel,
+                false,
+            )
+            .unwrap();
+        tracker
+            .set_discord_channel_backfill("100", true, Some("1"), "2024-01-01T00:00:00Z")
+            .unwrap();
+        tracker
+            .set_discord_channel_cursor("100", "1001", "2024-01-01T00:00:00Z")
+            .unwrap();
+
+        tracker.delete_all_discord_message_data().unwrap();
+
+        // Chunks gone, and the channel registry/cursors reset so a re-run backfills.
+        assert!(!tracker
+            .discord_chunk_hash_matches("100", "hash-1001")
+            .unwrap());
+        let (complete, backfill_cursor) = tracker.get_discord_channel_backfill("100").unwrap();
+        assert!(!complete);
+        assert_eq!(backfill_cursor, None);
+        assert_eq!(tracker.get_discord_channel_cursor("100").unwrap(), None);
     }
 
     #[test]
