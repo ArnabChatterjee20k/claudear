@@ -4703,6 +4703,7 @@ mod tests {
             tls: claudear_config::config::TlsConfig::default(),
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
             qa: claudear_config::config::QaConfig::default(),
+            knowledgebase: claudear_config::config::KnowledgebasesConfig::default(),
         }
     }
 
