@@ -3565,6 +3565,53 @@ impl EmbeddingStore for SqliteTracker {
         Ok(count as usize)
     }
 
+    fn record_issue_recurrence(
+        &self,
+        source: &str,
+        issue_id: &str,
+        event_count: i64,
+        is_escalating: bool,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO issue_recurrence (source, issue_id, event_count, is_escalating, observed_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'))
+             ON CONFLICT(source, issue_id) DO UPDATE SET
+                 event_count = excluded.event_count,
+                 is_escalating = excluded.is_escalating,
+                 observed_at = excluded.observed_at",
+            params![source, issue_id, event_count, is_escalating as i64],
+        )?;
+        Ok(())
+    }
+
+    fn get_issue_with_recurrence(
+        &self,
+        source: &str,
+        issue_id: &str,
+    ) -> Result<Option<(String, String, i64, bool)>> {
+        let conn = self.acquire_lock()?;
+        let row = conn
+            .query_row(
+                "SELECT COALESCE(i.title, ''), COALESCE(i.url, ''),
+                        COALESCE(r.event_count, 0), COALESCE(r.is_escalating, 0)
+                 FROM issues i
+                 LEFT JOIN issue_recurrence r
+                     ON r.source = i.source AND r.issue_id = i.issue_id
+                 WHERE i.source = ?1 AND i.issue_id = ?2",
+                params![source, issue_id],
+                |row| {
+                    let title: String = row.get(0)?;
+                    let url: String = row.get(1)?;
+                    let event_count: i64 = row.get(2)?;
+                    let is_escalating: i64 = row.get(3)?;
+                    Ok((title, url, event_count, is_escalating != 0))
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     fn search_code_chunks(
         &self,
         query_embedding: &[f32],

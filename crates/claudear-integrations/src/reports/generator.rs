@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use claudear_core::error::Result;
-use claudear_core::types::{FixAttemptStatus, Issue};
+use claudear_core::types::FixAttemptStatus;
 use claudear_storage::FixAttemptTracker;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -327,31 +327,21 @@ impl ReportGenerator {
     }
 
     /// Generate a digest of repetitive, non-actionable Sentry issues over the
-    /// last 7 days.
+    /// last 7 days, built entirely from stored observations.
     ///
     /// An issue is included when it is **both**:
     /// 1. a Sentry issue the agent gave up on — a root (`cascade_repo == None`)
     ///    `CannotFix` attempt with `attempted_at` in the last 7 days; and
-    /// 2. currently high-recurrence in Sentry — present in `sentry_issues` with
-    ///    `event_count >= min_event_count` **or** flagged escalating.
+    /// 2. high-recurrence as last observed — its stored recurrence has
+    ///    `event_count >= min_event_count` **or** is flagged escalating.
     ///
-    /// `sentry_issues` is the live snapshot from the Sentry source; the recurrence
-    /// signal (`event_count`, `is_escalating`) lives only in `Issue.metadata`, so
-    /// it must be supplied here rather than read from storage. Entries are sorted
+    /// Recurrence is read from storage (captured at processing time), so the
+    /// digest only ever surfaces issues the agent has actually seen and tried —
+    /// never anything unseen or not-yet-attempted. Entries are sorted
     /// most-recurring first.
-    pub fn generate_repetitive_digest(
-        &self,
-        sentry_issues: &[Issue],
-        min_event_count: i64,
-    ) -> Result<RepetitiveDigest> {
+    pub fn generate_repetitive_digest(&self, min_event_count: i64) -> Result<RepetitiveDigest> {
         let to = Utc::now();
         let from = to - Duration::days(7);
-
-        // Map source issue id -> live recurrence info from Sentry.
-        let recurrence: HashMap<&str, &Issue> = sentry_issues
-            .iter()
-            .map(|issue| (issue.id.as_str(), issue))
-            .collect();
 
         let cannot_fix = self
             .tracker
@@ -367,12 +357,14 @@ impl ReportGenerator {
                 continue;
             }
 
-            // Must still be surfaced by Sentry (i.e. recurring), and high-recurrence.
-            let Some(issue) = recurrence.get(attempt.issue_id.as_str()) else {
+            // Look up the stored issue + last-observed recurrence; skip if the
+            // issue isn't stored or isn't high-recurrence.
+            let Some((title, url, event_count, is_escalating)) = self
+                .tracker
+                .get_issue_with_recurrence("sentry", &attempt.issue_id)?
+            else {
                 continue;
             };
-            let event_count = issue.get_metadata::<i64>("event_count").unwrap_or(0);
-            let is_escalating = issue.get_metadata::<bool>("is_escalating").unwrap_or(false);
             if event_count < min_event_count && !is_escalating {
                 continue;
             }
@@ -380,8 +372,8 @@ impl ReportGenerator {
             entries.push(RepetitiveEntry {
                 issue_id: attempt.issue_id.clone(),
                 short_id: attempt.short_id.clone(),
-                title: issue.title.clone(),
-                url: issue.url.clone(),
+                title,
+                url,
                 event_count,
                 is_escalating,
                 last_error: attempt.error_message.clone(),
@@ -933,17 +925,27 @@ mod tests {
         assert!(report.pending_count >= 1);
     }
 
-    fn sentry_issue(id: &str, event_count: i64, is_escalating: bool) -> Issue {
-        let mut issue = Issue::new(
+    /// Store an issue (title/url) + its observed recurrence, as the watcher does.
+    fn seed_issue(
+        tracker: &Arc<dyn FixAttemptTracker>,
+        id: &str,
+        event_count: i64,
+        is_escalating: bool,
+    ) {
+        use claudear_core::types::{Issue, IssueEmbedding};
+        let issue = Issue::new(
             id,
             format!("SENTRY-{}", id),
             format!("Issue {}", id),
             format!("https://sentry.io/{}", id),
             "sentry",
         );
-        issue.set_metadata("event_count", event_count);
-        issue.set_metadata("is_escalating", is_escalating);
-        issue
+        tracker
+            .store_issue(&IssueEmbedding::from_issue(&issue))
+            .unwrap();
+        tracker
+            .record_issue_recurrence("sentry", id, event_count, is_escalating)
+            .unwrap();
     }
 
     #[test]
@@ -955,15 +957,18 @@ mod tests {
         tracker
             .mark_cannot_fix("sentry", "A", "pool sizing")
             .unwrap();
+        seed_issue(&tracker, "A", 100, false);
         // B: cannot_fix but low event count, not escalating -> excluded
         tracker.record_attempt("sentry", "B", "SENTRY-B").unwrap();
         tracker.mark_cannot_fix("sentry", "B", "rare").unwrap();
-        // C: cannot_fix but not currently surfaced by Sentry -> excluded
+        seed_issue(&tracker, "B", 5, false);
+        // C: cannot_fix but issue/recurrence never stored (not seen) -> excluded
         tracker.record_attempt("sentry", "C", "SENTRY-C").unwrap();
         tracker.mark_cannot_fix("sentry", "C", "gone").unwrap();
         // D: cannot_fix + escalating (low count) -> included
         tracker.record_attempt("sentry", "D", "SENTRY-D").unwrap();
         tracker.mark_cannot_fix("sentry", "D", "spike").unwrap();
+        seed_issue(&tracker, "D", 5, true);
         // E: non-sentry cannot_fix -> excluded
         tracker.record_attempt("linear", "E", "LIN-E").unwrap();
         tracker.mark_cannot_fix("linear", "E", "n/a").unwrap();
@@ -972,18 +977,10 @@ mod tests {
         tracker
             .mark_success("sentry", "F", "https://github.com/o/r/pull/1")
             .unwrap();
-
-        let sentry_issues = vec![
-            sentry_issue("A", 100, false),
-            sentry_issue("B", 5, false),
-            sentry_issue("D", 5, true),
-            sentry_issue("F", 999, false),
-        ];
+        seed_issue(&tracker, "F", 999, false);
 
         let generator = ReportGenerator::new(tracker);
-        let digest = generator
-            .generate_repetitive_digest(&sentry_issues, 50)
-            .unwrap();
+        let digest = generator.generate_repetitive_digest(50).unwrap();
 
         let ids: Vec<&str> = digest.entries.iter().map(|e| e.short_id.as_str()).collect();
         assert_eq!(ids, vec!["SENTRY-A", "SENTRY-D"]); // sorted by event_count desc
@@ -999,12 +996,11 @@ mod tests {
         let (_temp, tracker) = create_test_tracker();
         tracker.record_attempt("sentry", "X", "SENTRY-X").unwrap();
         tracker.mark_cannot_fix("sentry", "X", "low").unwrap();
+        // Low-recurrence and not escalating -> excluded.
+        seed_issue(&tracker, "X", 1, false);
 
         let generator = ReportGenerator::new(tracker);
-        // Issue is low-recurrence and not escalating -> excluded.
-        let digest = generator
-            .generate_repetitive_digest(&[sentry_issue("X", 1, false)], 50)
-            .unwrap();
+        let digest = generator.generate_repetitive_digest(50).unwrap();
         assert!(digest.is_empty());
         assert!(digest.period.contains("7 Days"));
     }

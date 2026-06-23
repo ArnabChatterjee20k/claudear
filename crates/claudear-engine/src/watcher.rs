@@ -2213,34 +2213,17 @@ Create a PR with your changes.{custom_instructions}"#,
     }
 
     /// Build and send the weekly digest of repetitive, non-actionable Sentry
-    /// issues — issues the agent gave up on (`cannot_fix`) that are still firing
-    /// frequently in Sentry. Report-only; the Discord notifier mentions the
-    /// configured on-call user.
+    /// issues — issues the agent gave up on (`cannot_fix`) that keep recurring.
+    /// Report-only; the Discord notifier mentions the configured on-call user.
     ///
-    /// The recurrence signal (`event_count`, `is_escalating`) is not persisted,
-    /// so this re-fetches a live snapshot from the Sentry source and intersects
-    /// it with the recent `cannot_fix` set. No-ops when there is no Sentry source
-    /// or nothing qualifies.
+    /// Built entirely from stored data: the `cannot_fix` set joined with the
+    /// recurrence observed at processing time (see `record_issue_recurrence`).
+    /// No live API calls, so it never surfaces issues the agent hasn't seen and
+    /// tried. No-ops when nothing qualifies.
     pub async fn send_repetitive_digest(&self) -> Result<()> {
-        let Some(sentry) = self.sources.iter().find(|s| s.name() == "sentry") else {
-            tracing::debug!(
-                component = "digest",
-                "No Sentry source configured; skipping repetitive digest"
-            );
-            return Ok(());
-        };
-
-        let sentry_issues = match sentry.fetch_issues().await {
-            Ok(issues) => issues,
-            Err(e) => {
-                tracing::warn!(component = "digest", error = %e, "Failed to fetch Sentry issues for repetitive digest");
-                return Ok(());
-            }
-        };
-
         let min_event_count = self.config.reports.repetitive_digest.min_event_count;
         let digest = ReportGenerator::new(self.tracker.clone())
-            .generate_repetitive_digest(&sentry_issues, min_event_count)?;
+            .generate_repetitive_digest(min_event_count)?;
 
         if digest.is_empty() {
             tracing::info!(
@@ -3552,6 +3535,21 @@ Create a PR with your changes.{custom_instructions}"#,
             let stored = IssueEmbedding::from_issue(&issue);
             if let Err(e) = self.tracker.store_issue(&stored) {
                 tracing::debug!(error = %e, "Failed to store issue content");
+            }
+        }
+
+        // Persist the observed recurrence signal (Sentry event_count / escalating)
+        // so the weekly repetitive-issues digest can be built from stored
+        // observations rather than a live API call.
+        if let Some(event_count) = issue.get_metadata::<i64>("event_count") {
+            let is_escalating = issue.get_metadata::<bool>("is_escalating").unwrap_or(false);
+            if let Err(e) = self.tracker.record_issue_recurrence(
+                source.name(),
+                &issue.id,
+                event_count,
+                is_escalating,
+            ) {
+                tracing::debug!(error = %e, "Failed to record issue recurrence");
             }
         }
 
