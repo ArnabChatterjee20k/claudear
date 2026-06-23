@@ -7,6 +7,7 @@
 //! regardless of how issues are ingested.
 
 use crate::watcher::Watcher;
+use chrono::Utc;
 use std::sync::Arc;
 use tokio::time::{interval, Duration, Instant};
 
@@ -54,6 +55,13 @@ impl HousekeepingWorker {
 
         let reindex_interval = self.watcher.reindex_interval();
         let mut last_reindex = Instant::now();
+
+        // Weekly digest of repetitive, non-actionable Sentry issues. State is
+        // held locally in this owned loop (no interior mutability needed). On a
+        // process restart `last_sent_at` resets; `is_due` gates on weekday +
+        // exact hour + a 6-day window, so a duplicate is only possible if the
+        // daemon restarts during the target hour on the target weekday.
+        let mut digest_schedule = self.watcher.repetitive_digest_schedule();
 
         while self.watcher.is_running() {
             timer.tick().await;
@@ -123,6 +131,19 @@ impl HousekeepingWorker {
 
             let (_, _, housekeeping_ok, _) =
                 tokio::join!(auto_close_fut, reviews_fut, housekeeping_fut, learning_fut);
+
+            // Weekly repetitive-issues digest (report-only).
+            if !self.watcher.is_dry_run() {
+                if let Some(schedule) = digest_schedule.as_mut() {
+                    let now = Utc::now();
+                    if schedule.is_due(now) {
+                        if let Err(e) = self.watcher.send_repetitive_digest().await {
+                            tracing::error!(component = "digest", error = %e, "Error sending repetitive-issues digest");
+                        }
+                        schedule.last_sent_at = Some(now);
+                    }
+                }
+            }
 
             let duration_secs = cron_start.elapsed().as_secs_f64();
             let cron_status = if housekeeping_ok { "ok" } else { "error" };
