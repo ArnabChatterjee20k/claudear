@@ -8803,6 +8803,7 @@ impl SqliteTracker {
 
     /// Register or refresh a discovered channel/thread in the `discord_channels`
     /// registry. Leaves the incremental cursor (`last_indexed_*`) untouched.
+    #[expect(clippy::too_many_arguments)]
     pub fn upsert_discord_channel(
         &self,
         channel_id: &str,

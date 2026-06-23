@@ -1388,6 +1388,7 @@ pub trait DiscordStore: Send + Sync {
     }
 
     /// Register or refresh a discovered channel/thread (cursor left untouched).
+    #[expect(clippy::too_many_arguments)]
     fn upsert_discord_channel(
         &self,
         _channel_id: &str,

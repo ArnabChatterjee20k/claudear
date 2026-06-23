@@ -1,6 +1,5 @@
 use crate::feedback::EmbeddingClient;
 use chrono::{DateTime, Utc};
-use claudear_config::DiscordKnowledgebaseConfig;
 use claudear_core::error::Result;
 use claudear_core::types::{
     DiscordChannelKind, DiscordIndexStats, DiscordMessageChunk, DiscordSearchResult,
@@ -66,7 +65,6 @@ impl DiscordIndexer {
         channel_id: &str,
         is_thread: bool,
         inputs: Vec<DiscordMessageInput>,
-        config: &DiscordKnowledgebaseConfig,
     ) -> Result<DiscordIndexStats> {
         tracing::info!(
             channel = %channel_id,
@@ -443,7 +441,6 @@ mod tests {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
         let indexer = DiscordIndexer::new(tracker, embedding_client);
-        let cfg = DiscordKnowledgebaseConfig::default();
 
         // Two messages within 10 min (one bucket) + a third after a >10 min gap
         // (second bucket) => two chunks covering all three messages.
@@ -453,15 +450,12 @@ mod tests {
             input("3", "alice", "2024-01-01T10:20:00Z"),
         ];
 
-        let stats = indexer
-            .index("chan1", false, inputs.clone(), &cfg)
-            .await
-            .unwrap();
+        let stats = indexer.index("chan1", false, inputs.clone()).await.unwrap();
         assert_eq!(stats.messages_processed, 3);
         assert_eq!(stats.messages_skipped, 0);
 
         // Re-indexing identical input => every chunk hash already exists => skip.
-        let stats2 = indexer.index("chan1", false, inputs, &cfg).await.unwrap();
+        let stats2 = indexer.index("chan1", false, inputs).await.unwrap();
         assert_eq!(stats2.messages_processed, 0);
         assert_eq!(stats2.messages_skipped, 3);
     }
@@ -474,13 +468,12 @@ mod tests {
         let tracker: Arc<dyn FixAttemptTracker> =
             Arc::new(claudear_storage::SqliteTracker::in_memory().unwrap());
         let indexer = DiscordIndexer::new(tracker.clone(), embedding_client.clone());
-        let cfg = DiscordKnowledgebaseConfig::default();
 
         let inputs = vec![
             input("1", "alice", "2024-01-01T10:00:00Z"),
             input("2", "bob", "2024-01-01T10:01:00Z"),
         ];
-        indexer.index("chan1", false, inputs, &cfg).await.unwrap();
+        indexer.index("chan1", false, inputs).await.unwrap();
 
         let search = DiscordSearchService::new(tracker, embedding_client);
         // Tolerant of vectorlite being unavailable (search returns empty then),
