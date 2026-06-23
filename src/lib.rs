@@ -120,7 +120,10 @@ pub use repo::{
     build_repo_index_with_fallback, index_repo_files, DependencyDiscovery, DependencyGraph,
     DependencyType, DiscoveredDependency, IndexedRepo, RepoIndex, RepoRelationships, Repository,
 };
-pub use reports::{Report, ReportFrequency, ReportGenerator, ReportSchedule, ReportScheduler};
+pub use reports::{
+    RecurringIssue, RepetitiveDigest, RepetitiveEntry, Report, ReportFrequency, ReportGenerator,
+    ReportSchedule, ReportScheduler,
+};
 pub use retry::{RetryDecision, RetryManager};
 pub use scm::GitHubUser;
 pub use storage::{

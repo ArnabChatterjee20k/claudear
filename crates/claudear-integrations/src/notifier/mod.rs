@@ -65,7 +65,7 @@ pub use sms::SmsNotifier;
 pub use telegram::TelegramNotifier;
 pub use whatsapp::WhatsAppNotifier;
 
-use crate::reports::Report;
+use crate::reports::{RepetitiveDigest, Report};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
@@ -136,6 +136,15 @@ pub trait Notifier: Send + Sync {
     async fn notify_report(&self, report: &Report) -> Result<()> {
         // Default implementation formats as text and uses notify_status
         self.notify_status(&report.format_text()).await
+    }
+
+    /// Send the weekly digest of repetitive, non-actionable Sentry issues.
+    ///
+    /// Default implementation formats as text and uses `notify_status`; channels
+    /// that can mention a user (e.g. Discord) should override this to tag the
+    /// configured on-call user.
+    async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
+        self.notify_status(&digest.format_text()).await
     }
 
     /// Send a blocking question through this channel.
@@ -346,6 +355,16 @@ impl Notifier for CompositeNotifier {
         self.broadcast(|n| {
             let report = report.clone();
             async move { n.notify_report(&report).await }
+        })
+        .await;
+        Ok(())
+    }
+
+    async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
+        let digest = digest.clone();
+        self.broadcast(|n| {
+            let digest = digest.clone();
+            async move { n.notify_repetitive_digest(&digest).await }
         })
         .await;
         Ok(())

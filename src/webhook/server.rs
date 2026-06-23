@@ -1205,6 +1205,7 @@ mod tests {
             tls: crate::config::TlsConfig::default(),
             embedding: crate::config::EmbeddingModelConfig::default(),
             qa: crate::config::QaConfig::default(),
+            reports: crate::config::ReportsConfig::default(),
         }
     }
 
