@@ -495,7 +495,10 @@ impl<H: DiscordHttpClient> DiscordClient<H> {
             );
             let mut query = Vec::new();
             if let Some(before) = &before {
-                query.push(format!("before={}", before));
+                // `before` is an ISO8601 archive_timestamp that can contain a `+`
+                // offset (e.g. `+00:00`); URL-encode it so `+` isn't decoded as a
+                // space and the cursor stays valid across pages.
+                query.push(format!("before={}", urlencoding::encode(before)));
             }
             if let Some(limit) = limit {
                 query.push(format!("limit={}", limit.clamp(1, 100)));
@@ -1060,7 +1063,7 @@ mod tests {
     async fn test_list_public_archived_threads_paged_query() {
         let mock = MockDiscordClient::new();
         mock.mock_get(
-            "https://discord.com/api/v10/channels/123/threads/archived/public?before=2024-01-01T00:00:00Z&limit=50",
+            "https://discord.com/api/v10/channels/123/threads/archived/public?before=2024-01-01T00%3A00%3A00Z&limit=50",
             200,
             r#"{"threads": []}"#,
         );
@@ -1087,7 +1090,7 @@ mod tests {
         );
         // Page 2: fetched with before = page-1 oldest archive_timestamp; has_more=false.
         mock.mock_get(
-            "https://discord.com/api/v10/channels/123/threads/archived/public?before=2024-06-01T00:00:00Z&limit=2",
+            "https://discord.com/api/v10/channels/123/threads/archived/public?before=2024-06-01T00%3A00%3A00Z&limit=2",
             200,
             r#"{"has_more": false, "threads": [
                 {"id": "3", "type": 11, "name": "t3", "parent_id": "123", "thread_metadata": {"archive_timestamp": "2024-05-30T00:00:00Z"}}
@@ -1104,6 +1107,40 @@ mod tests {
             ids,
             vec!["1", "2", "3"],
             "should follow has_more across pages"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_public_archived_threads_url_encodes_offset_cursor() {
+        let mock = MockDiscordClient::new();
+        // Page 1's oldest thread carries a +00:00 offset timestamp.
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/threads/archived/public?limit=1",
+            200,
+            r#"{"has_more": true, "threads": [
+                {"id": "1", "type": 11, "name": "t1", "parent_id": "123", "thread_metadata": {"archive_timestamp": "2024-06-01T00:00:00+00:00"}}
+            ]}"#,
+        );
+        // Page 2 must be requested with the cursor URL-encoded (`+` -> %2B, `:` -> %3A),
+        // otherwise the API would misparse it. The mock only matches the encoded form.
+        mock.mock_get(
+            "https://discord.com/api/v10/channels/123/threads/archived/public?before=2024-06-01T00%3A00%3A00%2B00%3A00&limit=1",
+            200,
+            r#"{"has_more": false, "threads": [
+                {"id": "2", "type": 11, "name": "t2", "parent_id": "123", "thread_metadata": {"archive_timestamp": "2024-05-30T00:00:00+00:00"}}
+            ]}"#,
+        );
+
+        let client = DiscordClient::with_http_client("token", mock).unwrap();
+        let threads = client
+            .list_public_archived_threads("123", None, Some(1))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = threads.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["1", "2"],
+            "offset cursor must be URL-encoded so page 2 resolves"
         );
     }
 
