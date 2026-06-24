@@ -38,6 +38,44 @@ pub struct IndexStats {
     pub last_indexed_at: Option<String>,
 }
 
+/// A Discord channel/thread tracked in the knowledgebase index, enriched with
+/// derived indexing stats (chunk count + indexed timeline) for the dashboard.
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredDiscordChannel {
+    pub channel_id: String,
+    pub guild_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub name: Option<String>,
+    /// "channel" | "thread" | "category".
+    pub kind: String,
+    /// Whether this is an archived thread.
+    pub archived: bool,
+    /// Whether the full history (within the backfill window) has been scraped.
+    pub backfill_complete: bool,
+    /// Forward cursor: newest indexed message id.
+    pub last_indexed_message_id: Option<String>,
+    pub last_indexed_at: Option<String>,
+    /// Number of indexed (embedded or pending) message chunks for this channel.
+    pub chunk_count: i64,
+    /// Timestamp of the oldest indexed message (start of the indexed window).
+    pub indexed_from: Option<String>,
+    /// Timestamp of the newest indexed message (end of the indexed window).
+    pub indexed_to: Option<String>,
+}
+
+/// Aggregate statistics for the Discord knowledgebase index.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscordKnowledgebaseStats {
+    /// Number of tracked regular channels (excludes threads/categories).
+    pub channel_count: usize,
+    /// Number of tracked threads.
+    pub thread_count: usize,
+    /// Total indexed message chunks across all channels.
+    pub chunk_count: usize,
+    /// Most recent index run across all channels.
+    pub last_indexed_at: Option<String>,
+}
+
 /// Current indexing progress.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IndexingProgress {

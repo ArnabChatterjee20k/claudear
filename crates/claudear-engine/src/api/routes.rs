@@ -148,6 +148,8 @@ pub fn create_api_router_full(
         )
         .route("/api/repos/dependencies", get(dependencies_handler))
         .route("/api/repos/{repo}/learning", get(repo_learning_handler))
+        .route("/api/channels", get(discord_channels_handler))
+        .route("/api/channels/stats", get(discord_channel_stats_handler))
         .route("/api/inference/stats", get(inference_stats_handler))
         .route("/api/inference/history", get(inference_history_handler))
         .route("/api/telemetry/overview", get(telemetry_overview_handler))
@@ -1714,6 +1716,36 @@ async fn dependencies_handler(
     state
         .tracker
         .list_all_dependencies()
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn discord_channels_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+) -> Result<Json<Vec<claudear_storage::StoredDiscordChannel>>, StatusCode> {
+    state
+        .tracker
+        .list_discord_channels()
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+async fn discord_channel_stats_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+) -> Result<Json<claudear_storage::DiscordKnowledgebaseStats>, StatusCode> {
+    state
+        .tracker
+        .get_discord_knowledgebase_stats()
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");
@@ -3759,6 +3791,35 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let deps: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(deps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_channels_endpoint_empty() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/channels", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let channels: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(channels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_channel_stats_endpoint() {
+        let tracker = create_test_tracker();
+        let (router, token) = create_authenticated_router(&tracker);
+
+        let response = router
+            .oneshot(auth_get("/api/channels/stats", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

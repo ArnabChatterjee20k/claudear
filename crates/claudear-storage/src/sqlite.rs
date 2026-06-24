@@ -1,9 +1,9 @@
 //! SQLite-based fix attempt tracker and analytics storage.
 
 use super::types::{
-    ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
-    InferenceStats, PurgeResult, StoredDependency, StoredIndexedRepo, StoredPrReviewComment,
-    StoredRepository, UserRow,
+    ConfidenceBreakdown, DiagnosticCounts, DiscordKnowledgebaseStats, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, PurgeResult, StoredDependency, StoredDiscordChannel,
+    StoredIndexedRepo, StoredPrReviewComment, StoredRepository, UserRow,
 };
 use super::{
     is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
@@ -4458,6 +4458,14 @@ impl DiscordStore for SqliteTracker {
             backfill_cursor,
             indexed_at,
         )
+    }
+
+    fn list_discord_channels(&self) -> Result<Vec<StoredDiscordChannel>> {
+        SqliteTracker::list_discord_channels(self)
+    }
+
+    fn get_discord_knowledgebase_stats(&self) -> Result<DiscordKnowledgebaseStats> {
+        SqliteTracker::get_discord_knowledgebase_stats(self)
     }
 }
 
@@ -9017,6 +9025,100 @@ impl SqliteTracker {
             params![channel_id, complete as i64, backfill_cursor, indexed_at],
         )?;
         Ok(())
+    }
+
+    /// List tracked Discord channels/threads with derived indexing stats. The
+    /// indexed timeline (`indexed_from`/`indexed_to`) and `chunk_count` are
+    /// aggregated from `discord_message_chunks`; categories are excluded since
+    /// they are never indexed themselves.
+    pub fn list_discord_channels(&self) -> Result<Vec<StoredDiscordChannel>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                c.channel_id,
+                c.guild_id,
+                c.parent_id,
+                c.name,
+                c.kind,
+                c.archived,
+                c.backfill_complete,
+                c.last_indexed_message_id,
+                c.last_indexed_at,
+                COUNT(ch.id) AS chunk_count,
+                MIN(ch.start_message_time) AS indexed_from,
+                MAX(ch.end_message_time) AS indexed_to
+            FROM discord_channels c
+            LEFT JOIN discord_message_chunks ch ON ch.channel_id = c.channel_id
+            WHERE c.kind != 4
+            GROUP BY c.channel_id
+            ORDER BY c.name
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let kind = claudear_core::types::DiscordChannelKind::from_i64(row.get(4)?);
+            let kind_str = match kind {
+                claudear_core::types::DiscordChannelKind::Channel => "channel",
+                claudear_core::types::DiscordChannelKind::Thread => "thread",
+                claudear_core::types::DiscordChannelKind::Category => "category",
+            };
+            Ok(StoredDiscordChannel {
+                channel_id: row.get(0)?,
+                guild_id: row.get(1)?,
+                parent_id: row.get(2)?,
+                name: row.get(3)?,
+                kind: kind_str.to_string(),
+                archived: row.get::<_, i64>(5)? != 0,
+                backfill_complete: row.get::<_, i64>(6)? != 0,
+                last_indexed_message_id: row.get(7)?,
+                last_indexed_at: row.get(8)?,
+                chunk_count: row.get(9)?,
+                indexed_from: row.get(10)?,
+                indexed_to: row.get(11)?,
+            })
+        })?;
+
+        let mut channels = Vec::new();
+        for row in rows.flatten() {
+            channels.push(row);
+        }
+        Ok(channels)
+    }
+
+    /// Aggregate statistics for the Discord knowledgebase index.
+    pub fn get_discord_knowledgebase_stats(&self) -> Result<DiscordKnowledgebaseStats> {
+        let conn = self.acquire_lock()?;
+
+        let channel_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM discord_channels WHERE kind = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let thread_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM discord_channels WHERE kind = 11",
+            [],
+            |row| row.get(0),
+        )?;
+        let chunk_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM discord_message_chunks", [], |row| {
+                row.get(0)
+            })?;
+        let last_indexed_at: Option<String> = conn
+            .query_row(
+                "SELECT MAX(last_indexed_at) FROM discord_channels",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        Ok(DiscordKnowledgebaseStats {
+            channel_count: channel_count as usize,
+            thread_count: thread_count as usize,
+            chunk_count: chunk_count as usize,
+            last_indexed_at,
+        })
     }
 
     /// Find code symbols by name (substring match).
@@ -18065,6 +18167,90 @@ mod tests {
             tracker.get_discord_channel_cursor("c1").unwrap().as_deref(),
             Some("1000")
         );
+    }
+
+    #[test]
+    fn test_list_discord_channels_with_stats() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // A regular channel with two chunks spanning a wider time window.
+        let mut early = sample_discord_chunk("100", "1001");
+        early.start_message_time = "2024-01-01T00:00:00Z".to_string();
+        early.end_message_time = "2024-01-01T00:05:00Z".to_string();
+        let mut late = sample_discord_chunk("100", "1002");
+        late.start_message_time = "2024-03-01T00:00:00Z".to_string();
+        late.end_message_time = "2024-03-01T12:00:00Z".to_string();
+        tracker.save_discord_chunks(&[early, late]).unwrap();
+        tracker
+            .upsert_discord_channel(
+                "100",
+                Some("g"),
+                None,
+                Some("general"),
+                Some(0),
+                claudear_core::types::DiscordChannelKind::Channel,
+                false,
+            )
+            .unwrap();
+        tracker
+            .set_discord_channel_backfill("100", true, Some("1"), "2024-03-02T00:00:00Z")
+            .unwrap();
+        tracker
+            .set_discord_channel_cursor("100", "1002", "2024-03-02T00:00:00Z")
+            .unwrap();
+
+        // A thread (no chunks yet) and a category (must be excluded).
+        tracker
+            .upsert_discord_channel(
+                "200",
+                Some("g"),
+                Some("100"),
+                Some("a-thread"),
+                Some(11),
+                claudear_core::types::DiscordChannelKind::Thread,
+                false,
+            )
+            .unwrap();
+        tracker
+            .upsert_discord_channel(
+                "300",
+                Some("g"),
+                None,
+                Some("a-category"),
+                Some(4),
+                claudear_core::types::DiscordChannelKind::Category,
+                false,
+            )
+            .unwrap();
+
+        let channels = tracker.list_discord_channels().unwrap();
+        // Category excluded => only the channel + thread.
+        assert_eq!(channels.len(), 2);
+
+        let general = channels.iter().find(|c| c.channel_id == "100").unwrap();
+        assert_eq!(general.kind, "channel");
+        assert_eq!(general.name.as_deref(), Some("general"));
+        assert!(general.backfill_complete);
+        assert_eq!(general.chunk_count, 2);
+        assert_eq!(
+            general.indexed_from.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+        assert_eq!(general.indexed_to.as_deref(), Some("2024-03-01T12:00:00Z"));
+        assert_eq!(general.last_indexed_message_id.as_deref(), Some("1002"));
+
+        let thread = channels.iter().find(|c| c.channel_id == "200").unwrap();
+        assert_eq!(thread.kind, "thread");
+        assert_eq!(thread.chunk_count, 0);
+        assert_eq!(thread.indexed_from, None);
+        assert_eq!(thread.indexed_to, None);
+
+        // Aggregate stats: 1 channel, 1 thread, 2 chunks.
+        let stats = tracker.get_discord_knowledgebase_stats().unwrap();
+        assert_eq!(stats.channel_count, 1);
+        assert_eq!(stats.thread_count, 1);
+        assert_eq!(stats.chunk_count, 2);
+        assert!(stats.last_indexed_at.is_some());
     }
 
     #[test]

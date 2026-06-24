@@ -458,6 +458,28 @@ export interface IndexingProgress {
   updated_at: string | null;
 }
 
+export interface StoredDiscordChannel {
+  channel_id: string;
+  guild_id: string | null;
+  parent_id: string | null;
+  name: string | null;
+  kind: string;
+  archived: boolean;
+  backfill_complete: boolean;
+  last_indexed_message_id: string | null;
+  last_indexed_at: string | null;
+  chunk_count: number;
+  indexed_from: string | null;
+  indexed_to: string | null;
+}
+
+export interface DiscordKnowledgebaseStats {
+  channel_count: number;
+  thread_count: number;
+  chunk_count: number;
+  last_indexed_at: string | null;
+}
+
 export interface InferenceStats {
   total_attempts: number;
   with_feedback: number;
@@ -907,6 +929,14 @@ export async function fetchRepoStats(): Promise<IndexStats> {
 
 export async function fetchDependencies(): Promise<StoredDependency[]> {
   return fetchJson(`${API_BASE}/repos/dependencies`);
+}
+
+export async function fetchDiscordChannels(): Promise<StoredDiscordChannel[]> {
+  return fetchJson(`${API_BASE}/channels`);
+}
+
+export async function fetchDiscordChannelStats(): Promise<DiscordKnowledgebaseStats> {
+  return fetchJson(`${API_BASE}/channels/stats`);
 }
 
 export const INDEXING_PROGRESS_WS_PATH = '/api/repos/indexing-progress';

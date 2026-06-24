@@ -16,8 +16,9 @@ pub use analytics::{
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteTracker;
 pub use types::{
-    ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
-    InferenceStats, PurgeResult, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
+    ConfidenceBreakdown, DiagnosticCounts, DiscordKnowledgebaseStats, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, PurgeResult, StoredDependency, StoredDiscordChannel,
+    StoredIndexedRepo, StoredRepository, UserRow,
 };
 #[cfg(feature = "sqlite")]
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
@@ -1462,6 +1463,22 @@ pub trait DiscordStore: Send + Sync {
         _indexed_at: &str,
     ) -> Result<()> {
         Ok(())
+    }
+
+    /// List tracked Discord channels/threads with derived indexing stats
+    /// (chunk count + indexed timeline). Excludes categories.
+    fn list_discord_channels(&self) -> Result<Vec<StoredDiscordChannel>> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate statistics for the Discord knowledgebase index.
+    fn get_discord_knowledgebase_stats(&self) -> Result<DiscordKnowledgebaseStats> {
+        Ok(DiscordKnowledgebaseStats {
+            channel_count: 0,
+            thread_count: 0,
+            chunk_count: 0,
+            last_indexed_at: None,
+        })
     }
 }
 
