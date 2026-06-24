@@ -15,6 +15,13 @@ use claudear_storage::FixAttemptTracker;
 /// Discord message page size (the API caps a single page at 100).
 const PAGE_LIMIT: usize = 100;
 
+/// A channel or thread registered for message backfill (pass 2 of `run`).
+struct IndexTarget {
+    id: String,
+    name: String,
+    is_thread: bool,
+}
+
 /// Fetches Discord content and drives the analysis `DiscordIndexer`.
 pub struct DiscordIndexOrchestrator {
     client: DiscordClient,
@@ -38,8 +45,6 @@ impl DiscordIndexOrchestrator {
         })
     }
 
-    /// Resolve channels by category, then fetch + index each channel and its
-    /// active/archived threads. Returns aggregate stats across everything seen.
     pub async fn run(&self, cfg: &DiscordKnowledgebaseConfig) -> Result<DiscordIndexStats> {
         let mut stats = DiscordIndexStats::default();
 
@@ -51,12 +56,6 @@ impl DiscordIndexOrchestrator {
         self.indexer.prepare().await?;
 
         let channels = self.client.list_guild_channels(&self.guild_id).await?;
-        // Active threads are listed guild-wide; group them by parent below.
-        let active_threads = self
-            .client
-            .list_active_threads(&self.guild_id, None, None)
-            .await
-            .unwrap_or_default();
 
         // `categories` are configured by name (or raw id); resolve them to the
         // guild's category channels so we can match by parent id below.
@@ -87,14 +86,16 @@ impl DiscordIndexOrchestrator {
         let ignore: HashSet<&str> = cfg.ignore_channels.iter().map(String::as_str).collect();
 
         let selected = select_channels(&channels, &categories, &ignore);
-        tracing::info!(
-            guild = %self.guild_id,
-            categories = resolved_categories.len(),
-            channels = selected.len(),
-            "Resolved Discord channels to index"
-        );
 
-        for channel in selected {
+        let active_threads = self
+            .client
+            .list_active_threads(&self.guild_id, None, None)
+            .await
+            .unwrap_or_default();
+
+        // register every in-category channel
+        let mut targets: Vec<IndexTarget> = Vec::new();
+        for channel in &selected {
             let _ = self.tracker.upsert_discord_channel(
                 &channel.id,
                 Some(self.guild_id.as_str()),
@@ -104,28 +105,15 @@ impl DiscordIndexOrchestrator {
                 channel.kind(),
                 false,
             );
+            targets.push(IndexTarget {
+                id: channel.id.clone(),
+                name: channel.name.clone().unwrap_or_default(),
+                is_thread: false,
+            });
+        }
 
-            match self
-                .index_one(
-                    &channel.id,
-                    channel.name.as_deref().unwrap_or(""),
-                    false,
-                    cfg,
-                )
-                .await
-            {
-                Ok(s) => {
-                    merge_message_stats(&mut stats, &s);
-                    stats.channels_processed += 1;
-                }
-                Err(e) => {
-                    tracing::warn!(channel = %channel.id, error = %e, "Failed to index channel");
-                    stats.channels_failed += 1;
-                }
-            }
-
-            // Threads under this channel: active (from the guild-wide list) +
-            // public archived (fetched per channel).
+        // register each channel's threads
+        for channel in &selected {
             let mut threads: Vec<&DiscordThread> = active_threads
                 .iter()
                 .filter(|t| t.parent_id.as_deref() == Some(channel.id.as_str()))
@@ -150,15 +138,43 @@ impl DiscordIndexOrchestrator {
                     thread.kind(),
                     thread.archived,
                 );
+                targets.push(IndexTarget {
+                    id: thread.id.clone(),
+                    name: thread.name.clone(),
+                    is_thread: true,
+                });
+            }
+        }
 
-                match self.index_one(&thread.id, &thread.name, true, cfg).await {
-                    Ok(s) => {
-                        merge_message_stats(&mut stats, &s);
+        tracing::info!(
+            guild = %self.guild_id,
+            categories = resolved_categories.len(),
+            channels = selected.len(),
+            targets = targets.len(),
+            "Registered Discord channels/threads; starting backfill"
+        );
+
+        // backfill messages for every registered target
+        for target in &targets {
+            match self
+                .index_one(&target.id, &target.name, target.is_thread, cfg)
+                .await
+            {
+                Ok(s) => {
+                    merge_message_stats(&mut stats, &s);
+                    if target.is_thread {
                         stats.threads_processed += 1;
+                    } else {
+                        stats.channels_processed += 1;
                     }
-                    Err(e) => {
-                        tracing::warn!(thread = %thread.id, error = %e, "Failed to index thread");
+                }
+                Err(e) => {
+                    if target.is_thread {
+                        tracing::warn!(thread = %target.id, error = %e, "Failed to index thread");
                         stats.threads_failed += 1;
+                    } else {
+                        tracing::warn!(channel = %target.id, error = %e, "Failed to index channel");
+                        stats.channels_failed += 1;
                     }
                 }
             }
