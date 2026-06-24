@@ -83,8 +83,7 @@ impl DiscordIndexOrchestrator {
             );
         }
 
-        let categories: HashSet<&str> =
-            resolved_categories.iter().map(|c| c.id.as_str()).collect();
+        let categories: HashSet<&str> = resolved_categories.iter().map(|c| c.id.as_str()).collect();
         let ignore: HashSet<&str> = cfg.ignore_channels.iter().map(String::as_str).collect();
 
         let selected = select_channels(&channels, &categories, &ignore);
@@ -525,8 +524,7 @@ mod tests {
             channel("c1", 0, Some("cat1")),
         ];
         // Match by name (case-insensitive).
-        let (resolved, unresolved) =
-            resolve_categories(&channels, &["NAME-CAT1".to_string()]);
+        let (resolved, unresolved) = resolve_categories(&channels, &["NAME-CAT1".to_string()]);
         let ids: Vec<&str> = resolved.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["cat1"]);
         assert!(unresolved.is_empty());
@@ -536,10 +534,8 @@ mod tests {
     fn test_resolve_categories_by_id_and_dedup() {
         let channels = vec![channel("cat1", 4, None), channel("cat2", 4, None)];
         // Same category referenced by both id and name => returned once.
-        let (resolved, unresolved) = resolve_categories(
-            &channels,
-            &["cat1".to_string(), "name-cat1".to_string()],
-        );
+        let (resolved, unresolved) =
+            resolve_categories(&channels, &["cat1".to_string(), "name-cat1".to_string()]);
         let ids: Vec<&str> = resolved.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["cat1"]);
         assert!(unresolved.is_empty());
@@ -561,8 +557,7 @@ mod tests {
     fn test_resolve_categories_ignores_non_category_kinds() {
         // A text channel literally named like a category must not match.
         let channels = vec![channel("c1", 0, None)];
-        let (resolved, unresolved) =
-            resolve_categories(&channels, &["name-c1".to_string()]);
+        let (resolved, unresolved) = resolve_categories(&channels, &["name-c1".to_string()]);
         assert!(resolved.is_empty());
         assert_eq!(unresolved, vec!["name-c1".to_string()]);
     }
