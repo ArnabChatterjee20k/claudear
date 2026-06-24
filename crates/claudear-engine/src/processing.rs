@@ -6,6 +6,7 @@ use claudear_analysis::feedback::{
     IssueEmbeddingService, Outcome,
 };
 use claudear_analysis::inference::RepoResolution;
+use claudear_analysis::knowledgebase::DiscordSearchService;
 use claudear_analysis::qa::{
     build_correlation_id, embed_text, find_reusable_qa, format_answer_context,
     format_reuse_context, format_timeout_context, normalize_text,
@@ -167,6 +168,7 @@ pub struct IssueProcessor {
     pub embedding_client: Option<Arc<EmbeddingClient>>,
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub code_search_service: Option<Arc<CodeSearchService>>,
+    pub discord_search_service: Option<Arc<DiscordSearchService>>,
     pub feedback_analyzer: Arc<tokio::sync::Mutex<FeedbackAnalyzer>>,
     pub review_watcher: Option<Arc<ReviewWatcher>>,
     pub user_registry: UserRegistry,
@@ -813,6 +815,15 @@ impl IssueProcessor {
                     _ => {}
                 }
             }
+        }
+
+        // Enrich context with indexed Discord discussions (independent of code index).
+        let discord_ctx = self.discord_grounding_context(issue, 5).await;
+        if !discord_ctx.is_empty() {
+            let metric = ProcessingMetric::new("discord_search_context_added", 1.0)
+                .with_source(source_name.to_string());
+            self.tracker.record_metric(&metric).ok();
+            context = format!("{}\n{}", context, discord_ctx);
         }
 
         // Append PR review feedback context for review-driven reruns
@@ -1521,8 +1532,9 @@ impl IssueProcessor {
             }
         };
 
-        // Retrieve grounding context from the code index across ALL repos.
-        let context = if let Some(ref code_search) = self.code_search_service {
+        // Retrieve grounding context from the code index across ALL repos, plus
+        // any indexed Discord discussions.
+        let mut context = if let Some(ref code_search) = self.code_search_service {
             let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
             match code_search
                 .search(&query, None, self.config.qa.max_context_chunks)
@@ -1536,6 +1548,16 @@ impl IssueProcessor {
         } else {
             String::new()
         };
+        let discord_ctx = self
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks)
+            .await;
+        if !discord_ctx.is_empty() {
+            context = if context.is_empty() {
+                discord_ctx
+            } else {
+                format!("{}\n{}", context, discord_ctx)
+            };
+        }
 
         self.record_issue_decision(
             issue,
@@ -1970,8 +1992,10 @@ impl IssueProcessor {
         }
     }
 
-    /// Retrieve RAG grounding context for an issue from the code index.
+    /// Retrieve RAG grounding context for an issue from the code index, plus any
+    /// indexed Discord discussions.
     async fn build_rag_context(&self, issue: &Issue) -> String {
+        let mut context = String::new();
         if let Some(ref code_search) = self.code_search_service {
             let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
             if let Ok(results) = code_search
@@ -1979,13 +2003,37 @@ impl IssueProcessor {
                 .await
             {
                 if !results.is_empty() {
-                    return claudear_analysis::repo::code_index::format_code_search_context(
-                        &results,
-                    );
+                    context =
+                        claudear_analysis::repo::code_index::format_code_search_context(&results);
                 }
             }
         }
-        String::new()
+        let discord_ctx = self
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks)
+            .await;
+        if !discord_ctx.is_empty() {
+            context = if context.is_empty() {
+                discord_ctx
+            } else {
+                format!("{}\n{}", context, discord_ctx)
+            };
+        }
+        context
+    }
+
+    /// Retrieve grounding context from the indexed Discord knowledge source.
+    /// Empty string when the source is disabled or yields no results.
+    async fn discord_grounding_context(&self, issue: &Issue, limit: usize) -> String {
+        let Some(ref discord_search) = self.discord_search_service else {
+            return String::new();
+        };
+        let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
+        match discord_search.search(&query, None, limit).await {
+            Ok(results) if !results.is_empty() => {
+                claudear_analysis::knowledgebase::format_discord_search_context(&results)
+            }
+            _ => String::new(),
+        }
     }
 
     /// Record an issue-level decision as a "decision" activity entry.
@@ -3409,6 +3457,7 @@ mod tests {
             embedding_client: None,
             issue_embedding_service: None,
             code_search_service: None,
+            discord_search_service: None,
             feedback_analyzer,
             review_watcher: None,
             user_registry: claudear_config::users::UserRegistry::new(

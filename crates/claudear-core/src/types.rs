@@ -526,6 +526,50 @@ impl ReplyKind {
     }
 }
 
+/// Classification of a Discord entity tracked in the `discord_channels` table.
+/// The integer values mirror Discord's own `channel_type` codes
+/// for easy cross-reference against the raw `channel_type` column: `Channel` = 0
+/// (GUILD_TEXT), `Category` = 4 (GUILD_CATEGORY), `Thread` = 11 (PUBLIC_THREAD,
+/// the representative thread type). Whether a thread is archived is tracked
+/// separately by the `discord_channels.archived` flag, not by this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordChannelKind {
+    /// A regular text/forum channel (Discord type 0).
+    Channel,
+    /// A thread (Discord thread type 10/11/12). Archived state is a separate flag.
+    Thread,
+    /// A category (Discord type 4) — groups channels; not indexable itself, but
+    /// tracked so `categories` config selections can be resolved.
+    Category,
+}
+
+impl DiscordChannelKind {
+    /// Integer value persisted in the `discord_channels.kind` column. Mirrors
+    /// Discord `channel_type` codes (see type docs).
+    pub fn as_i64(&self) -> i64 {
+        match self {
+            DiscordChannelKind::Channel => 0,
+            DiscordChannelKind::Category => 4,
+            DiscordChannelKind::Thread => 11,
+        }
+    }
+
+    /// Parse from the persisted integer; unknown values fall back to `Channel`.
+    pub fn from_i64(value: i64) -> Self {
+        match value {
+            4 => DiscordChannelKind::Category,
+            11 => DiscordChannelKind::Thread,
+            _ => DiscordChannelKind::Channel,
+        }
+    }
+
+    /// Whether this entity is a thread rather than a channel or category.
+    pub fn is_thread(&self) -> bool {
+        matches!(self, DiscordChannelKind::Thread)
+    }
+}
+
 /// Outcome of a `Verify` action: whether the agent reproduced the reported issue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyResult {
@@ -2516,6 +2560,33 @@ pub struct CodeSearchResult {
     pub score: f64,
 }
 
+/// A range-based Discord message chunk for embedding (a span of consecutive
+/// messages in a channel or thread). Mirrors the `discord_message_chunks` table.
+/// `channel_id` is the channel *or* thread id (a thread is itself a channel in
+/// Discord); `channel_kind` disambiguates which it is.
+#[derive(Debug, Clone)]
+pub struct DiscordMessageChunk {
+    pub id: Option<i64>,
+    pub guild_id: Option<String>,
+    pub channel_id: String,
+    pub channel_kind: DiscordChannelKind,
+    pub start_message_id: String,
+    pub end_message_id: String,
+    pub participant_ids: Option<Vec<String>>,
+    pub start_message_time: String,
+    pub end_message_time: String,
+    pub chunk_text: String,
+    pub context_text: String,
+    pub content_hash: Option<String>,
+}
+
+/// A Discord chunk search result with similarity score.
+#[derive(Debug, Clone)]
+pub struct DiscordSearchResult {
+    pub chunk: DiscordMessageChunk,
+    pub score: f64,
+}
+
 /// Statistics from a code indexing run.
 #[derive(Debug, Clone, Default)]
 pub struct CodeIndexStats {
@@ -2542,6 +2613,38 @@ impl std::fmt::Display for CodeIndexStats {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DiscordIndexStats {
+    pub messages_processed: usize,
+    pub messages_skipped: usize,
+    pub messages_failed: usize,
+
+    pub channels_processed: usize,
+    pub channels_skipped: usize,
+    pub channels_failed: usize,
+
+    pub threads_processed: usize,
+    pub threads_skipped: usize,
+    pub threads_failed: usize,
+}
+
+impl std::fmt::Display for DiscordIndexStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "messages(processed={}, skipped={}, failed={}), channels(processed={}, skipped={}, failed={}), threads(processed={}, skipped={}, failed={})",
+            self.messages_processed,
+            self.messages_skipped,
+            self.messages_failed,
+            self.channels_processed,
+            self.channels_skipped,
+            self.channels_failed,
+            self.threads_processed,
+            self.threads_skipped,
+            self.threads_failed,
+        )
+    }
+}
 /// Complexity metrics for a single function.
 #[derive(Debug, Clone, Default)]
 pub struct FunctionComplexity {

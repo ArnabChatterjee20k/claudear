@@ -1,5 +1,6 @@
 //! Discord API types for thread management.
 
+use claudear_core::types::DiscordChannelKind;
 use serde::{Deserialize, Serialize};
 
 /// A Discord user.
@@ -35,6 +36,20 @@ pub struct DiscordChannel {
     pub parent_id: Option<String>,
 }
 
+impl DiscordChannel {
+    /// Classify this channel for the `discord_channels` registry by its raw
+    /// Discord `channel_type`: type 4 is a `Category`; thread types (10
+    /// announcement, 11 public, 12 private) map to `Thread`; everything else is
+    /// a `Channel`. Archived state is tracked separately, not by `kind`.
+    pub fn kind(&self) -> DiscordChannelKind {
+        match self.channel_type {
+            4 => DiscordChannelKind::Category,
+            10..=12 => DiscordChannelKind::Thread,
+            _ => DiscordChannelKind::Channel,
+        }
+    }
+}
+
 /// A Discord thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordThread {
@@ -61,12 +76,43 @@ pub struct DiscordThread {
     pub message_count: Option<u32>,
     /// Member count.
     pub member_count: Option<u32>,
+    /// Thread metadata (archive timestamp, etc.). Present on real API responses;
+    /// carries the `archive_timestamp` cursor used to page archived threads.
+    #[serde(default)]
+    pub thread_metadata: Option<ThreadMetadata>,
+}
+
+/// Subset of Discord's `thread_metadata` object.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ThreadMetadata {
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub locked: bool,
+    /// ISO8601 timestamp of when the thread was archived. Used as the `before`
+    /// cursor when paging `GET /channels/{id}/threads/archived/public`.
+    pub archive_timestamp: Option<String>,
 }
 
 impl DiscordThread {
     /// Check if the thread is still active (not archived or locked).
     pub fn is_active(&self) -> bool {
         !self.archived && !self.locked
+    }
+
+    /// Classify this thread for the `discord_channels` registry. A thread always
+    /// has `kind = Thread`; its archived state is carried by the `archived`
+    /// field (persisted to the `discord_channels.archived` flag), not by `kind`.
+    pub fn kind(&self) -> DiscordChannelKind {
+        DiscordChannelKind::Thread
+    }
+
+    /// ISO8601 archive timestamp, if present — the pagination cursor for listing
+    /// archived threads.
+    pub fn archive_timestamp(&self) -> Option<&str> {
+        self.thread_metadata
+            .as_ref()
+            .and_then(|m| m.archive_timestamp.as_deref())
     }
 }
 
@@ -498,6 +544,7 @@ mod tests {
             locked: false,
             message_count: None,
             member_count: None,
+            thread_metadata: None,
         };
         assert!(active_thread.is_active());
 
@@ -907,6 +954,7 @@ mod tests {
             locked: true,
             message_count: None,
             member_count: None,
+            thread_metadata: None,
         };
         assert!(!thread.is_active());
     }
@@ -1191,6 +1239,7 @@ mod tests {
             locked: false,
             message_count: Some(100),
             member_count: Some(10),
+            thread_metadata: None,
         };
         let json = serde_json::to_string(&thread).unwrap();
         let deserialized: DiscordThread = serde_json::from_str(&json).unwrap();

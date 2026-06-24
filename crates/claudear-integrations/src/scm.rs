@@ -2183,9 +2183,9 @@ mod tests {
         use claudear_core::error::{Error, Result};
         use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus, IssueType};
         use claudear_storage::{
-            ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore,
-            ExperimentStore, KnowledgeStore, RegressionStore, RepoStore, SimilarityStore,
-            UserStore, WebhookStore,
+            ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore,
+            EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
+            SimilarityStore, UserStore, WebhookStore,
         };
         use std::collections::{HashMap, HashSet};
         use std::sync::{Arc, Mutex};
@@ -2419,6 +2419,7 @@ mod tests {
         impl EvaluationStore for MockFixAttemptTracker {}
         impl WebhookStore for MockFixAttemptTracker {}
         impl SimilarityStore for MockFixAttemptTracker {}
+        impl DiscordStore for MockFixAttemptTracker {}
 
         fn make_fix_attempt(
             source: &str,
@@ -4045,9 +4046,9 @@ mod tests {
         use claudear_core::error::Result;
         use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
         use claudear_storage::{
-            ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore,
-            ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore, RepoStore,
-            SimilarityStore, UserStore, WebhookStore,
+            ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore,
+            EvaluationStore, ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore,
+            RepoStore, SimilarityStore, UserStore, WebhookStore,
         };
         use std::collections::HashSet;
         use std::sync::{Arc, Mutex};
@@ -4223,6 +4224,7 @@ mod tests {
         impl EvaluationStore for MockTracker {}
         impl WebhookStore for MockTracker {}
         impl SimilarityStore for MockTracker {}
+        impl DiscordStore for MockTracker {}
 
         fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
             CodeReview {
@@ -4734,9 +4736,9 @@ mod tests {
         use claudear_core::error::Result;
         use claudear_core::types::{FixAttempt, FixAttemptStats, FixAttemptStatus};
         use claudear_storage::{
-            ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore,
-            ExperimentStore, KnowledgeStore, RegressionStore, RepoStore, SimilarityStore,
-            UserStore, WebhookStore,
+            ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore,
+            EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
+            SimilarityStore, UserStore, WebhookStore,
         };
         use std::collections::{HashMap, HashSet};
         use std::sync::{Arc, Mutex};
@@ -4937,6 +4939,7 @@ mod tests {
         impl EvaluationStore for MockFixAttemptTracker {}
         impl WebhookStore for MockFixAttemptTracker {}
         impl SimilarityStore for MockFixAttemptTracker {}
+        impl DiscordStore for MockFixAttemptTracker {}
 
         fn make_fix_attempt(
             source: &str,
@@ -5353,9 +5356,9 @@ mod tests {
             ActivityLogEntry, FixAttempt, FixAttemptStats, FixAttemptStatus, PrReviewRecord,
         };
         use claudear_storage::{
-            ActivityStore, AttemptTracker, ChatStore, EmbeddingStore, EvaluationStore,
-            ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore, RepoStore,
-            SimilarityStore, SqliteTracker, UserStore, WebhookStore,
+            ActivityStore, AttemptTracker, ChatStore, DiscordStore, EmbeddingStore,
+            EvaluationStore, ExperimentStore, FixAttemptTracker, KnowledgeStore, RegressionStore,
+            RepoStore, SimilarityStore, SqliteTracker, UserStore, WebhookStore,
         };
         use std::collections::HashSet;
         use std::sync::{Arc, Mutex};
@@ -5558,6 +5561,7 @@ mod tests {
         impl EvaluationStore for MockTrackerWithRecording {}
         impl WebhookStore for MockTrackerWithRecording {}
         impl SimilarityStore for MockTrackerWithRecording {}
+        impl DiscordStore for MockTrackerWithRecording {}
 
         fn make_review(id: i64, state: &str, user: &str, submitted_at: &str) -> CodeReview {
             CodeReview {

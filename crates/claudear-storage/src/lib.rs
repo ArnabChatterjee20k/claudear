@@ -16,8 +16,9 @@ pub use analytics::{
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteTracker;
 pub use types::{
-    ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
-    InferenceStats, PurgeResult, StoredDependency, StoredIndexedRepo, StoredRepository, UserRow,
+    ConfidenceBreakdown, DiagnosticCounts, DiscordKnowledgebaseStats, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, PurgeResult, StoredDependency, StoredDiscordChannel,
+    StoredIndexedRepo, StoredRepository, UserRow,
 };
 #[cfg(feature = "sqlite")]
 pub use vectorlite::{is_vectorlite_available, try_load_vectorlite};
@@ -1344,6 +1345,143 @@ pub trait RepoStore: Send + Sync {
     }
 }
 
+pub trait DiscordStore: Send + Sync {
+    /// Batch-save range-based message chunks. Returns the assigned row ids.
+    fn save_discord_chunks(
+        &self,
+        _chunks: &[claudear_core::types::DiscordMessageChunk],
+    ) -> Result<Vec<i64>> {
+        Ok(Vec::new())
+    }
+
+    /// Save embeddings for message chunks and insert them into the HNSW index.
+    fn save_discord_chunk_embeddings(
+        &self,
+        _pairs: &[(i64, &[f32])],
+        _model_name: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Search message chunks by vector similarity, optionally scoped to one channel.
+    fn search_discord_message_chunks(
+        &self,
+        _query_embedding: &[f32],
+        _channel_id: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
+        Ok(Vec::new())
+    }
+
+    fn discord_chunk_hash_matches(&self, _channel_id: &str, _content_hash: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Delete all chunks (and CASCADE-deleted embeddings) for a channel/thread.
+    fn delete_discord_message_data_for_channel(&self, _channel_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete message chunks (and CASCADE-deleted embeddings) by chunk id.
+    fn delete_discord_message_chunks_by_ids(&self, _chunk_ids: &[i64]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Drop chunks for a channel whose `content_hash` is no longer in
+    /// `current_hashes` (messages edited/deleted since last index).
+    fn cleanup_stale_discord_message_data(
+        &self,
+        _channel_id: &str,
+        _current_hashes: &[String],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete all Discord chunks/embeddings across every channel (full reset).
+    fn delete_all_discord_message_data(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Embedding model name used for the stored Discord chunks (None if none yet).
+    fn get_discord_message_embedding_model(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Get a global value from the discord_message_chunk_metadata table.
+    fn get_discord_message_index_meta(&self, _key: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Set (upsert) a global value in the discord_message_chunk_metadata table.
+    fn set_discord_message_index_meta(&self, _key: &str, _value: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Register or refresh a discovered channel/thread (cursor left untouched).
+    #[expect(clippy::too_many_arguments)]
+    fn upsert_discord_channel(
+        &self,
+        _channel_id: &str,
+        _guild_id: Option<&str>,
+        _parent_id: Option<&str>,
+        _name: Option<&str>,
+        _channel_type: Option<i64>,
+        _kind: claudear_core::types::DiscordChannelKind,
+        _archived: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Incremental cursor for a channel/thread (None => never indexed, backfill).
+    fn get_discord_channel_cursor(&self, _channel_id: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Advance the incremental cursor for a channel/thread.
+    fn set_discord_channel_cursor(
+        &self,
+        _channel_id: &str,
+        _last_message_id: &str,
+        _indexed_at: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Backfill state `(backfill_complete, backfill_cursor)` for a channel/thread.
+    /// Defaults to `(false, None)` when backfill has not started.
+    fn get_discord_channel_backfill(&self, _channel_id: &str) -> Result<(bool, Option<String>)> {
+        Ok((false, None))
+    }
+
+    /// Record backfill progress: whether full history is scraped (`complete`)
+    /// and the oldest indexed id (`backfill_cursor`).
+    fn set_discord_channel_backfill(
+        &self,
+        _channel_id: &str,
+        _complete: bool,
+        _backfill_cursor: Option<&str>,
+        _indexed_at: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// List tracked Discord channels/threads with derived indexing stats
+    /// (chunk count + indexed timeline). Excludes categories.
+    fn list_discord_channels(&self) -> Result<Vec<StoredDiscordChannel>> {
+        Ok(Vec::new())
+    }
+
+    /// Aggregate statistics for the Discord knowledgebase index.
+    fn get_discord_knowledgebase_stats(&self) -> Result<DiscordKnowledgebaseStats> {
+        Ok(DiscordKnowledgebaseStats {
+            channel_count: 0,
+            thread_count: 0,
+            chunk_count: 0,
+            last_indexed_at: None,
+        })
+    }
+}
+
 /// User management, sessions, channels, regression, experiments, diagnostics,
 /// User CRUD, sessions, and channel cursors (all defaulted).
 pub trait UserStore: Send + Sync {
@@ -1550,6 +1688,7 @@ pub trait FixAttemptTracker:
     + UserStore
     + RegressionStore
     + ChatStore
+    + DiscordStore
 {
 }
 
@@ -1566,6 +1705,7 @@ impl<T> FixAttemptTracker for T where
         + UserStore
         + RegressionStore
         + ChatStore
+        + DiscordStore
 {
 }
 
@@ -1655,6 +1795,7 @@ impl RepoStore for NoopTracker {}
 impl UserStore for NoopTracker {}
 impl RegressionStore for NoopTracker {}
 impl ChatStore for NoopTracker {}
+impl DiscordStore for NoopTracker {}
 
 #[cfg(test)]
 mod tests {
@@ -1838,6 +1979,7 @@ mod tests {
         impl UserStore for FullTracker {}
         impl RegressionStore for FullTracker {}
         impl ChatStore for FullTracker {}
+        impl DiscordStore for FullTracker {}
 
         #[test]
         fn test_blanket_impl_auto_satisfies_fix_attempt_tracker() {

@@ -1091,6 +1091,25 @@ https_port = 443
 # HTTP port for HTTP→HTTPS redirect (default: 80, set to 0 to disable)
 http_redirect_port = 80
 
+[knowledgebase.discord]
+enabled = false
+# Falls back to the notifier/issue Discord bot_token when empty.
+bot_token = ""
+# Guild to index. Falls back to the notifier/issue Discord guild_id when empty.
+guild_id = ""
+# Discord categories to index, by name (case-insensitive) or raw category id.
+# Names are resolved to ids at runtime and the mapping is stored in the db.
+# An empty list indexes nothing. e.g. categories = ["Engineering", "Support"]
+# final channels = channels from categories - ignore_channels from the categories
+categories = []
+# Channel/thread ids to exclude from the resolved set.
+ignore_channels = []
+# 0 means full history
+# in days
+backfill_days = 0
+# How often (in hours) to pull and re-index all repositories (default: 6.0, 0 = disable)
+reindex_interval_hours = 6.0
+
 # ============================================
 # Scheduled Reports / Digests
 # ============================================

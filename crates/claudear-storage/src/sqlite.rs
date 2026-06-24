@@ -1,14 +1,14 @@
 //! SQLite-based fix attempt tracker and analytics storage.
 
 use super::types::{
-    ConfidenceBreakdown, DiagnosticCounts, IndexStats, IndexingProgress, InferenceHistoryEntry,
-    InferenceStats, PurgeResult, StoredDependency, StoredIndexedRepo, StoredPrReviewComment,
-    StoredRepository, UserRow,
+    ConfidenceBreakdown, DiagnosticCounts, DiscordKnowledgebaseStats, IndexStats, IndexingProgress,
+    InferenceHistoryEntry, InferenceStats, PurgeResult, StoredDependency, StoredDiscordChannel,
+    StoredIndexedRepo, StoredPrReviewComment, StoredRepository, UserRow,
 };
 use super::{
     is_vectorlite_available, try_load_vectorlite, ActivityStore, AttemptTracker, ChatStore,
-    EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore, RegressionStore, RepoStore,
-    SimilarityStore, UserStore, WebhookStore,
+    DiscordStore, EmbeddingStore, EvaluationStore, ExperimentStore, KnowledgeStore,
+    RegressionStore, RepoStore, SimilarityStore, UserStore, WebhookStore,
 };
 use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
@@ -39,6 +39,9 @@ const OUTCOME_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 const CODE_CHUNK_VECTOR_TABLE: &str = "code_chunk_vectors";
 const CODE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
 const CODE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
+const DISCORD_MESSAGE_CHUNK_VECTOR_TABLE: &str = "discord_message_chunk_vectors";
+const DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH: usize = 200;
+const DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER: usize = 20;
 
 /// Maximum allowed embedding dimension to prevent malformed data from generating
 /// unbounded DDL strings. Covers all common embedding models (up to 8192-dim).
@@ -4341,6 +4344,131 @@ impl SimilarityStore for SqliteTracker {
     }
 }
 
+impl DiscordStore for SqliteTracker {
+    fn save_discord_chunks(
+        &self,
+        chunks: &[claudear_core::types::DiscordMessageChunk],
+    ) -> Result<Vec<i64>> {
+        SqliteTracker::save_discord_chunks(self, chunks)
+    }
+
+    fn save_discord_chunk_embeddings(
+        &self,
+        pairs: &[(i64, &[f32])],
+        model_name: &str,
+    ) -> Result<()> {
+        SqliteTracker::save_discord_chunk_embeddings(self, pairs, model_name)
+    }
+
+    fn search_discord_message_chunks(
+        &self,
+        query_embedding: &[f32],
+        channel_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
+        SqliteTracker::search_discord_message_chunks(self, query_embedding, channel_id, limit)
+    }
+
+    fn discord_chunk_hash_matches(&self, channel_id: &str, content_hash: &str) -> Result<bool> {
+        SqliteTracker::discord_chunk_hash_matches(self, channel_id, content_hash)
+    }
+
+    fn delete_discord_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
+        SqliteTracker::delete_discord_message_data_for_channel(self, channel_id)
+    }
+
+    fn delete_discord_message_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
+        SqliteTracker::delete_discord_message_chunks_by_ids(self, chunk_ids)
+    }
+
+    fn cleanup_stale_discord_message_data(
+        &self,
+        channel_id: &str,
+        current_hashes: &[String],
+    ) -> Result<()> {
+        SqliteTracker::cleanup_stale_discord_message_data(self, channel_id, current_hashes)
+    }
+
+    fn delete_all_discord_message_data(&self) -> Result<()> {
+        SqliteTracker::delete_all_discord_message_data(self)
+    }
+
+    fn get_discord_message_embedding_model(&self) -> Result<Option<String>> {
+        SqliteTracker::get_discord_message_embedding_model(self)
+    }
+
+    fn get_discord_message_index_meta(&self, key: &str) -> Result<Option<String>> {
+        SqliteTracker::get_discord_message_index_meta(self, key)
+    }
+
+    fn set_discord_message_index_meta(&self, key: &str, value: &str) -> Result<()> {
+        SqliteTracker::set_discord_message_index_meta(self, key, value)
+    }
+
+    fn upsert_discord_channel(
+        &self,
+        channel_id: &str,
+        guild_id: Option<&str>,
+        parent_id: Option<&str>,
+        name: Option<&str>,
+        channel_type: Option<i64>,
+        kind: claudear_core::types::DiscordChannelKind,
+        archived: bool,
+    ) -> Result<()> {
+        SqliteTracker::upsert_discord_channel(
+            self,
+            channel_id,
+            guild_id,
+            parent_id,
+            name,
+            channel_type,
+            kind,
+            archived,
+        )
+    }
+
+    fn get_discord_channel_cursor(&self, channel_id: &str) -> Result<Option<String>> {
+        SqliteTracker::get_discord_channel_cursor(self, channel_id)
+    }
+
+    fn set_discord_channel_cursor(
+        &self,
+        channel_id: &str,
+        last_message_id: &str,
+        indexed_at: &str,
+    ) -> Result<()> {
+        SqliteTracker::set_discord_channel_cursor(self, channel_id, last_message_id, indexed_at)
+    }
+
+    fn get_discord_channel_backfill(&self, channel_id: &str) -> Result<(bool, Option<String>)> {
+        SqliteTracker::get_discord_channel_backfill(self, channel_id)
+    }
+
+    fn set_discord_channel_backfill(
+        &self,
+        channel_id: &str,
+        complete: bool,
+        backfill_cursor: Option<&str>,
+        indexed_at: &str,
+    ) -> Result<()> {
+        SqliteTracker::set_discord_channel_backfill(
+            self,
+            channel_id,
+            complete,
+            backfill_cursor,
+            indexed_at,
+        )
+    }
+
+    fn list_discord_channels(&self) -> Result<Vec<StoredDiscordChannel>> {
+        SqliteTracker::list_discord_channels(self)
+    }
+
+    fn get_discord_knowledgebase_stats(&self) -> Result<DiscordKnowledgebaseStats> {
+        SqliteTracker::get_discord_knowledgebase_stats(self)
+    }
+}
+
 impl SqliteTracker {
     /// Record an activity to the activity log.
     /// Persist a single action-pipeline run.
@@ -8341,6 +8469,666 @@ impl SqliteTracker {
         }
 
         Ok(results)
+    }
+
+    /// Save Discord message chunks, returning the inserted row ids (in order).
+    pub fn save_discord_chunks(
+        &self,
+        chunks: &[claudear_core::types::DiscordMessageChunk],
+    ) -> Result<Vec<i64>> {
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let mut ids = Vec::with_capacity(chunks.len());
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO discord_message_chunks (guild_id, channel_id, channel_kind, start_message_id, end_message_id, participant_ids, start_message_time, end_message_time, chunk_text, context_text, content_hash)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "#,
+            )?;
+
+            for chunk in chunks {
+                // Persist participant ids as a comma-separated list (snowflake ids never contain commas).
+                let participants = chunk.participant_ids.as_ref().map(|v| v.join(","));
+                stmt.execute(params![
+                    chunk.guild_id.as_deref(),
+                    &chunk.channel_id,
+                    chunk.channel_kind.as_i64(),
+                    &chunk.start_message_id,
+                    &chunk.end_message_id,
+                    participants,
+                    &chunk.start_message_time,
+                    &chunk.end_message_time,
+                    &chunk.chunk_text,
+                    &chunk.context_text,
+                    chunk.content_hash.as_deref(),
+                ])?;
+                ids.push(tx.last_insert_rowid());
+            }
+        }
+
+        tx.commit()?;
+        Ok(ids)
+    }
+
+    /// Save embeddings for Discord message chunks and insert into the HNSW vector index.
+    pub fn save_discord_chunk_embeddings(
+        &self,
+        pairs: &[(i64, &[f32])],
+        model_name: &str,
+    ) -> Result<()> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.acquire_lock()?;
+
+        let dimension = pairs[0].1.len();
+        let _ = Self::ensure_discord_chunk_vector_table(&conn, dimension);
+
+        let has_vector_table = Self::table_exists(&conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)?;
+
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO discord_message_chunk_embeddings (chunk_id, embedding, embedding_model) VALUES (?1, ?2, ?3)",
+            )?;
+
+            for &(chunk_id, embedding) in pairs {
+                let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+                stmt.execute(params![chunk_id, blob, model_name])?;
+
+                if has_vector_table {
+                    let emb_id = tx.last_insert_rowid();
+                    let insert_sql = format!(
+                        "INSERT INTO {}(rowid, embedding) VALUES (?1, ?2)",
+                        DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+                    );
+                    if let Err(e) = tx.execute(&insert_sql, params![emb_id, blob]) {
+                        tracing::warn!(error = %e, chunk_id, "Failed to insert into discord chunk vector table — aborting batch");
+                        // Drop tx without commit to roll back the entire batch,
+                        // so embeddings and vector index stay consistent.
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Lazily create the HNSW vector table for Discord message chunk embeddings.
+    fn ensure_discord_chunk_vector_table(conn: &Connection, dimension: usize) -> Result<bool> {
+        if dimension == 0 {
+            return Ok(false);
+        }
+        validate_dimension(dimension)?;
+
+        if !is_vectorlite_available(conn) {
+            match try_load_vectorlite(conn) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Unable to load vectorlite for discord chunk search");
+                    return Ok(false);
+                }
+            }
+        }
+
+        if Self::table_exists(conn, DISCORD_MESSAGE_CHUNK_VECTOR_TABLE)? {
+            // Reuse the existing table only if its declared dimension matches.
+            // After an embedding-model upgrade the vector length can change, so a
+            // stale `float32[N]` table must be dropped and recreated — otherwise
+            // inserts of the new blobs fail and searches see stale vectors.
+            let existing_sql: Option<String> = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![DISCORD_MESSAGE_CHUNK_VECTOR_TABLE],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let matches = existing_sql
+                .as_deref()
+                .map(|sql| sql.contains(&format!("float32[{}]", dimension)))
+                .unwrap_or(false);
+            if matches {
+                return Ok(true);
+            }
+            tracing::info!(
+                dimension,
+                "Discord chunk vector table dimension changed — recreating"
+            );
+            conn.execute_batch(&format!(
+                "DROP TABLE IF EXISTS {}",
+                DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+            ))?;
+        }
+
+        let sql = format!(
+            r#"
+            CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vectorlite(
+                embedding float32[{dimension}] cosine,
+                hnsw(max_elements=100000, ef_construction=200, M=16)
+            )
+            "#,
+            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE,
+            dimension = dimension
+        );
+
+        match conn.execute_batch(&sql) {
+            Ok(()) => {
+                // Backfill existing embeddings.
+                let backfill = format!(
+                    r#"
+                    INSERT INTO {table}(rowid, embedding)
+                    SELECT id, embedding
+                    FROM discord_message_chunk_embeddings
+                    WHERE length(embedding) = ?1
+                    "#,
+                    table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+                );
+                if let Err(e) = conn.execute(&backfill, params![(dimension * 4) as i64]) {
+                    tracing::debug!(error = %e, "Failed to backfill discord chunk vector embeddings");
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to create discord chunk vector table");
+                Ok(false)
+            }
+        }
+    }
+
+    /// Search Discord message chunks by vector similarity using the HNSW index.
+    pub fn search_discord_message_chunks(
+        &self,
+        query_embedding: &[f32],
+        channel_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<claudear_core::types::DiscordSearchResult>> {
+        use claudear_core::types::{DiscordChannelKind, DiscordMessageChunk, DiscordSearchResult};
+
+        if query_embedding.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Clamp limit to prevent excessive memory usage from the HNSW candidate multiplier.
+        let limit = limit.min(1000);
+
+        let conn = self.acquire_lock()?;
+
+        if !Self::ensure_discord_chunk_vector_table(&conn, query_embedding.len())? {
+            // Vectorlite unavailable — fall back to empty results.
+            return Ok(Vec::new());
+        }
+
+        let query_blob: Vec<u8> = query_embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        let candidate_limit = limit * DISCORD_MESSAGE_CHUNK_VECTOR_CANDIDATE_MULTIPLIER;
+
+        let sql = format!(
+            r#"
+            WITH candidates AS (
+                SELECT rowid AS emb_id,
+                       MAX(0.0, MIN(1.0, 1.0 - distance)) AS similarity
+                FROM {table}
+                WHERE knn_search(embedding, knn_param(?1, ?2, ?3))
+            )
+            SELECT c.similarity,
+                   ch.id, ch.guild_id, ch.channel_id, ch.channel_kind,
+                   ch.start_message_id, ch.end_message_id, ch.participant_ids,
+                   ch.start_message_time, ch.end_message_time,
+                   ch.chunk_text, ch.context_text, ch.content_hash
+            FROM candidates c
+            JOIN discord_message_chunk_embeddings e ON e.id = c.emb_id
+            JOIN discord_message_chunks ch ON ch.id = e.chunk_id
+            WHERE (?4 IS NULL OR ch.channel_id = ?4)
+            ORDER BY c.similarity DESC
+            LIMIT ?5
+            "#,
+            table = DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+        );
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to prepare discord chunk vector search");
+                return Ok(Vec::new());
+            }
+        };
+
+        let rows = match stmt.query_map(
+            params![
+                query_blob,
+                candidate_limit as i64,
+                DISCORD_MESSAGE_CHUNK_VECTOR_EF_SEARCH as i64,
+                channel_id,
+                limit as i64,
+            ],
+            |row| {
+                let similarity: f64 = row.get(0)?;
+                let kind_int: i64 = row.get(4)?;
+                let participants: Option<String> = row.get(7)?;
+                Ok(DiscordSearchResult {
+                    chunk: DiscordMessageChunk {
+                        id: row.get(1)?,
+                        guild_id: row.get(2)?,
+                        channel_id: row.get(3)?,
+                        channel_kind: DiscordChannelKind::from_i64(kind_int),
+                        start_message_id: row.get(5)?,
+                        end_message_id: row.get(6)?,
+                        participant_ids: participants.map(|s| {
+                            s.split(',')
+                                .filter(|x| !x.is_empty())
+                                .map(String::from)
+                                .collect()
+                        }),
+                        start_message_time: row.get(8)?,
+                        end_message_time: row.get(9)?,
+                        chunk_text: row.get(10)?,
+                        context_text: row.get(11)?,
+                        content_hash: row.get(12)?,
+                    },
+                    score: similarity,
+                })
+            },
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "Discord chunk vector search failed");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(r) => results.push(r),
+                Err(e) => tracing::debug!(error = %e, "Failed to read discord chunk vector row"),
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn discord_chunk_hash_matches(&self, channel_id: &str, content_hash: &str) -> Result<bool> {
+        let conn = self.acquire_lock()?;
+        let (chunk_count, embedded_count): (i64, i64) = conn.query_row(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM discord_message_chunks
+                 WHERE channel_id = ?1 AND content_hash = ?2),
+                (SELECT COUNT(*) FROM discord_message_chunks c
+                 JOIN discord_message_chunk_embeddings e ON e.chunk_id = c.id
+                 WHERE c.channel_id = ?1 AND c.content_hash = ?2)
+            "#,
+            params![channel_id, content_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(chunk_count > 0 && chunk_count == embedded_count)
+    }
+
+    /// Delete all indexed chunks (and CASCADE-deleted embeddings) for a channel/thread.
+    pub fn delete_discord_message_data_for_channel(&self, channel_id: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+
+        // embeddings will be deleted via the cascade delete
+        conn.execute(
+            "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
+            params![channel_id],
+        )?;
+        Ok(())
+    }
+
+    /// Delete Discord message chunks (and their CASCADE-deleted embeddings) by chunk IDs.
+    pub fn delete_discord_message_chunks_by_ids(&self, chunk_ids: &[i64]) -> Result<()> {
+        if chunk_ids.is_empty() {
+            return Ok(());
+        };
+        let conn = self.acquire_lock()?;
+        let placeholders: Vec<String> = (1..=chunk_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "DELETE FROM discord_message_chunks WHERE id IN ({})",
+            placeholders.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = chunk_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
+        // embeddings will be deleted via the cascade delete
+        conn.execute(&sql, params.as_slice())?;
+        Ok(())
+    }
+
+    /// Remove indexed chunks for a channel whose `content_hash` is no longer in current_hashes
+    pub fn cleanup_stale_discord_message_data(
+        &self,
+        channel_id: &str,
+        current_hashes: &[String],
+    ) -> Result<()> {
+        let mut conn = self.acquire_lock()?;
+
+        if current_hashes.is_empty() {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "DELETE FROM discord_message_chunks WHERE channel_id = ?1",
+                params![channel_id],
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
+
+        let indexed: Vec<(i64, Option<String>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT id, content_hash FROM discord_message_chunks WHERE channel_id = ?1",
+            )?;
+            let rows: Vec<(i64, Option<String>)> = stmt
+                .query_map(params![channel_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            rows
+        };
+
+        let current_set: std::collections::HashSet<&str> =
+            current_hashes.iter().map(|s| s.as_str()).collect();
+
+        let stale_ids: Vec<i64> = indexed
+            .into_iter()
+            .filter_map(|(id, hash)| match hash {
+                Some(h) if !current_set.contains(h.as_str()) => Some(id),
+                _ => None,
+            })
+            .collect();
+
+        if !stale_ids.is_empty() {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for id in &stale_ids {
+                tx.execute(
+                    "DELETE FROM discord_message_chunks WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_all_discord_message_data(&self) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        // Embeddings CASCADE via the discord_message_chunks FK.
+        conn.execute("DELETE FROM discord_message_chunks", [])?;
+        // Reset the channel registry/cursors so a forced full re-index re-backfills
+        // history instead of resuming incrementally from a now-stale cursor.
+        conn.execute("DELETE FROM discord_channels", [])?;
+        // Drop the HNSW vector table so it is recreated fresh — clears stale vectors
+        // and lets a new embedding model's dimension take effect. Best-effort: it may
+        // not exist, or vectorlite may be unavailable on this connection.
+        let _ = conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {}",
+            DISCORD_MESSAGE_CHUNK_VECTOR_TABLE
+        ));
+        Ok(())
+    }
+
+    /// Embedding model name used for the stored Discord chunks (None if none yet).
+    pub fn get_discord_message_embedding_model(&self) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT embedding_model FROM discord_message_chunk_embeddings LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn get_discord_message_index_meta(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT value FROM discord_message_chunk_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Set (upsert) a global value in the discord_message_chunk_metadata table.
+    pub fn set_discord_message_index_meta(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "INSERT INTO discord_message_chunk_metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Register or refresh a discovered channel/thread in the `discord_channels`
+    /// registry. Leaves the incremental cursor (`last_indexed_*`) untouched.
+    #[expect(clippy::too_many_arguments)]
+    pub fn upsert_discord_channel(
+        &self,
+        channel_id: &str,
+        guild_id: Option<&str>,
+        parent_id: Option<&str>,
+        name: Option<&str>,
+        channel_type: Option<i64>,
+        kind: claudear_core::types::DiscordChannelKind,
+        archived: bool,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO discord_channels (channel_id, guild_id, parent_id, name, channel_type, kind, archived)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                guild_id = excluded.guild_id,
+                parent_id = excluded.parent_id,
+                name = excluded.name,
+                channel_type = excluded.channel_type,
+                kind = excluded.kind,
+                archived = excluded.archived
+            "#,
+            params![
+                channel_id,
+                guild_id,
+                parent_id,
+                name,
+                channel_type,
+                kind.as_i64(),
+                archived as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Incremental cursor for a channel/thread: the last message id indexed.
+    /// `None` means the channel has never been indexed (do a backfill).
+    pub fn get_discord_channel_cursor(&self, channel_id: &str) -> Result<Option<String>> {
+        let conn = self.acquire_lock()?;
+        let result: Option<Option<String>> = conn
+            .query_row(
+                "SELECT last_indexed_message_id FROM discord_channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(result.flatten())
+    }
+
+    /// Advance the incremental cursor for a channel/thread to `last_message_id`.
+    pub fn set_discord_channel_cursor(
+        &self,
+        channel_id: &str,
+        last_message_id: &str,
+        indexed_at: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO discord_channels (channel_id, last_indexed_message_id, last_indexed_at)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                last_indexed_message_id = excluded.last_indexed_message_id,
+                last_indexed_at = excluded.last_indexed_at
+            "#,
+            params![channel_id, last_message_id, indexed_at],
+        )?;
+        Ok(())
+    }
+
+    /// Backfill state for a channel/thread: `(backfill_complete, backfill_cursor)`.
+    /// Defaults to `(false, None)` when the channel has no row yet — i.e. backfill
+    /// has not started, so it is not complete and there is no progress cursor.
+    pub fn get_discord_channel_backfill(&self, channel_id: &str) -> Result<(bool, Option<String>)> {
+        let conn = self.acquire_lock()?;
+        let result: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT backfill_complete, backfill_cursor FROM discord_channels WHERE channel_id = ?1",
+                params![channel_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(result
+            .map(|(complete, cursor)| (complete != 0, cursor))
+            .unwrap_or((false, None)))
+    }
+
+    /// Record backfill progress for a channel/thread: whether the full history is
+    /// now scraped (`complete`) and the oldest indexed id (`backfill_cursor`,
+    /// the point to page *before* on the next backfill step).
+    pub fn set_discord_channel_backfill(
+        &self,
+        channel_id: &str,
+        complete: bool,
+        backfill_cursor: Option<&str>,
+        indexed_at: &str,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            r#"
+            INSERT INTO discord_channels (channel_id, backfill_complete, backfill_cursor, last_indexed_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(channel_id) DO UPDATE SET
+                backfill_complete = excluded.backfill_complete,
+                backfill_cursor = excluded.backfill_cursor,
+                last_indexed_at = excluded.last_indexed_at
+            "#,
+            params![channel_id, complete as i64, backfill_cursor, indexed_at],
+        )?;
+        Ok(())
+    }
+
+    /// List tracked Discord channels/threads with derived indexing stats. The
+    /// indexed timeline (`indexed_from`/`indexed_to`) and `chunk_count` are
+    /// aggregated from `discord_message_chunks`; categories are excluded since
+    /// they are never indexed themselves.
+    pub fn list_discord_channels(&self) -> Result<Vec<StoredDiscordChannel>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT
+                c.channel_id,
+                c.guild_id,
+                c.parent_id,
+                -- Category of a channel is its direct parent (cat_direct); for a
+                -- thread the parent is a channel, so go one more hop (cat_thread).
+                COALESCE(cat_direct.name, cat_thread.name) AS category_name,
+                c.name,
+                c.kind,
+                c.archived,
+                c.backfill_complete,
+                c.last_indexed_message_id,
+                c.last_indexed_at,
+                COUNT(ch.id) AS chunk_count,
+                MIN(ch.start_message_time) AS indexed_from,
+                MAX(ch.end_message_time) AS indexed_to
+            FROM discord_channels c
+            LEFT JOIN discord_message_chunks ch ON ch.channel_id = c.channel_id
+            LEFT JOIN discord_channels cat_direct
+                   ON cat_direct.channel_id = c.parent_id AND cat_direct.kind = 4
+            LEFT JOIN discord_channels parent_chan
+                   ON parent_chan.channel_id = c.parent_id AND parent_chan.kind = 0
+            LEFT JOIN discord_channels cat_thread
+                   ON cat_thread.channel_id = parent_chan.parent_id AND cat_thread.kind = 4
+            WHERE c.kind != 4
+            GROUP BY c.channel_id
+            ORDER BY c.name
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let kind = claudear_core::types::DiscordChannelKind::from_i64(row.get(5)?);
+            let kind_str = match kind {
+                claudear_core::types::DiscordChannelKind::Channel => "channel",
+                claudear_core::types::DiscordChannelKind::Thread => "thread",
+                claudear_core::types::DiscordChannelKind::Category => "category",
+            };
+            Ok(StoredDiscordChannel {
+                channel_id: row.get(0)?,
+                guild_id: row.get(1)?,
+                parent_id: row.get(2)?,
+                category_name: row.get(3)?,
+                name: row.get(4)?,
+                kind: kind_str.to_string(),
+                archived: row.get::<_, i64>(6)? != 0,
+                backfill_complete: row.get::<_, i64>(7)? != 0,
+                last_indexed_message_id: row.get(8)?,
+                last_indexed_at: row.get(9)?,
+                chunk_count: row.get(10)?,
+                indexed_from: row.get(11)?,
+                indexed_to: row.get(12)?,
+            })
+        })?;
+
+        let mut channels = Vec::new();
+        for row in rows.flatten() {
+            channels.push(row);
+        }
+        Ok(channels)
+    }
+
+    /// Aggregate statistics for the Discord knowledgebase index.
+    pub fn get_discord_knowledgebase_stats(&self) -> Result<DiscordKnowledgebaseStats> {
+        let conn = self.acquire_lock()?;
+
+        let channel_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM discord_channels WHERE kind = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let thread_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM discord_channels WHERE kind = 11",
+            [],
+            |row| row.get(0),
+        )?;
+        let chunk_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM discord_message_chunks", [], |row| {
+                row.get(0)
+            })?;
+        let last_indexed_at: Option<String> = conn
+            .query_row(
+                "SELECT MAX(last_indexed_at) FROM discord_channels",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        Ok(DiscordKnowledgebaseStats {
+            channel_count: channel_count as usize,
+            thread_count: thread_count as usize,
+            chunk_count: chunk_count as usize,
+            last_indexed_at,
+        })
     }
 
     /// Find code symbols by name (substring match).
@@ -17202,6 +17990,281 @@ mod tests {
     fn test_save_code_chunk_embeddings_empty() {
         let tracker = SqliteTracker::in_memory().unwrap();
         tracker.save_code_chunk_embeddings(&[], "test").unwrap();
+    }
+
+    // --- Discord message chunks (vectorlite) ---
+
+    fn sample_discord_chunk(
+        channel_id: &str,
+        start_id: &str,
+    ) -> claudear_core::types::DiscordMessageChunk {
+        claudear_core::types::DiscordMessageChunk {
+            id: None,
+            guild_id: Some("guild1".to_string()),
+            channel_id: channel_id.to_string(),
+            channel_kind: claudear_core::types::DiscordChannelKind::Channel,
+            start_message_id: start_id.to_string(),
+            end_message_id: start_id.to_string(),
+            participant_ids: Some(vec!["u1".to_string(), "u2".to_string()]),
+            start_message_time: "2024-01-01T00:00:00Z".to_string(),
+            end_message_time: "2024-01-01T00:05:00Z".to_string(),
+            chunk_text: "hello world".to_string(),
+            context_text: "channel general\nhello world".to_string(),
+            content_hash: Some(format!("hash-{}", start_id)),
+        }
+    }
+
+    #[test]
+    fn test_save_discord_chunks_returns_ids() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let chunks = vec![
+            sample_discord_chunk("100", "1001"),
+            sample_discord_chunk("100", "1002"),
+        ];
+        let ids = tracker.save_discord_chunks(&chunks).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn test_save_discord_chunks_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let ids = tracker.save_discord_chunks(&[]).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_save_discord_chunk_embeddings_empty() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker.save_discord_chunk_embeddings(&[], "test").unwrap();
+    }
+
+    #[test]
+    fn test_search_discord_chunks_empty_embedding() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let results = tracker
+            .search_discord_message_chunks(&[], None, 10)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_discord_chunks_zero_limit() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let results = tracker
+            .search_discord_message_chunks(&[0.1, 0.2, 0.3, 0.4], None, 0)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_save_discord_chunk_embeddings_and_search() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let chunks = vec![
+            sample_discord_chunk("100", "1001"),
+            sample_discord_chunk("200", "2001"),
+        ];
+        let ids = tracker.save_discord_chunks(&chunks).unwrap();
+
+        let emb_a = vec![1.0f32, 0.0, 0.0, 0.0];
+        let emb_b = vec![0.0f32, 1.0, 0.0, 0.0];
+        tracker
+            .save_discord_chunk_embeddings(&[(ids[0], &emb_a), (ids[1], &emb_b)], "test-model")
+            .unwrap();
+
+        // Query nearest to the first chunk. When vectorlite is available the
+        // nearest match (channel "100") comes back; when it is not, search
+        // degrades to empty results — both are valid outcomes.
+        let results = tracker
+            .search_discord_message_chunks(&[0.9f32, 0.1, 0.0, 0.0], None, 5)
+            .unwrap();
+        if let Some(top) = results.first() {
+            assert_eq!(top.chunk.channel_id, "100");
+            assert_eq!(top.chunk.start_message_id, "1001");
+            assert_eq!(
+                top.chunk.participant_ids.as_deref(),
+                Some(["u1".to_string(), "u2".to_string()].as_slice())
+            );
+            assert!(top.score >= results.last().unwrap().score);
+        }
+
+        // The optional channel_id filter must restrict results to that channel.
+        let filtered = tracker
+            .search_discord_message_chunks(&[0.0f32, 0.9, 0.0, 0.0], Some("200"), 5)
+            .unwrap();
+        for r in &filtered {
+            assert_eq!(r.chunk.channel_id, "200");
+        }
+    }
+
+    #[test]
+    fn test_discord_channel_backfill_defaults_when_absent() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // No row yet => not complete, no progress cursor.
+        let (complete, cursor) = tracker.get_discord_channel_backfill("chan-x").unwrap();
+        assert!(!complete);
+        assert_eq!(cursor, None);
+        // Forward cursor also absent.
+        assert_eq!(tracker.get_discord_channel_cursor("chan-x").unwrap(), None);
+    }
+
+    #[test]
+    fn test_delete_all_discord_message_data_resets_channels() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // A chunk + a channel with completed backfill and a forward cursor.
+        tracker
+            .save_discord_chunks(&[sample_discord_chunk("100", "1001")])
+            .unwrap();
+        tracker
+            .upsert_discord_channel(
+                "100",
+                Some("g"),
+                None,
+                Some("general"),
+                Some(0),
+                claudear_core::types::DiscordChannelKind::Channel,
+                false,
+            )
+            .unwrap();
+        tracker
+            .set_discord_channel_backfill("100", true, Some("1"), "2024-01-01T00:00:00Z")
+            .unwrap();
+        tracker
+            .set_discord_channel_cursor("100", "1001", "2024-01-01T00:00:00Z")
+            .unwrap();
+
+        tracker.delete_all_discord_message_data().unwrap();
+
+        // Chunks gone, and the channel registry/cursors reset so a re-run backfills.
+        assert!(!tracker
+            .discord_chunk_hash_matches("100", "hash-1001")
+            .unwrap());
+        let (complete, backfill_cursor) = tracker.get_discord_channel_backfill("100").unwrap();
+        assert!(!complete);
+        assert_eq!(backfill_cursor, None);
+        assert_eq!(tracker.get_discord_channel_cursor("100").unwrap(), None);
+    }
+
+    #[test]
+    fn test_discord_channel_backfill_roundtrip() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // Mid-backfill: progress recorded, not complete.
+        tracker
+            .set_discord_channel_backfill("c1", false, Some("900"), "2024-01-01T00:00:00Z")
+            .unwrap();
+        let (complete, cursor) = tracker.get_discord_channel_backfill("c1").unwrap();
+        assert!(!complete);
+        assert_eq!(cursor.as_deref(), Some("900"));
+
+        // Forward cursor is independent of backfill progress.
+        tracker
+            .set_discord_channel_cursor("c1", "1000", "2024-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(
+            tracker.get_discord_channel_cursor("c1").unwrap().as_deref(),
+            Some("1000")
+        );
+
+        // Completing backfill flips the flag without disturbing the forward cursor.
+        tracker
+            .set_discord_channel_backfill("c1", true, Some("1"), "2024-01-02T00:00:00Z")
+            .unwrap();
+        let (complete, cursor) = tracker.get_discord_channel_backfill("c1").unwrap();
+        assert!(complete);
+        assert_eq!(cursor.as_deref(), Some("1"));
+        assert_eq!(
+            tracker.get_discord_channel_cursor("c1").unwrap().as_deref(),
+            Some("1000")
+        );
+    }
+
+    #[test]
+    fn test_list_discord_channels_with_stats() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        // A regular channel with two chunks spanning a wider time window.
+        let mut early = sample_discord_chunk("100", "1001");
+        early.start_message_time = "2024-01-01T00:00:00Z".to_string();
+        early.end_message_time = "2024-01-01T00:05:00Z".to_string();
+        let mut late = sample_discord_chunk("100", "1002");
+        late.start_message_time = "2024-03-01T00:00:00Z".to_string();
+        late.end_message_time = "2024-03-01T12:00:00Z".to_string();
+        tracker.save_discord_chunks(&[early, late]).unwrap();
+        tracker
+            .upsert_discord_channel(
+                "100",
+                Some("g"),
+                Some("300"), // parent category 300 ("a-category")
+                Some("general"),
+                Some(0),
+                claudear_core::types::DiscordChannelKind::Channel,
+                false,
+            )
+            .unwrap();
+        tracker
+            .set_discord_channel_backfill("100", true, Some("1"), "2024-03-02T00:00:00Z")
+            .unwrap();
+        tracker
+            .set_discord_channel_cursor("100", "1002", "2024-03-02T00:00:00Z")
+            .unwrap();
+
+        // A thread (no chunks yet) and a category (must be excluded).
+        tracker
+            .upsert_discord_channel(
+                "200",
+                Some("g"),
+                Some("100"),
+                Some("a-thread"),
+                Some(11),
+                claudear_core::types::DiscordChannelKind::Thread,
+                false,
+            )
+            .unwrap();
+        tracker
+            .upsert_discord_channel(
+                "300",
+                Some("g"),
+                None,
+                Some("a-category"),
+                Some(4),
+                claudear_core::types::DiscordChannelKind::Category,
+                false,
+            )
+            .unwrap();
+
+        let channels = tracker.list_discord_channels().unwrap();
+        // Category excluded => only the channel + thread.
+        assert_eq!(channels.len(), 2);
+
+        let general = channels.iter().find(|c| c.channel_id == "100").unwrap();
+        assert_eq!(general.kind, "channel");
+        assert_eq!(general.name.as_deref(), Some("general"));
+        // Channel's category is its direct parent.
+        assert_eq!(general.category_name.as_deref(), Some("a-category"));
+        assert!(general.backfill_complete);
+        assert_eq!(general.chunk_count, 2);
+        assert_eq!(
+            general.indexed_from.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
+        assert_eq!(general.indexed_to.as_deref(), Some("2024-03-01T12:00:00Z"));
+        assert_eq!(general.last_indexed_message_id.as_deref(), Some("1002"));
+
+        let thread = channels.iter().find(|c| c.channel_id == "200").unwrap();
+        assert_eq!(thread.kind, "thread");
+        assert_eq!(thread.chunk_count, 0);
+        assert_eq!(thread.indexed_from, None);
+        assert_eq!(thread.indexed_to, None);
+        // Thread's category is resolved via its parent channel (200 -> 100 -> 300).
+        assert_eq!(thread.category_name.as_deref(), Some("a-category"));
+
+        // Aggregate stats: 1 channel, 1 thread, 2 chunks.
+        let stats = tracker.get_discord_knowledgebase_stats().unwrap();
+        assert_eq!(stats.channel_count, 1);
+        assert_eq!(stats.thread_count, 1);
+        assert_eq!(stats.chunk_count, 2);
+        assert!(stats.last_indexed_at.is_some());
     }
 
     #[test]

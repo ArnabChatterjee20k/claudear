@@ -412,6 +412,9 @@ pub struct Config {
     /// RAG-grounded question answering configuration.
     #[serde(default)]
     pub qa: QaConfig,
+    /// knowledgebase configuration
+    #[serde(default)]
+    pub knowledgebase: KnowledgebasesConfig,
     /// Scheduled reports / digests configuration group.
     #[serde(default)]
     pub reports: ReportsConfig,
@@ -605,6 +608,7 @@ impl Default for Config {
             tls: TlsConfig::default(),
             embedding: EmbeddingModelConfig::default(),
             qa: QaConfig::default(),
+            knowledgebase: KnowledgebasesConfig::default(),
             reports: ReportsConfig::default(),
         }
     }
@@ -1928,6 +1932,42 @@ impl Default for RegressionConfig {
             github_token: None,
             github_search_repos: Vec::new(),
             package_names: std::collections::HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KnowledgebasesConfig {
+    pub discord: Option<DiscordKnowledgebaseConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscordKnowledgebaseConfig {
+    pub enabled: bool,
+    pub bot_token: Option<SecretValue>,
+    /// Guild to index. Falls back to the merged notifier/issue Discord guild_id
+    /// when unset (see `Config::discord_merged`).
+    pub guild_id: Option<String>,
+    pub categories: Vec<String>,
+    pub ignore_channels: Vec<String>,
+    pub backfill_days: Option<u64>,
+    pub reindex_interval_hours: f64,
+}
+
+impl Default for DiscordKnowledgebaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: None,
+            guild_id: None,
+            categories: Vec::new(),
+            ignore_channels: Vec::new(),
+            backfill_days: None,
+            // Match the documented default so periodic reindexing isn't silently
+            // disabled when the field is omitted from an enabled config.
+            reindex_interval_hours: 6.0,
         }
     }
 }
@@ -3351,6 +3391,55 @@ mod tests {
         assert_eq!(cfg.trigger_status, "active");
         assert_eq!(cfg.reply_as, ReplyAs::Note);
         assert!(cfg.trigger_tags.contains(&"claude".to_string()));
+    }
+
+    #[test]
+    fn test_knowledgebase_discord_parses_from_toml() {
+        // Mirrors the documented [knowledgebase.discord] block: the table name and
+        // every field must deserialize into DiscordKnowledgebaseConfig.
+        let toml = r#"
+            [knowledgebase.discord]
+            enabled = true
+            bot_token = "tok"
+            guild_id = "G123"
+            categories = ["cat1", "cat2"]
+            ignore_channels = ["c9"]
+            backfill_days = 7
+            reindex_interval_hours = 12.0
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let d = cfg
+            .knowledgebase
+            .discord
+            .expect("discord knowledgebase present");
+        assert!(d.enabled);
+        assert_eq!(d.guild_id.as_deref(), Some("G123"));
+        assert_eq!(d.categories, vec!["cat1".to_string(), "cat2".to_string()]);
+        assert_eq!(d.ignore_channels, vec!["c9".to_string()]);
+        assert_eq!(d.backfill_days, Some(7));
+        assert_eq!(d.reindex_interval_hours, 12.0);
+    }
+
+    #[test]
+    fn test_knowledgebase_discord_defaults_reindex_to_six_hours() {
+        // Omitting reindex_interval_hours must default to 6.0, not 0.0 (which would
+        // silently disable periodic reindexing).
+        let toml = r#"
+            [knowledgebase.discord]
+            enabled = true
+            categories = ["cat1"]
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let d = cfg
+            .knowledgebase
+            .discord
+            .expect("discord knowledgebase present");
+        assert!(d.enabled);
+        assert_eq!(d.reindex_interval_hours, 6.0);
+        assert_eq!(
+            DiscordKnowledgebaseConfig::default().reindex_interval_hours,
+            6.0
+        );
     }
 
     #[test]

@@ -369,6 +369,8 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
         review_watcher: None,
         issue_embedding_service: None,
         code_search_service: None,
+        discord_search_service: None,
+        discord_index_orchestrator: None,
         relationships: None,
         github_client: None,
         scm_provider: None,

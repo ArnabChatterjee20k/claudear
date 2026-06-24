@@ -56,6 +56,9 @@ impl HousekeepingWorker {
         let reindex_interval = self.watcher.reindex_interval();
         let mut last_reindex = Instant::now();
 
+        let discord_reindex_interval = self.watcher.discord_reindex_interval();
+        let mut last_discord_reindex = Instant::now();
+
         // Weekly digest of repetitive, non-actionable Sentry issues. State is
         // held locally in this owned loop (no interior mutability needed). On a
         // process restart `last_sent_at` resets; `is_due` gates on weekday +
@@ -95,6 +98,14 @@ impl HousekeepingWorker {
                 if last_reindex.elapsed() >= reindex_dur {
                     self.watcher.pull_and_reindex_all_repos().await;
                     last_reindex = Instant::now();
+                }
+            }
+
+            // Periodically re-index the Discord knowledge source
+            if let Some(discord_dur) = discord_reindex_interval {
+                if last_discord_reindex.elapsed() >= discord_dur {
+                    self.watcher.reindex_discord_knowledgebase().await;
+                    last_discord_reindex = Instant::now();
                 }
             }
 
