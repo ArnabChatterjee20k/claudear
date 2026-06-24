@@ -31,8 +31,8 @@ impl HousekeepingWorker {
     ///
     /// 1. Warm-start (clone repos, sync DB, load feedback).
     /// 2. Mark the watcher as running.
-    /// 3. On every tick: retries, cascades, auto-close, reviews, metrics, and
-    ///    periodic learning.
+    /// 3. On every tick: retries, cascades, auto-close, reviews, metrics,
+    ///    periodic learning and report-gen
     pub async fn start(&self) -> anyhow::Result<()> {
         // Warm-start: clone repos, sync to DB, index code, load feedback
         self.watcher.warm_start().await?;
@@ -129,21 +129,28 @@ impl HousekeepingWorker {
                 }
             };
 
-            let (_, _, housekeeping_ok, _) =
-                tokio::join!(auto_close_fut, reviews_fut, housekeeping_fut, learning_fut);
-
             // Weekly repetitive-issues digest (report-only).
-            if !self.watcher.is_dry_run() {
-                if let Some(schedule) = digest_schedule.as_mut() {
-                    let now = Utc::now();
-                    if schedule.is_due(now) {
-                        if let Err(e) = self.watcher.send_repetitive_digest().await {
-                            tracing::error!(component = "digest", error = %e, "Error sending repetitive-issues digest");
+            let digest_fut = async {
+                if !self.watcher.is_dry_run() {
+                    if let Some(schedule) = digest_schedule.as_mut() {
+                        let now = Utc::now();
+                        if schedule.is_due(now) {
+                            if let Err(e) = self.watcher.send_repetitive_digest().await {
+                                tracing::error!(component = "digest", error = %e, "Error sending repetitive-issues digest");
+                            }
+                            schedule.last_sent_at = Some(now);
                         }
-                        schedule.last_sent_at = Some(now);
                     }
                 }
-            }
+            };
+
+            let (_, _, housekeeping_ok, _, _) = tokio::join!(
+                auto_close_fut,
+                reviews_fut,
+                housekeeping_fut,
+                learning_fut,
+                digest_fut
+            );
 
             let duration_secs = cron_start.elapsed().as_secs_f64();
             let cron_status = if housekeeping_ok { "ok" } else { "error" };
