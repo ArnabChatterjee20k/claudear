@@ -1097,8 +1097,12 @@ enabled = false
 bot_token = ""
 # Guild to index. Falls back to the notifier/issue Discord guild_id when empty.
 guild_id = ""
+# Discord categories to index, by name (case-insensitive) or raw category id.
+# Names are resolved to ids at runtime and the mapping is stored in the db.
+# An empty list indexes nothing. e.g. categories = ["Engineering", "Support"]
 # final channels = channels from categories - ignore_channels from the categories
 categories = []
+# Channel/thread ids to exclude from the resolved set.
 ignore_channels = []
 # 0 means full history
 # in days

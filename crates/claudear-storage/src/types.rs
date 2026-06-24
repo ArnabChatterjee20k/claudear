@@ -45,6 +45,11 @@ pub struct StoredDiscordChannel {
     pub channel_id: String,
     pub guild_id: Option<String>,
     pub parent_id: Option<String>,
+    /// Name of the category this channel/thread belongs to, resolved from the
+    /// persisted category rows. For a channel this is its parent category; for a
+    /// thread it is the category of its parent channel. `None` if uncategorised
+    /// or the category has not been indexed yet.
+    pub category_name: Option<String>,
     pub name: Option<String>,
     /// "channel" | "thread" | "category".
     pub kind: String,

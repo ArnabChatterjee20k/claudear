@@ -58,12 +58,39 @@ impl DiscordIndexOrchestrator {
             .await
             .unwrap_or_default();
 
-        let categories: HashSet<&str> = cfg.categories.iter().map(String::as_str).collect();
+        // `categories` are configured by name (or raw id); resolve them to the
+        // guild's category channels so we can match by parent id below.
+        let (resolved_categories, unresolved) = resolve_categories(&channels, &cfg.categories);
+        if !unresolved.is_empty() {
+            tracing::warn!(
+                guild = %self.guild_id,
+                categories = ?unresolved,
+                "Configured Discord categories not found in guild — skipping",
+            );
+        }
+
+        // Persist the resolved categories so the name -> id mapping is stored
+        // for future reference (dashboard, debugging, config validation).
+        for cat in &resolved_categories {
+            let _ = self.tracker.upsert_discord_channel(
+                &cat.id,
+                Some(self.guild_id.as_str()),
+                cat.parent_id.as_deref(),
+                cat.name.as_deref(),
+                Some(cat.channel_type as i64),
+                cat.kind(),
+                false,
+            );
+        }
+
+        let categories: HashSet<&str> =
+            resolved_categories.iter().map(|c| c.id.as_str()).collect();
         let ignore: HashSet<&str> = cfg.ignore_channels.iter().map(String::as_str).collect();
 
         let selected = select_channels(&channels, &categories, &ignore);
         tracing::info!(
             guild = %self.guild_id,
+            categories = resolved_categories.len(),
             channels = selected.len(),
             "Resolved Discord channels to index"
         );
@@ -312,8 +339,47 @@ impl DiscordIndexOrchestrator {
     }
 }
 
-/// Select the text channels whose parent category is in `categories`, minus any
-/// in `ignore`. Categories and threads (non-`Channel` kinds) are excluded —
+/// Resolve the configured `categories` — each entry a category **name**
+/// (case-insensitive) or a raw category ID — to the matching category channels
+/// discovered in the guild. Deduplicated by id. The second element lists the
+/// config entries that matched no category so the caller can warn about them.
+fn resolve_categories<'a>(
+    channels: &'a [DiscordChannel],
+    configured: &[String],
+) -> (Vec<&'a DiscordChannel>, Vec<String>) {
+    let categories: Vec<&DiscordChannel> = channels
+        .iter()
+        .filter(|c| c.kind() == DiscordChannelKind::Category)
+        .collect();
+
+    let mut resolved: Vec<&DiscordChannel> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut unresolved: Vec<String> = Vec::new();
+
+    for entry in configured {
+        let needle = entry.trim();
+        if needle.is_empty() {
+            continue;
+        }
+        match categories.iter().find(|c| {
+            c.id == needle
+                || c.name
+                    .as_deref()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(needle))
+        }) {
+            // Newly matched category — record it.
+            Some(cat) if seen.insert(cat.id.as_str()) => resolved.push(cat),
+            // Already matched via another entry (name + id, or duplicate).
+            Some(_) => {}
+            None => unresolved.push(entry.clone()),
+        }
+    }
+
+    (resolved, unresolved)
+}
+
+/// Select the text channels whose parent category id is in `categories`, minus
+/// any in `ignore`. Categories and threads (non-`Channel` kinds) are excluded —
 /// threads are discovered separately per channel.
 fn select_channels<'a>(
     channels: &'a [DiscordChannel],
@@ -448,6 +514,57 @@ mod tests {
         let categories: HashSet<&str> = HashSet::new();
         let ignore: HashSet<&str> = HashSet::new();
         assert!(select_channels(&channels, &categories, &ignore).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_categories_by_name_case_insensitive() {
+        // Category "cat1" has name "name-cat1" (per the `channel` helper).
+        let channels = vec![
+            channel("cat1", 4, None),
+            channel("cat2", 4, None),
+            channel("c1", 0, Some("cat1")),
+        ];
+        // Match by name (case-insensitive).
+        let (resolved, unresolved) =
+            resolve_categories(&channels, &["NAME-CAT1".to_string()]);
+        let ids: Vec<&str> = resolved.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["cat1"]);
+        assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_categories_by_id_and_dedup() {
+        let channels = vec![channel("cat1", 4, None), channel("cat2", 4, None)];
+        // Same category referenced by both id and name => returned once.
+        let (resolved, unresolved) = resolve_categories(
+            &channels,
+            &["cat1".to_string(), "name-cat1".to_string()],
+        );
+        let ids: Vec<&str> = resolved.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["cat1"]);
+        assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_categories_reports_unresolved() {
+        let channels = vec![channel("cat1", 4, None)];
+        let (resolved, unresolved) = resolve_categories(
+            &channels,
+            &["name-cat1".to_string(), "does-not-exist".to_string()],
+        );
+        let ids: Vec<&str> = resolved.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["cat1"]);
+        assert_eq!(unresolved, vec!["does-not-exist".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_categories_ignores_non_category_kinds() {
+        // A text channel literally named like a category must not match.
+        let channels = vec![channel("c1", 0, None)];
+        let (resolved, unresolved) =
+            resolve_categories(&channels, &["name-c1".to_string()]);
+        assert!(resolved.is_empty());
+        assert_eq!(unresolved, vec!["name-c1".to_string()]);
     }
 
     #[test]

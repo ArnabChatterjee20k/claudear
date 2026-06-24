@@ -86,6 +86,16 @@ export default function ChannelsPage() {
       ),
     },
     {
+      key: 'category_name',
+      header: 'Category',
+      render: row =>
+        row.category_name ? (
+          <span className="text-sm">{row.category_name}</span>
+        ) : (
+          <span className="text-muted-foreground text-sm">--</span>
+        ),
+    },
+    {
       key: 'kind',
       header: 'Type',
       render: row => <KindBadge kind={row.kind} archived={row.archived} />,
@@ -187,6 +197,10 @@ export default function ChannelsPage() {
                 <p className="text-sm">
                   <StatusBadge complete={selected.backfill_complete} />
                 </p>
+              </div>
+              <div>
+                <p className="text-sm text-muted-foreground">Category</p>
+                <p className="text-sm">{selected.category_name ?? '--'}</p>
               </div>
               <div>
                 <p className="text-sm text-muted-foreground">Channel ID</p>

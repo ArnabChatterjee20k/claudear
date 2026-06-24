@@ -9039,6 +9039,9 @@ impl SqliteTracker {
                 c.channel_id,
                 c.guild_id,
                 c.parent_id,
+                -- Category of a channel is its direct parent (cat_direct); for a
+                -- thread the parent is a channel, so go one more hop (cat_thread).
+                COALESCE(cat_direct.name, cat_thread.name) AS category_name,
                 c.name,
                 c.kind,
                 c.archived,
@@ -9050,6 +9053,12 @@ impl SqliteTracker {
                 MAX(ch.end_message_time) AS indexed_to
             FROM discord_channels c
             LEFT JOIN discord_message_chunks ch ON ch.channel_id = c.channel_id
+            LEFT JOIN discord_channels cat_direct
+                   ON cat_direct.channel_id = c.parent_id AND cat_direct.kind = 4
+            LEFT JOIN discord_channels parent_chan
+                   ON parent_chan.channel_id = c.parent_id AND parent_chan.kind = 0
+            LEFT JOIN discord_channels cat_thread
+                   ON cat_thread.channel_id = parent_chan.parent_id AND cat_thread.kind = 4
             WHERE c.kind != 4
             GROUP BY c.channel_id
             ORDER BY c.name
@@ -9057,7 +9066,7 @@ impl SqliteTracker {
         )?;
 
         let rows = stmt.query_map([], |row| {
-            let kind = claudear_core::types::DiscordChannelKind::from_i64(row.get(4)?);
+            let kind = claudear_core::types::DiscordChannelKind::from_i64(row.get(5)?);
             let kind_str = match kind {
                 claudear_core::types::DiscordChannelKind::Channel => "channel",
                 claudear_core::types::DiscordChannelKind::Thread => "thread",
@@ -9067,15 +9076,16 @@ impl SqliteTracker {
                 channel_id: row.get(0)?,
                 guild_id: row.get(1)?,
                 parent_id: row.get(2)?,
-                name: row.get(3)?,
+                category_name: row.get(3)?,
+                name: row.get(4)?,
                 kind: kind_str.to_string(),
-                archived: row.get::<_, i64>(5)? != 0,
-                backfill_complete: row.get::<_, i64>(6)? != 0,
-                last_indexed_message_id: row.get(7)?,
-                last_indexed_at: row.get(8)?,
-                chunk_count: row.get(9)?,
-                indexed_from: row.get(10)?,
-                indexed_to: row.get(11)?,
+                archived: row.get::<_, i64>(6)? != 0,
+                backfill_complete: row.get::<_, i64>(7)? != 0,
+                last_indexed_message_id: row.get(8)?,
+                last_indexed_at: row.get(9)?,
+                chunk_count: row.get(10)?,
+                indexed_from: row.get(11)?,
+                indexed_to: row.get(12)?,
             })
         })?;
 
@@ -18185,7 +18195,7 @@ mod tests {
             .upsert_discord_channel(
                 "100",
                 Some("g"),
-                None,
+                Some("300"), // parent category 300 ("a-category")
                 Some("general"),
                 Some(0),
                 claudear_core::types::DiscordChannelKind::Channel,
@@ -18230,6 +18240,8 @@ mod tests {
         let general = channels.iter().find(|c| c.channel_id == "100").unwrap();
         assert_eq!(general.kind, "channel");
         assert_eq!(general.name.as_deref(), Some("general"));
+        // Channel's category is its direct parent.
+        assert_eq!(general.category_name.as_deref(), Some("a-category"));
         assert!(general.backfill_complete);
         assert_eq!(general.chunk_count, 2);
         assert_eq!(
@@ -18244,6 +18256,8 @@ mod tests {
         assert_eq!(thread.chunk_count, 0);
         assert_eq!(thread.indexed_from, None);
         assert_eq!(thread.indexed_to, None);
+        // Thread's category is resolved via its parent channel (200 -> 100 -> 300).
+        assert_eq!(thread.category_name.as_deref(), Some("a-category"));
 
         // Aggregate stats: 1 channel, 1 thread, 2 chunks.
         let stats = tracker.get_discord_knowledgebase_stats().unwrap();

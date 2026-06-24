@@ -462,6 +462,7 @@ export interface StoredDiscordChannel {
   channel_id: string;
   guild_id: string | null;
   parent_id: string | null;
+  category_name: string | null;
   name: string | null;
   kind: string;
   archived: boolean;
