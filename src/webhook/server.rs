@@ -1218,6 +1218,7 @@ mod tests {
             embedding: crate::config::EmbeddingModelConfig::default(),
             qa: crate::config::QaConfig::default(),
             knowledgebase: crate::config::KnowledgebasesConfig::default(),
+            reports: crate::config::ReportsConfig::default(),
         }
     }
 

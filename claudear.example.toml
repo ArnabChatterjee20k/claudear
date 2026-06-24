@@ -1105,3 +1105,31 @@ ignore_channels = []
 backfill_days = 0
 # How often (in hours) to pull and re-index all repositories (default: 6.0, 0 = disable)
 reindex_interval_hours = 6.0
+
+# ============================================
+# Scheduled Reports / Digests
+# ============================================
+
+[reports.repetitive_digest]
+# Weekly digest of repetitive, non-actionable Sentry issues.
+#
+# Many Sentry issues recur every week but are operational/infra noise the agent
+# cannot produce a code fix for (e.g. connection-pool sizing) — it retries and
+# ends in `cannot_fix`. This digest collects such issues that are STILL firing
+# frequently and posts them once a week to your notifier(s), mentioning
+# notifiers.discord.user_id on Discord so a human can act. Report-only: it does
+# not change the fix pipeline. Requires a configured Sentry source + Discord
+# webhook.
+
+# Enable the weekly digest (default: false)
+enabled = false
+
+# Day of week to send (default: "monday")
+day = "monday"
+
+# Hour to send, 0-23 UTC (default: 9)
+hour = 9
+
+# High-recurrence threshold: minimum Sentry event_count for an issue to qualify.
+# Issues currently flagged escalating qualify regardless of this. (default: 50)
+min_event_count = 50

@@ -578,6 +578,15 @@ pub struct VerifyResult {
     /// One-line summary of the verification verdict.
     #[serde(default)]
     pub summary: String,
+    /// Why the reported behavior is a problem (user-facing impact).
+    #[serde(default)]
+    pub impact: String,
+    /// The underlying cause traced in the code.
+    #[serde(default)]
+    pub root_cause: String,
+    /// A proposed fix direction (not applied — verify is read-only).
+    #[serde(default)]
+    pub suggested_fix: String,
     /// Evidence supporting the verdict (repro steps, failing output, etc.).
     #[serde(default)]
     pub evidence: String,

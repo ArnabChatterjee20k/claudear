@@ -38,8 +38,13 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 5,
+        name: "issue_recurrence",
+        sql: include_str!("../../../migrations/V5__issue_recurrence.sql"),
+    },
+    Migration {
+        version: 6,
         name: "support_discord_knowledgebase",
-        sql: include_str!("../../../migrations/V5__support_discord_knowledgebase.sql"),
+        sql: include_str!("../../../migrations/V6__support_discord_knowledgebase.sql"),
     },
 ];
 
@@ -184,6 +189,7 @@ mod tests {
             "chat_messages",
             "action_runs",
             "support_reply_ratings",
+            "issue_recurrence",
         ];
 
         for table in expected_tables {

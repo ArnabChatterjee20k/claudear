@@ -21,6 +21,7 @@ use claudear_core::types::{
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
+use claudear_integrations::reports::{ReportFrequency, ReportGenerator, ReportSchedule};
 use claudear_integrations::runner::{self, AgentRunner};
 use claudear_integrations::scm::{
     PrReviewState, PrStatus, ReviewEvent, ReviewWatcher, ScmProvider,
@@ -2237,6 +2238,50 @@ Create a PR with your changes.{custom_instructions}"#,
         Ok(())
     }
 
+    /// The weekly schedule for the repetitive-issues digest, or `None` when the
+    /// feature is disabled. The caller (housekeeping loop) owns the returned
+    /// schedule and its `last_sent_at` cadence state.
+    pub fn repetitive_digest_schedule(&self) -> Option<ReportSchedule> {
+        let cfg = &self.config.reports.repetitive_digest;
+        if !cfg.enabled {
+            return None;
+        }
+        let day = match ReportFrequency::parse(&format!("weekly-{}", cfg.day.to_lowercase())) {
+            Some(ReportFrequency::Weekly(d)) => d,
+            _ => chrono::Weekday::Mon,
+        };
+        Some(ReportSchedule::weekly("repetitive-digest", day, cfg.hour))
+    }
+
+    /// Build and send the weekly digest of repetitive, non-actionable Sentry
+    /// issues — issues the agent gave up on (`cannot_fix`) that keep recurring.
+    /// Report-only; the Discord notifier mentions the configured on-call user.
+    ///
+    /// Built entirely from stored data: the `cannot_fix` set joined with the
+    /// recurrence observed at processing time (see `record_issue_recurrence`).
+    /// No live API calls, so it never surfaces issues the agent hasn't seen and
+    /// tried. No-ops when nothing qualifies.
+    pub async fn send_repetitive_digest(&self) -> Result<()> {
+        let min_event_count = self.config.reports.repetitive_digest.min_event_count;
+        let digest = ReportGenerator::new(self.tracker.clone())
+            .generate_repetitive_digest(min_event_count)?;
+
+        if digest.is_empty() {
+            tracing::info!(
+                component = "digest",
+                "No repetitive non-actionable Sentry issues this week; nothing to send"
+            );
+            return Ok(());
+        }
+
+        tracing::info!(
+            component = "digest",
+            count = digest.entries.len(),
+            "Sending weekly repetitive-issues digest"
+        );
+        self.notifier.notify_repetitive_digest(&digest).await
+    }
+
     /// Run housekeeping tasks: retries, cascades, and metrics.
     /// Called on the global timer, separate from per-source polling.
     pub async fn run_housekeeping_cycle(&self) -> Result<()> {
@@ -3534,6 +3579,21 @@ Create a PR with your changes.{custom_instructions}"#,
             }
         }
 
+        // Persist the observed recurrence signal (Sentry event_count / escalating)
+        // so the weekly repetitive-issues digest can be built from stored
+        // observations rather than a live API call.
+        if let Some(event_count) = issue.get_metadata::<i64>("event_count") {
+            let is_escalating = issue.get_metadata::<bool>("is_escalating").unwrap_or(false);
+            if let Err(e) = self.tracker.record_issue_recurrence(
+                source.name(),
+                &issue.id,
+                event_count,
+                is_escalating,
+            ) {
+                tracing::debug!(error = %e, "Failed to record issue recurrence");
+            }
+        }
+
         // Get the attempt ID for the processing pipeline
         let attempt_id = self
             .tracker
@@ -4747,6 +4807,7 @@ mod tests {
             embedding: claudear_config::config::EmbeddingModelConfig::default(),
             qa: claudear_config::config::QaConfig::default(),
             knowledgebase: claudear_config::config::KnowledgebasesConfig::default(),
+            reports: claudear_config::config::ReportsConfig::default(),
         }
     }
 

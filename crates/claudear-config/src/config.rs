@@ -415,6 +415,9 @@ pub struct Config {
     /// knowledgebase configuration
     #[serde(default)]
     pub knowledgebase: KnowledgebasesConfig,
+    /// Scheduled reports / digests configuration group.
+    #[serde(default)]
+    pub reports: ReportsConfig,
 }
 
 fn default_storage_dir() -> PathBuf {
@@ -606,6 +609,46 @@ impl Default for Config {
             embedding: EmbeddingModelConfig::default(),
             qa: QaConfig::default(),
             knowledgebase: KnowledgebasesConfig::default(),
+            reports: ReportsConfig::default(),
+        }
+    }
+}
+
+/// Scheduled reports / digests configuration group.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReportsConfig {
+    /// Weekly digest of repetitive, non-actionable Sentry issues.
+    pub repetitive_digest: RepetitiveDigestConfig,
+}
+
+/// Weekly digest of repetitive, non-actionable Sentry issues.
+///
+/// Surfaces Sentry issues the agent gave up on (`cannot_fix`) that keep
+/// recurring, posting them once a week to the configured notifier(s) and
+/// mentioning `notifiers.discord.user_id` on Discord. Report-only — it does not
+/// change the fix pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepetitiveDigestConfig {
+    /// Whether the weekly digest is enabled (default: false).
+    pub enabled: bool,
+    /// Day of week to send, e.g. "monday" (default: "monday").
+    pub day: String,
+    /// Hour to send, 0-23 UTC (default: 9).
+    pub hour: u32,
+    /// High-recurrence threshold: minimum Sentry `event_count` to qualify.
+    /// Issues currently flagged escalating qualify regardless. (default: 50)
+    pub min_event_count: i64,
+}
+
+impl Default for RepetitiveDigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            day: "monday".to_string(),
+            hour: 9,
+            min_event_count: 50,
         }
     }
 }

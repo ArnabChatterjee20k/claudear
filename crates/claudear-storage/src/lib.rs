@@ -997,6 +997,35 @@ pub trait EmbeddingStore: Send + Sync {
         Ok(0)
     }
 
+    /// Record (upsert) the observed recurrence signal for an issue.
+    ///
+    /// Captured at processing time from the transient issue metadata so the
+    /// repetitive-issues digest can be built from stored observations rather
+    /// than a live API call. Keyed by `(source, issue_id)`; later observations
+    /// overwrite earlier ones.
+    fn record_issue_recurrence(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+        _event_count: i64,
+        _is_escalating: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fetch an issue's display fields plus its last-observed recurrence signal.
+    ///
+    /// Returns `(title, url, event_count, is_escalating)` when the issue is
+    /// stored, with recurrence defaulting to `(0, false)` if never observed.
+    /// `None` when the issue is not in storage.
+    fn get_issue_with_recurrence(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+    ) -> Result<Option<(String, String, i64, bool)>> {
+        Ok(None)
+    }
+
     /// Record an inference attempt. Returns the row ID.
     #[expect(clippy::too_many_arguments)]
     fn record_inference_attempt(
