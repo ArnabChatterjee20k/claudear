@@ -319,11 +319,18 @@ pub fn format_discord_search_context(results: &[DiscordSearchResult]) -> String 
 
     for (i, result) in results.iter().enumerate() {
         let chunk = &result.chunk;
+        let label = match chunk.guild_id.as_deref().filter(|g| !g.is_empty()) {
+            Some(guild_id) => format!(
+                "[Channel `{}`](https://discord.com/channels/{}/{}/{})",
+                chunk.channel_id, guild_id, chunk.channel_id, chunk.start_message_id,
+            ),
+            None => format!("Channel `{}`", chunk.channel_id),
+        };
         let _ = writeln!(
             context,
-            "### {}. Channel `{}` (Similarity: {:.0}%)",
+            "### {}. {} (Similarity: {:.0}%)",
             i + 1,
-            chunk.channel_id,
+            label,
             result.score * 100.0,
         );
 
@@ -443,6 +450,31 @@ mod tests {
         assert!(out.contains("95%"));
         assert!(out.contains("alice, bob"));
         assert!(out.contains("alice: hi"));
+        // Channel heading is a clickable deep link to the first message.
+        assert!(out.contains("[Channel `chan1`](https://discord.com/channels/g/chan1/1)"));
+    }
+
+    #[test]
+    fn test_format_context_without_guild_is_not_linked() {
+        let chunk = DiscordMessageChunk {
+            id: Some(1),
+            guild_id: None,
+            channel_id: "chan1".to_string(),
+            channel_kind: DiscordChannelKind::Channel,
+            start_message_id: "1".to_string(),
+            end_message_id: "2".to_string(),
+            participant_ids: None,
+            start_message_time: "2024-01-01T10:00:00Z".to_string(),
+            end_message_time: "2024-01-01T10:05:00Z".to_string(),
+            chunk_text: "hi".to_string(),
+            context_text: "ctx".to_string(),
+            content_hash: Some("h".to_string()),
+        };
+        let out = format_discord_search_context(&[DiscordSearchResult { chunk, score: 0.5 }]);
+
+        assert!(out.contains("Channel `chan1`"));
+        // No guild id => no permalink.
+        assert!(!out.contains("https://discord.com/channels"));
     }
 
     // ---- end-to-end index (needs embedding model + sqlite) --------------
