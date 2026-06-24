@@ -45,11 +45,6 @@ impl DiscordIndexOrchestrator {
         })
     }
 
-    /// Scope: configured categories -> their channels (by parent id) -> those
-    /// channels' threads. We never index channels/threads outside the configured
-    /// categories. Registration (pass 1) is split from message backfill (pass 2)
-    /// so the full channel/thread list lands in the DB up front — an interrupted
-    /// backfill no longer leaves channels missing. Returns aggregate stats.
     pub async fn run(&self, cfg: &DiscordKnowledgebaseConfig) -> Result<DiscordIndexStats> {
         let mut stats = DiscordIndexStats::default();
 
@@ -60,11 +55,6 @@ impl DiscordIndexOrchestrator {
         }
         self.indexer.prepare().await?;
 
-        // Discord has no "list a category's channels" or "list categories"
-        // endpoint — `GET /guilds/{id}/channels` returns every channel+category
-        // in ONE call. We use it purely to discover the configured categories and
-        // the channels parented to them; everything else is filtered out and
-        // never fetched further.
         let channels = self.client.list_guild_channels(&self.guild_id).await?;
 
         // `categories` are configured by name (or raw id); resolve them to the
@@ -95,23 +85,15 @@ impl DiscordIndexOrchestrator {
         let categories: HashSet<&str> = resolved_categories.iter().map(|c| c.id.as_str()).collect();
         let ignore: HashSet<&str> = cfg.ignore_channels.iter().map(String::as_str).collect();
 
-        // Channels whose parent category id is one of the configured categories.
         let selected = select_channels(&channels, &categories, &ignore);
 
-        // Active (non-archived) threads can only be listed guild-wide — Discord
-        // has no per-channel active-threads endpoint. We fetch the list once and
-        // immediately drop any thread whose parent is not a selected channel, so
-        // no out-of-category thread is ever message-fetched.
         let active_threads = self
             .client
             .list_active_threads(&self.guild_id, None, None)
             .await
             .unwrap_or_default();
 
-        // ---- Pass 1a: register every in-category channel FIRST ----
-        // A tight, network-free loop of DB upserts, so the full channel list is
-        // persisted near-instantly. Even if thread enumeration or the (slow)
-        // message backfill below is interrupted, no channel row goes missing.
+        // register every in-category channel
         let mut targets: Vec<IndexTarget> = Vec::new();
         for channel in &selected {
             let _ = self.tracker.upsert_discord_channel(
@@ -130,10 +112,7 @@ impl DiscordIndexOrchestrator {
             });
         }
 
-        // ---- Pass 1b: register each channel's threads ----
-        // Active (filtered from the guild-wide list) + public archived (fetched +
-        // paginated per channel). Threads of channels outside the configured
-        // categories are never fetched.
+        // register each channel's threads
         for channel in &selected {
             let mut threads: Vec<&DiscordThread> = active_threads
                 .iter()
@@ -175,7 +154,7 @@ impl DiscordIndexOrchestrator {
             "Registered Discord channels/threads; starting backfill"
         );
 
-        // ---- Pass 2: backfill messages for every registered target ----
+        // backfill messages for every registered target
         for target in &targets {
             match self
                 .index_one(&target.id, &target.name, target.is_thread, cfg)
