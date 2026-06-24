@@ -36,6 +36,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "support_reply_ratings",
         sql: include_str!("../../../migrations/V4__support_reply_ratings.sql"),
     },
+    Migration {
+        version: 5,
+        name: "issue_recurrence",
+        sql: include_str!("../../../migrations/V5__issue_recurrence.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -96,7 +101,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         // Verify a table from V1 exists
         let count: u32 = conn
@@ -121,7 +126,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -179,6 +184,7 @@ mod tests {
             "chat_messages",
             "action_runs",
             "support_reply_ratings",
+            "issue_recurrence",
         ];
 
         for table in expected_tables {

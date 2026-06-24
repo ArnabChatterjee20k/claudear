@@ -3,6 +3,7 @@
 use super::Notifier;
 use crate::ask_reply_inbox;
 use crate::discord::{CreateMessageParams, DiscordClient, DiscordMessageReference, MessageEmbed};
+use crate::reports::RepetitiveDigest;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use claudear_config::config::DiscordConfig;
@@ -1136,6 +1137,74 @@ pub(crate) fn build_urgent_issues_message(
     })
 }
 
+/// Build the Discord message for the weekly repetitive-issues digest.
+///
+/// Returns `None` when the digest is empty (nothing to send). The mention is
+/// placed in `content` (outside the embed) so it actually pings the user.
+pub(crate) fn build_repetitive_digest_message(
+    digest: &RepetitiveDigest,
+    mention: Option<String>,
+) -> Option<DiscordMessage> {
+    if digest.is_empty() {
+        return None;
+    }
+
+    let fields: Vec<DiscordField> = digest
+        .entries
+        .iter()
+        .take(10)
+        .map(|entry| {
+            let title = truncate_string(&entry.title, 80);
+            let url = truncate_string(&entry.url, MAX_URL_LENGTH);
+            let escalating = if entry.is_escalating {
+                " \u{1F4C8}"
+            } else {
+                ""
+            };
+            let mut value = format!(
+                "[{}]({})\n{} events{}",
+                title, url, entry.event_count, escalating
+            );
+            if let Some(err) = &entry.last_error {
+                value.push_str(&format!("\n_{}_", truncate_string(err, 200)));
+            }
+            DiscordField {
+                name: truncate_string(&entry.short_id, MAX_SHORT_ID_LENGTH).to_string(),
+                value,
+                inline: Some(false),
+            }
+        })
+        .collect();
+
+    let extra = digest.entries.len().saturating_sub(10);
+    let mut description =
+        "These Sentry issues keep recurring but the agent can't fix them \u{2014} they need a human."
+            .to_string();
+    if extra > 0 {
+        description.push_str(&format!(" (+{} more)", extra));
+    }
+
+    Some(DiscordMessage {
+        content: mention,
+        embeds: Some(vec![DiscordEmbed {
+            title: Some(format!(
+                "\u{1F501} {} repetitive issue{} ({})",
+                digest.entries.len(),
+                if digest.entries.len() > 1 { "s" } else { "" },
+                digest.period
+            )),
+            description: Some(description),
+            url: None,
+            color: Some(0x9b59b6), // Purple
+            fields: Some(fields),
+            footer: Some(DiscordFooter {
+                text: "Claudear \u{2014} Weekly Repetitive Issues".to_string(),
+            }),
+            timestamp: Some(timestamp()),
+        }]),
+    })
+}
+
 /// Build the Discord message for a human-in-the-loop question.
 pub(crate) fn build_ask_question_message(
     issue: &Issue,
@@ -1315,6 +1384,14 @@ impl<H: DiscordWebhookClient + 'static> Notifier for DiscordNotifier<H> {
     async fn notify_urgent_issues(&self, issues: &[Issue]) -> Result<()> {
         let mention = self.get_user_mention();
         if let Some(message) = build_urgent_issues_message(issues, mention) {
+            let _ = self.send(message).await?;
+        }
+        Ok(())
+    }
+
+    async fn notify_repetitive_digest(&self, digest: &RepetitiveDigest) -> Result<()> {
+        let mention = self.get_user_mention();
+        if let Some(message) = build_repetitive_digest_message(digest, mention) {
             let _ = self.send(message).await?;
         }
         Ok(())
@@ -3962,6 +4039,62 @@ mod tests {
 
         assert!(msg.content.is_none());
         assert!(msg.embeds.is_some());
+    }
+
+    fn test_digest(entries: Vec<crate::reports::RepetitiveEntry>) -> RepetitiveDigest {
+        RepetitiveDigest {
+            period: "Last 7 Days".to_string(),
+            from: Utc::now(),
+            to: Utc::now(),
+            entries,
+        }
+    }
+
+    #[test]
+    fn test_build_repetitive_digest_message_empty_is_none() {
+        let digest = test_digest(vec![]);
+        assert!(build_repetitive_digest_message(&digest, Some("<@1>".to_string())).is_none());
+    }
+
+    #[test]
+    fn test_build_repetitive_digest_message_has_mention_and_fields() {
+        let digest = test_digest(vec![
+            crate::reports::RepetitiveEntry {
+                issue_id: "A".to_string(),
+                short_id: "SENTRY-A".to_string(),
+                title: "Pool exhausted".to_string(),
+                url: "https://sentry.io/A".to_string(),
+                event_count: 1200,
+                is_escalating: true,
+                last_error: Some("max retries reached".to_string()),
+                repo: Some("o/r".to_string()),
+            },
+            crate::reports::RepetitiveEntry {
+                issue_id: "B".to_string(),
+                short_id: "SENTRY-B".to_string(),
+                title: "Timeout".to_string(),
+                url: "https://sentry.io/B".to_string(),
+                event_count: 80,
+                is_escalating: false,
+                last_error: None,
+                repo: None,
+            },
+        ]);
+
+        let msg = build_repetitive_digest_message(&digest, Some("<@123>".to_string())).unwrap();
+        // Mention must be in content (outside embed) so it pings.
+        assert_eq!(msg.content.as_deref(), Some("<@123>"));
+        let embed = &msg.embeds.as_ref().unwrap()[0];
+        assert!(embed
+            .title
+            .as_ref()
+            .unwrap()
+            .contains("2 repetitive issues"));
+        let fields = embed.fields.as_ref().unwrap();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "SENTRY-A");
+        assert!(fields[0].value.contains("1200 events"));
+        assert!(fields[0].value.contains("max retries reached"));
     }
 
     #[test]
