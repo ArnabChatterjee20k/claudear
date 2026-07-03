@@ -206,6 +206,11 @@ pub async fn build_app(
                     .default_provider_config()
                     .map(|p| p.permissions.clone())
                     .unwrap_or_default(),
+                readonly_tools: config
+                    .agent
+                    .default_provider_config()
+                    .map(|p| p.readonly_tools.clone())
+                    .unwrap_or_default(),
                 skip_permissions: config
                     .agent
                     .default_provider_config()
@@ -243,6 +248,11 @@ pub async fn build_app(
                         .agent
                         .default_provider_config()
                         .map(|p| p.permissions.clone())
+                        .unwrap_or_default(),
+                    readonly_tools: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.readonly_tools.clone())
                         .unwrap_or_default(),
                     skip_permissions: config
                         .agent

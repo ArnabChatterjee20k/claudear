@@ -23,10 +23,9 @@ const DEFAULT_LOG_DIR: &str = "./logs";
 const CLAUDE_LOG_SUBDIR: &str = "claude";
 const EXECUTION_LOG_PREVIEW_LIMIT: usize = 2000;
 
-/// Read-only tools granted for RAG-grounded Q&A runs. The agent may inspect the
-/// repository (read files, search) but cannot modify it, run arbitrary commands,
-/// or create branches/PRs.
-const READ_ONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+/// Default read-only tools granted for RAG-grounded Q&A runs when the config
+/// doesn't specify its own set
+const DEFAULT_READONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebFetch", "WebSearch"];
 
 /// Resolve the root directory for execution logs.
 /// Used by both the runner and the API to validate log file paths.
@@ -229,6 +228,9 @@ pub struct ClaudeRunnerConfig {
     pub instructions: Option<String>,
     /// Tool permissions granted without prompting (--allowedTools).
     pub permissions: Vec<String>,
+    /// Tools allowed for read-only Q&A (question) runs. Empty means fall back to
+    /// [`DEFAULT_READONLY_TOOLS`].
+    pub readonly_tools: Vec<String>,
     /// Skip all permission prompts (default: false).
     pub skip_permissions: bool,
     /// CLI binary name or absolute path (default: "claude").
@@ -244,6 +246,7 @@ impl Default for ClaudeRunnerConfig {
             model: None,
             instructions: None,
             permissions: Vec::new(),
+            readonly_tools: Vec::new(),
             skip_permissions: false,
             binary: "claude".to_string(),
             env: HashMap::new(),
@@ -704,10 +707,15 @@ The PR title should include the issue ID: {}
                 args.push("--allowedTools".to_string());
                 args.push(perm.clone());
             }
-        } else {
-            for perm in READ_ONLY_TOOLS {
+        } else if self.config.readonly_tools.is_empty() {
+            for perm in DEFAULT_READONLY_TOOLS {
                 args.push("--allowedTools".to_string());
                 args.push((*perm).to_string());
+            }
+        } else {
+            for perm in &self.config.readonly_tools {
+                args.push("--allowedTools".to_string());
+                args.push(perm.clone());
             }
         }
         args.push("--print".to_string());
