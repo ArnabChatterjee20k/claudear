@@ -738,7 +738,7 @@ impl Watcher {
         );
 
         for (name, path, scm_url) in &repos {
-            match GitOps::ensure_repo_fetched(path, scm_url).await {
+            match GitOps::ensure_repo_synced(path, scm_url).await {
                 Ok(default_branch) => {
                     tracing::debug!(repo = %name, default_branch = %default_branch, "Fetched repo");
                 }
@@ -1850,18 +1850,18 @@ impl Watcher {
         )?;
 
         // Fetch the downstream repo (no checkout/reset — just update object store)
-        let detected_default_branch =
-            match GitOps::ensure_repo_fetched(&project_dir, &scm_url).await {
-                Ok(branch) => branch,
-                Err(e) => {
-                    tracing::warn!(
-                        downstream = %downstream_repo_name,
-                        error = %e,
-                        "Failed to fetch downstream repo, continuing with index default branch"
-                    );
-                    default_branch.clone()
-                }
-            };
+        let detected_default_branch = match GitOps::ensure_repo_synced(&project_dir, &scm_url).await
+        {
+            Ok(branch) => branch,
+            Err(e) => {
+                tracing::warn!(
+                    downstream = %downstream_repo_name,
+                    error = %e,
+                    "Failed to fetch downstream repo, continuing with index default branch"
+                );
+                default_branch.clone()
+            }
+        };
 
         // Incrementally re-index code after fetch so code search is up-to-date
         self.reindex_repo(downstream_repo_name, &project_dir).await;

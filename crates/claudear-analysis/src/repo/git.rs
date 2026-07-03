@@ -78,6 +78,14 @@ impl GitOps {
         Ok(Self::detect_default_branch(repo_path).await)
     }
 
+    /// Ensure a repository is current *and* its working tree is advanced to the
+    /// remote's default branch.
+    pub async fn ensure_repo_synced(repo_path: &Path, scm_url: &str) -> Result<String> {
+        let default_branch = Self::ensure_repo_fetched(repo_path, scm_url).await?;
+        Self::checkout_reset(repo_path, &default_branch).await?;
+        Ok(default_branch)
+    }
+
     /// Fetch all remote refs without touching the working tree.
     pub async fn fetch_all(repo_path: &Path) -> Result<()> {
         tracing::debug!(repo = ?repo_path, "Fetching all remote refs");
@@ -382,6 +390,20 @@ impl GitOps {
             return Err(Error::git(format!("git fetch failed: {}", stderr)));
         }
 
+        Self::checkout_reset(repo_path, branch).await?;
+
+        tracing::debug!(repo = ?repo_path, "Repository updated successfully");
+        Ok(())
+    }
+
+    /// Check out `branch` and hard-reset the working tree to `origin/<branch>`.
+    ///
+    /// Assumes the relevant refs are already fetched. Discards any local changes
+    /// in the working tree — callers must only use this on managed clones.
+    async fn checkout_reset(repo_path: &Path, branch: &str) -> Result<()> {
+        // Validate branch name to prevent injection via crafted branch names
+        validate_ref(branch, "branch name")?;
+
         // Checkout the branch (branch name is validated above)
         let output = Command::new("git")
             .args(["checkout", branch])
@@ -412,7 +434,6 @@ impl GitOps {
             return Err(Error::git(format!("git reset failed: {}", stderr)));
         }
 
-        tracing::debug!(repo = ?repo_path, "Repository updated successfully");
         Ok(())
     }
 
