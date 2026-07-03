@@ -608,15 +608,6 @@ mod tests {
             .expect("git commit failed");
     }
 
-    /// For switching out to a different branch
-    fn checkout_reppo(path: &Path, branch: &str) {
-        StdCommand::new("git")
-            .args(["checkout", branch])
-            .current_dir(path)
-            .output()
-            .expect("git add failed");
-    }
-
     // ════════════════════════════════════════════════════════════
     //  validate_ref
     // ════════════════════════════════════════════════════════════
