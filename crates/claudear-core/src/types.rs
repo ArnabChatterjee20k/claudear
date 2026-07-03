@@ -3159,6 +3159,49 @@ pub trait SentryHttpClient: Send + Sync {
     ) -> crate::Result<crate::http::HttpResponse>;
 }
 
+/// timeline for metadata of an issue
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimelineEventStatus {
+    #[serde(rename = "repo_resolved")]
+    RepoResolved,
+
+    #[serde(rename = "embeddings_generated")]
+    EmbeddingsGenerated,
+
+    #[serde(rename = "agent_started")]
+    AgentStarted,
+
+    #[serde(rename = "verify_started")]
+    VerifyStarted,
+
+    #[serde(rename = "verify_completed")]
+    VerifyCompleted,
+
+    #[serde(rename = "reply_started")]
+    ReplyStarted,
+
+    #[serde(rename = "reply_sent")]
+    ReplySent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEvent {
+    pub time: DateTime<Utc>,
+    pub event: TimelineEventStatus,
+    /// (e.g. `"repo": "appwrite"`, `"pr": 123`).
+    #[serde(flatten)]
+    pub context: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Ordered state timeline for a single issue, keyed by `short_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueTimeline {
+    /// Human-readable issue id (`short_id`), e.g. `"GH-123"`.
+    pub issue: String,
+    /// Events in chronological order.
+    pub events: Vec<TimelineEvent>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
