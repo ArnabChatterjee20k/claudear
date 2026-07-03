@@ -262,6 +262,11 @@ pub struct DiscordSourceConfig {
     /// ingested (engage only when tagged). When unset, every message in the
     /// listen channel is ingested (legacy behaviour).
     pub bot_id: Option<String>,
+    /// Bot role ID. When the bot is mentioned via a server *role* (`<@&ID>`)
+    /// rather than as a user (`<@ID>`), Discord emits the role id. Set this
+    /// alongside `bot_id` so the source ingests the message regardless of which
+    /// form the sender picked from autocomplete.
+    pub bot_role_id: Option<String>,
 }
 
 /// Discord notifier-only configuration (for outbound notifications).
@@ -354,6 +359,13 @@ pub struct Config {
     pub max_activity_entries: usize,
     /// IPC request timeout in seconds (default: 30).
     pub ipc_timeout_secs: u64,
+    /// Verbose per-source diagnostics. When true, sources emit extra
+    /// per-item polling logs (e.g. the Discord source logs each fetched
+    /// message and why it was ingested or ignored). Off by default — these
+    /// logs are noisy and only useful when debugging why an item wasn't
+    /// picked up.
+    #[serde(default)]
+    pub debug_logging: bool,
     /// Agent runner configuration (providers, experiments, orchestration).
     #[serde(default)]
     pub agent: AgentConfig,
@@ -588,6 +600,7 @@ impl Default for Config {
             processing_delay_ms: 5000,
             max_activity_entries: 10_000,
             ipc_timeout_secs: 30,
+            debug_logging: false,
             agent: AgentConfig::default(),
             scm: ScmConfig::default(),
             issues: IssuesConfig::default(),
@@ -1215,6 +1228,11 @@ pub struct DiscordConfig {
     /// @-mention this bot (so it engages only when tagged). When unset, every
     /// message in the listen channel is ingested (the legacy behaviour).
     pub bot_id: Option<String>,
+    /// Bot role ID. Matched in addition to `bot_id` so a role mention
+    /// (`<@&ID>`) is treated the same as a direct user mention (`<@ID>`).
+    pub bot_role_id: Option<String>,
+    /// Verbose per-message polling diagnostics for the Discord source.
+    pub debug_logging: bool,
 }
 
 /// Email (SMTP) notification configuration.
@@ -3209,6 +3227,9 @@ impl Config {
             poll_interval_ms: src.and_then(|s| s.poll_interval_ms),
             // bot_id gates the source (configured under issues.discord).
             bot_id: src.and_then(|s| s.bot_id.clone()),
+            bot_role_id: src.and_then(|s| s.bot_role_id.clone()),
+            // Sourced from the global `debug_logging` flag, not per-source.
+            debug_logging: self.debug_logging,
         }
     }
 
