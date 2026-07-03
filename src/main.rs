@@ -874,6 +874,11 @@ async fn build_watcher_deps(
                 .default_provider_config()
                 .map(|p| p.permissions.clone())
                 .unwrap_or_default(),
+            readonly_tools: config
+                .agent
+                .default_provider_config()
+                .map(|p| p.readonly_tools.clone())
+                .unwrap_or_default(),
             skip_permissions: config
                 .agent
                 .default_provider_config()
@@ -999,6 +1004,11 @@ async fn build_watcher_deps(
                         .agent
                         .default_provider_config()
                         .map(|p| p.permissions.clone())
+                        .unwrap_or_default(),
+                    readonly_tools: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.readonly_tools.clone())
                         .unwrap_or_default(),
                     skip_permissions: config
                         .agent
@@ -3822,6 +3832,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         .default_provider_config()
                         .map(|p| p.permissions.clone())
                         .unwrap_or_default(),
+                    readonly_tools: config
+                        .agent
+                        .default_provider_config()
+                        .map(|p| p.readonly_tools.clone())
+                        .unwrap_or_default(),
                     skip_permissions: config
                         .agent
                         .default_provider_config()
@@ -4205,6 +4220,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             .default_provider_config()
                             .map(|p| p.permissions.clone())
                             .unwrap_or_default(),
+                        readonly_tools: config
+                            .agent
+                            .default_provider_config()
+                            .map(|p| p.readonly_tools.clone())
+                            .unwrap_or_default(),
                         skip_permissions: config
                             .agent
                             .default_provider_config()
@@ -4314,6 +4334,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                                 .agent
                                 .default_provider_config()
                                 .map(|p| p.permissions.clone())
+                                .unwrap_or_default(),
+                            readonly_tools: config
+                                .agent
+                                .default_provider_config()
+                                .map(|p| p.readonly_tools.clone())
                                 .unwrap_or_default(),
                             skip_permissions: config
                                 .agent
