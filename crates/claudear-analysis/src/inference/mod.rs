@@ -779,16 +779,16 @@ impl RepoInferrer {
 
             let pull_results: Vec<_> = stream::iter(repos_to_pull)
                 .map(|(name, path, scm_url)| async move {
-                    match GitOps::ensure_repo_fetched(&path, &scm_url).await {
+                    match GitOps::ensure_repo_synced(&path, &scm_url).await {
                         Ok(default_branch) => {
                             tracing::debug!(
                                 repo = %name,
                                 default_branch = %default_branch,
-                                "Fetched repository"
+                                "Synced repository to origin default branch"
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(repo = %name, error = %e, "Failed to fetch repository");
+                            tracing::warn!(repo = %name, error = %e, "Failed to sync repository");
                         }
                     }
                     name

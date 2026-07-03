@@ -307,7 +307,7 @@ impl IssueProcessor {
             );
 
             let detected_default_branch =
-                match GitOps::ensure_repo_fetched(&project_dir, scm_url).await {
+                match GitOps::ensure_repo_synced(&project_dir, scm_url).await {
                     Ok(branch) => branch,
                     Err(e) => {
                         let error = format!("Failed to fetch repository: {}", e);
@@ -578,7 +578,7 @@ impl IssueProcessor {
                                 new_resolution.repo_name(),
                             ) {
                                 let detected_branch =
-                                    match GitOps::ensure_repo_fetched(&new_project_dir, scm_url)
+                                    match GitOps::ensure_repo_synced(&new_project_dir, scm_url)
                                         .await
                                     {
                                         Ok(branch) => branch,
