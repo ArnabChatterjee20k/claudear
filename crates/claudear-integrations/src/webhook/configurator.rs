@@ -1691,6 +1691,7 @@ mod tests {
             processing_delay_ms: 5000,
             max_activity_entries: 100,
             ipc_timeout_secs: 30,
+            debug_logging: false,
             agent: claudear_config::config::AgentConfig::default(),
             scm: claudear_config::config::ScmConfig::default(),
             issues: claudear_config::config::IssuesConfig::default(),

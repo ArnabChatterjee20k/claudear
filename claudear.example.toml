@@ -35,6 +35,12 @@ max_activity_entries = 10000
 # IPC request timeout in seconds (default: 30)
 ipc_timeout_secs = 30
 
+# Verbose per-source polling diagnostics. When true, sources emit extra
+# per-item logs (e.g. the Discord source logs each fetched message and why it
+# was ingested or ignored, and who was mentioned). Noisy — enable only when
+# debugging why an item wasn't picked up. Default: false.
+debug_logging = false
+
 # Bind address for HTTP server (default: "127.0.0.1", use "0.0.0.0" in Docker)
 bind_address = "127.0.0.1"
 
@@ -468,6 +474,12 @@ guild_id = ""
 # Detection uses Discord's parsed `mentions` array, falling back to scanning
 # message content for <@ID> / <@!ID>.
 bot_id = ""
+
+# Bot *role* id, matching role mentions (<@&ID>). If a role in your server
+# shares the bot's name, typing "@Claudear" may insert a role mention instead
+# of a user mention. Set this so the message is ingested either way. Matched in
+# addition to bot_id; when both are empty the gate is disabled (reply to all).
+bot_role_id = ""
 
 # Polling interval in milliseconds (overrides global)
 poll_interval_ms = 300000
