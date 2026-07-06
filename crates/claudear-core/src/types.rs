@@ -3187,10 +3187,24 @@ pub enum TimelineEventStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineEvent {
     pub time: DateTime<Utc>,
-    pub event: TimelineEventStatus,
+    pub event: String,
     /// (e.g. `"repo": "appwrite"`, `"pr": 123`).
     #[serde(flatten)]
     pub context: serde_json::Map<String, serde_json::Value>,
+}
+
+impl From<ActivityLogEntry> for TimelineEvent {
+    fn from(e: ActivityLogEntry) -> Self {
+        let context = match e.metadata {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        TimelineEvent {
+            time: e.timestamp,
+            event: e.activity_type,
+            context,
+        }
+    }
 }
 
 /// Ordered state timeline for a single issue, keyed by `short_id`.

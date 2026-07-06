@@ -15,12 +15,12 @@ use claudear_core::error::Result;
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
     ExperimentProviderStats, FixAttempt, FixAttemptStats, FixAttemptStatus, FixOutcome,
-    IssueEmbedding, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment, QaKnowledgeEntry,
-    QaMatch, SimilarIssue, SourceStats,
+    IssueEmbedding, IssueTimeline, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment,
+    QaKnowledgeEntry, QaMatch, SimilarIssue, SourceStats, TimelineEvent,
 };
 use rand::RngExt;
-use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{Name, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -2752,6 +2752,19 @@ impl ActivityStore for SqliteTracker {
 
     fn get_success_rate(&self) -> Result<f64> {
         SqliteTracker::get_success_rate(self)
+    }
+
+    fn get_issue_timeline(&self, source: &str, issue_id: &str) -> Result<IssueTimeline> {
+        let events: Vec<TimelineEvent> = self
+            .get_activities_for_issue(source, issue_id)?
+            .into_iter()
+            .map(TimelineEvent::from)
+            .collect();
+
+        Ok(IssueTimeline {
+            issue: issue_id.to_owned(),
+            events: events,
+        })
     }
 
     // --- Code Indexing ---
