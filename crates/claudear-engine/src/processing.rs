@@ -18,7 +18,7 @@ use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
     ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
-    QaKnowledgeEntry, ReplyKind, VerifyResult,
+    QaKnowledgeEntry, ReplyKind, TimelineEventStatus, VerifyResult,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
@@ -786,6 +786,15 @@ impl IssueProcessor {
                 String::new()
             };
 
+        if self.issue_embedding_service.is_some() {
+            self.record_timeline_event(
+                issue,
+                TimelineEventStatus::EmbeddingsGenerated,
+                format!("Generated embeddings context for {}", issue.short_id),
+                json!({}),
+            );
+        }
+
         // Build context from source/handler
         let mut context = context_provider.build_issue_context(issue).await?;
 
@@ -879,6 +888,13 @@ impl IssueProcessor {
                 }
             }
         }
+
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::FixStarted,
+            format!("Fix started for {}", issue.short_id),
+            json!({}),
+        );
 
         // Claude execution + ask loop
         let mut rounds: u8 = 0;
@@ -1371,6 +1387,14 @@ impl IssueProcessor {
                 }));
                 self.tracker.record_activity(&activity).ok();
 
+                let pr_number = claudear_storage::parse_pr_url(pr_url).map(|(_, n)| n);
+                self.record_timeline_event(
+                    issue,
+                    TimelineEventStatus::FixSucceeded,
+                    format!("Fix succeeded for {}", issue.short_id),
+                    json!({ "pr": pr_number, "pr_url": pr_url }),
+                );
+
                 return Ok(ProcessingOutcome::Success {
                     pr_url: pr_url.clone(),
                 });
@@ -1419,6 +1443,13 @@ impl IssueProcessor {
                 }));
                 self.tracker.record_activity(&activity).ok();
 
+                self.record_timeline_event(
+                    issue,
+                    TimelineEventStatus::FixFailed,
+                    format!("Completed without PR for {}", issue.short_id),
+                    json!({ "reason": reason }),
+                );
+
                 return Ok(ProcessingOutcome::CompletedNoPr { reason });
             }
         }
@@ -1438,6 +1469,12 @@ impl IssueProcessor {
         };
         tracing::error!(short_id = %issue.short_id, error = %error, "Failed");
         self.tracker.mark_failed(source_name, &issue.id, &error)?;
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::FixFailed,
+            format!("Fix failed for {}", issue.short_id),
+            json!({ "error": error.chars().take(300).collect::<String>() }),
+        );
         notify_failed_with_escalation(&self.notifier, &self.tracker, issue, &error).await?;
         if let Some(id) = attempt_id {
             let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, false);
@@ -1521,6 +1558,14 @@ impl IssueProcessor {
         resolution: &RepoResolution,
         source_name: &str,
     ) -> ProcessingOutcome {
+        // Timeline: QA run started.
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::QaStarted,
+            format!("QA started for {}", issue.short_id),
+            json!({}),
+        );
+
         // Run in the resolved repo when available (lets the agent read real code),
         // otherwise a scratch dir (answer is grounded purely in RAG context).
         let project_dir = match resolution {
@@ -1588,6 +1633,12 @@ impl IssueProcessor {
                     format!("Answered question {}", issue.short_id),
                     json!({ "answer_chars": answer.len() }),
                 );
+                self.record_timeline_event(
+                    issue,
+                    TimelineEventStatus::QaCompleted,
+                    format!("QA completed (answered) for {}", issue.short_id),
+                    json!({}),
+                );
                 ProcessingOutcome::CompletedNoPr {
                     reason: "answered question".to_string(),
                 }
@@ -1595,6 +1646,12 @@ impl IssueProcessor {
             Ok(Err(e)) => {
                 let error = e.to_string();
                 let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
+                self.record_timeline_event(
+                    issue,
+                    TimelineEventStatus::QaFailed,
+                    format!("QA failed for {}", issue.short_id),
+                    json!({ "error": error.chars().take(300).collect::<String>() }),
+                );
                 ProcessingOutcome::Failed { error }
             }
             Err(_) => {
@@ -1603,6 +1660,12 @@ impl IssueProcessor {
                     self.config.qa.answer_timeout_secs
                 );
                 let _ = self.tracker.mark_failed(source_name, &issue.id, &error);
+                self.record_timeline_event(
+                    issue,
+                    TimelineEventStatus::QaFailed,
+                    format!("QA timed out for {}", issue.short_id),
+                    json!({ "error": error }),
+                );
                 ProcessingOutcome::Failed { error }
             }
         }
@@ -1811,6 +1874,12 @@ impl IssueProcessor {
             format!("Verifying (reproducing) {}", issue.short_id),
             json!({ "context_chars": context.len() }),
         );
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::VerifyStarted,
+            format!("Verifying (reproducing) {}", issue.short_id),
+            json!({}),
+        );
 
         let timeout =
             std::time::Duration::from_secs(self.config.reply().verify_timeout_secs.max(1));
@@ -1869,6 +1938,20 @@ impl IssueProcessor {
             ),
             json!({ "reproduced": verdict.reproduced, "summary": verdict.summary }),
         );
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::VerifyCompleted,
+            format!(
+                "Verify {}: {}",
+                issue.short_id,
+                if verdict.reproduced {
+                    "reproduced"
+                } else {
+                    "not reproduced"
+                }
+            ),
+            json!({ "reproduced": verdict.reproduced }),
+        );
 
         // Post the verification findings back to the ticket (via the same path as
         // replies, so it honours the source's configured delivery — e.g. an
@@ -1915,6 +1998,12 @@ impl IssueProcessor {
             format!("Generating {} reply for {}", kind.as_str(), issue.short_id),
             json!({ "kind": kind.as_str(), "inbox": inbox_key, "context_chars": context.len() }),
         );
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::ReplyStarted,
+            format!("Generating {} reply for {}", kind.as_str(), issue.short_id),
+            json!({ "kind": kind.as_str() }),
+        );
 
         let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
         let result = tokio::time::timeout(
@@ -1958,6 +2047,12 @@ impl IssueProcessor {
                     "reply_sent",
                     format!("Sent {} reply for {}", kind.as_str(), issue.short_id),
                     json!({ "kind": kind.as_str(), "reply_chars": reply.len() }),
+                );
+                self.record_timeline_event(
+                    issue,
+                    TimelineEventStatus::ReplySent,
+                    format!("Sent {} reply for {}", kind.as_str(), issue.short_id),
+                    json!({ "kind": kind.as_str() }),
                 );
                 ProcessingOutcome::CompletedNoPr {
                     reason: format!("replied ({})", kind.as_str()),
@@ -2051,6 +2146,20 @@ impl IssueProcessor {
                 "decision": decision,
                 "details": details,
             }));
+        self.tracker.record_activity(&activity).ok();
+    }
+
+    fn record_timeline_event(
+        &self,
+        issue: &Issue,
+        event: TimelineEventStatus,
+        message: impl Into<String>,
+        context: serde_json::Value,
+    ) {
+        let activity = ActivityLogEntry::new(event.as_str(), message.into())
+            .with_source(issue.source.clone())
+            .with_issue(issue.id.clone(), issue.short_id.clone())
+            .with_metadata(context);
         self.tracker.record_activity(&activity).ok();
     }
 
