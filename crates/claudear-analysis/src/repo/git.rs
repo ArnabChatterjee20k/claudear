@@ -82,7 +82,7 @@ impl GitOps {
     /// remote's default branch.
     pub async fn ensure_repo_synced(repo_path: &Path, scm_url: &str) -> Result<String> {
         // Repair single-branch/stale-refspec clones so the fetch sees the current default.
-        if repo_path.exists() {
+        if Self::is_git_repo(repo_path) {
             Self::ensure_all_branches_tracked(repo_path).await;
         }
         let default_branch = Self::ensure_repo_fetched(repo_path, scm_url).await?;
@@ -429,9 +429,9 @@ impl GitOps {
         // Validate branch name to prevent injection via crafted branch names
         validate_ref(branch, "branch name")?;
 
-        // Create-or-reset the local branch to the remote tip (works when it doesn't exist locally).
+        // Force create-or-reset the local branch to the remote tip, discarding any dirty state.
         let output = Command::new("git")
-            .args(["checkout", "-B", branch, &format!("origin/{}", branch)])
+            .args(["checkout", "-f", "-B", branch, &format!("origin/{}", branch)])
             .current_dir(repo_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
