@@ -4512,18 +4512,6 @@ Create a PR with your changes.{custom_instructions}"#,
                                 "Failed to mark attempt as closed"
                             );
                         }
-                        // Timeline: PR closed (issue reached terminal state).
-                        self.tracker
-                            .record_activity(
-                                &ActivityLogEntry::new(
-                                    TimelineEventStatus::PrClosed.as_str(),
-                                    format!("PR closed for {}", attempt.short_id),
-                                )
-                                .with_source(attempt.source.clone())
-                                .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
-                                .with_metadata(json!({ "pr_url": attempt.pr_url })),
-                            )
-                            .ok();
                         let _ = self
                             .tracker
                             .update_qa_outcome_stats_for_attempt(attempt.id, false);
