@@ -1445,7 +1445,7 @@ impl IssueProcessor {
 
                 self.record_timeline_event(
                     issue,
-                    TimelineEventStatus::FixFailed,
+                    TimelineEventStatus::CompletedNoPr,
                     format!("Completed without PR for {}", issue.short_id),
                     json!({ "reason": reason }),
                 );

@@ -1301,15 +1301,15 @@ async fn activity_handler(
         })
 }
 
-/// Return the full activity timeline for a single issue, most recent first.
+/// Return the timeline for a single issue.
 async fn issue_timeline_handler(
     _user: AuthUser,
     State(state): State<ApiState>,
     Path((source, issue_id)): Path<(String, String)>,
-) -> Result<Json<Vec<claudear_core::types::ActivityLogEntry>>, StatusCode> {
+) -> Result<Json<claudear_core::types::IssueTimeline>, StatusCode> {
     state
         .tracker
-        .get_activities_for_issue(&source, &issue_id)
+        .get_issue_timeline(&source, &issue_id)
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");

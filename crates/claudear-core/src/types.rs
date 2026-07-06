@@ -3192,6 +3192,9 @@ pub enum TimelineEventStatus {
     #[serde(rename = "fix_failed")]
     FixFailed,
 
+    #[serde(rename = "completed_no_pr")]
+    CompletedNoPr,
+
     /// A question-answering (QA) run began.
     #[serde(rename = "qa_started")]
     QaStarted,
@@ -3229,6 +3232,7 @@ impl TimelineEventStatus {
             Self::ReplySent => "reply_sent",
             Self::FixSucceeded => "fix_succeeded",
             Self::FixFailed => "fix_failed",
+            Self::CompletedNoPr => "completed_no_pr",
             Self::QaStarted => "qa_started",
             Self::QaCompleted => "qa_completed",
             Self::QaFailed => "qa_failed",
@@ -3277,7 +3281,7 @@ mod tests {
 
     /// Every `TimelineEventStatus` variant. Update when adding a variant so the
     /// drift test below stays exhaustive.
-    const ALL_TIMELINE_EVENTS: [TimelineEventStatus; 16] = [
+    const ALL_TIMELINE_EVENTS: [TimelineEventStatus; 17] = [
         TimelineEventStatus::ProcessingStarted,
         TimelineEventStatus::RepoResolved,
         TimelineEventStatus::EmbeddingsGenerated,
@@ -3288,6 +3292,7 @@ mod tests {
         TimelineEventStatus::ReplySent,
         TimelineEventStatus::FixSucceeded,
         TimelineEventStatus::FixFailed,
+        TimelineEventStatus::CompletedNoPr,
         TimelineEventStatus::QaStarted,
         TimelineEventStatus::QaCompleted,
         TimelineEventStatus::QaFailed,

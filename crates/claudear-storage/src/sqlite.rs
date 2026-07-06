@@ -2763,17 +2763,13 @@ impl ActivityStore for SqliteTracker {
     }
 
     fn get_issue_timeline(&self, source: &str, issue_id: &str) -> Result<IssueTimeline> {
-        // get_activities_for_issue returns newest-first
-        let events: Vec<TimelineEvent> = self
-            .get_activities_for_issue(source, issue_id)?
-            .into_iter()
-            .rev()
-            .map(TimelineEvent::from)
-            .collect();
+        // `get_activities_for_issue` returns newest-first.
+        let mut rows = self.get_activities_for_issue(source, issue_id)?;
+        rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id)));
 
         Ok(IssueTimeline {
             issue: issue_id.to_owned(),
-            events,
+            events: rows.into_iter().map(TimelineEvent::from).collect(),
         })
     }
 
@@ -11665,6 +11661,41 @@ mod tests {
         let timeline = tracker.get_issue_timeline("linear", "nope").unwrap();
         assert_eq!(timeline.issue, "nope");
         assert!(timeline.events.is_empty());
+    }
+
+    #[test]
+    fn test_get_issue_timeline_is_chronological() {
+        use claudear_core::types::TimelineEventStatus;
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Recorded in lifecycle order; timeline must return them oldest-first
+        // (get_activities_for_issue is newest-first, so this guards the sort).
+        let seq = [
+            TimelineEventStatus::ProcessingStarted,
+            TimelineEventStatus::RepoResolved,
+            TimelineEventStatus::FixStarted,
+            TimelineEventStatus::FixSucceeded,
+        ];
+        for ev in seq {
+            tracker
+                .record_activity(
+                    &ActivityLogEntry::new(ev.as_str(), "m")
+                        .with_source("linear")
+                        .with_issue("issue-7", "LIN-7"),
+                )
+                .unwrap();
+        }
+
+        let timeline = tracker.get_issue_timeline("linear", "issue-7").unwrap();
+        let got: Vec<&str> = timeline.events.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(
+            got,
+            vec![
+                "processing_started",
+                "repo_resolved",
+                "fix_started",
+                "fix_succeeded"
+            ]
+        );
     }
 
     #[test]
