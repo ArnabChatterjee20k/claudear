@@ -240,6 +240,15 @@ pub trait ActivityStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Get all activity entries for a single issue, most recent first.
+    fn get_activities_for_issue(
+        &self,
+        _source: &str,
+        _issue_id: &str,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        Ok(Vec::new())
+    }
+
     /// Record an agent execution.
     fn record_execution(&self, _execution: &AgentExecution) -> Result<i64> {
         Ok(0)

@@ -1538,6 +1538,14 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::get_recent_activities(self, limit, source_filter)
     }
 
+    fn get_activities_for_issue(
+        &self,
+        source: &str,
+        issue_id: &str,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        SqliteTracker::get_activities_for_issue(self, source, issue_id)
+    }
+
     fn get_attempt_by_id(&self, id: i64) -> Result<Option<FixAttempt>> {
         SqliteTracker::get_attempt_by_id(self, id)
     }

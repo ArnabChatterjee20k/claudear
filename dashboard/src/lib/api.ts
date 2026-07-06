@@ -823,6 +823,15 @@ export async function fetchActivity(params?: {
   return fetchJson(`${API_BASE}/activity?${searchParams}`);
 }
 
+export async function fetchIssueTimeline(
+  source: string,
+  issueId: string,
+): Promise<ActivityLogEntry[]> {
+  return fetchJson(
+    `${API_BASE}/issues/${encodeURIComponent(source)}/${encodeURIComponent(issueId)}/timeline`,
+  );
+}
+
 export async function fetchAttemptDetail(attemptId: number): Promise<AttemptDetailResponse> {
   return fetchJson(`${API_BASE}/attempts/${attemptId}/detail`);
 }
