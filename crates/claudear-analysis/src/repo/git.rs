@@ -81,9 +81,30 @@ impl GitOps {
     /// Ensure a repository is current *and* its working tree is advanced to the
     /// remote's default branch.
     pub async fn ensure_repo_synced(repo_path: &Path, scm_url: &str) -> Result<String> {
+        // Repair single-branch/stale-refspec clones so the fetch sees the current default.
+        if repo_path.exists() {
+            Self::ensure_all_branches_tracked(repo_path).await;
+        }
         let default_branch = Self::ensure_repo_fetched(repo_path, scm_url).await?;
         Self::checkout_reset(repo_path, &default_branch).await?;
         Ok(default_branch)
+    }
+
+    /// Set the fetch refspec to track all branches (`git remote set-branches origin '*'`).
+    async fn ensure_all_branches_tracked(repo_path: &Path) {
+        let output = Command::new("git")
+            .args(["remote", "set-branches", "origin", "*"])
+            .current_dir(repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        if let Ok(o) = output {
+            if !o.status.success() {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::debug!(repo = ?repo_path, error = %stderr, "Failed to widen fetch refspec");
+            }
+        }
     }
 
     /// Fetch all remote refs without touching the working tree.
@@ -91,7 +112,7 @@ impl GitOps {
         tracing::debug!(repo = ?repo_path, "Fetching all remote refs");
 
         let output = Command::new("git")
-            .args(["fetch", "origin"])
+            .args(["fetch", "origin", "--prune"])
             .current_dir(repo_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -404,9 +425,9 @@ impl GitOps {
         // Validate branch name to prevent injection via crafted branch names
         validate_ref(branch, "branch name")?;
 
-        // Checkout the branch (branch name is validated above)
+        // Create-or-reset the local branch to the remote tip (works when it doesn't exist locally).
         let output = Command::new("git")
-            .args(["checkout", branch])
+            .args(["checkout", "-B", branch, &format!("origin/{}", branch)])
             .current_dir(repo_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
