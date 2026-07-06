@@ -81,9 +81,34 @@ impl GitOps {
     /// Ensure a repository is current *and* its working tree is advanced to the
     /// remote's default branch.
     pub async fn ensure_repo_synced(repo_path: &Path, scm_url: &str) -> Result<String> {
+        // Repair single-branch/stale-refspec clones so the fetch sees the current default.
+        if Self::is_git_repo(repo_path) {
+            Self::ensure_all_branches_tracked(repo_path).await;
+        }
         let default_branch = Self::ensure_repo_fetched(repo_path, scm_url).await?;
         Self::checkout_reset(repo_path, &default_branch).await?;
         Ok(default_branch)
+    }
+
+    /// Set the fetch refspec to track all branches (`git remote set-branches origin '*'`).
+    async fn ensure_all_branches_tracked(repo_path: &Path) {
+        let output = Command::new("git")
+            .args(["remote", "set-branches", "origin", "*"])
+            .current_dir(repo_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        match output {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::debug!(repo = ?repo_path, error = %stderr, "Failed to widen fetch refspec");
+            }
+            Err(e) => {
+                tracing::debug!(repo = ?repo_path, error = %e, "Failed to run git remote set-branches");
+            }
+        }
     }
 
     /// Fetch all remote refs without touching the working tree.
@@ -91,7 +116,7 @@ impl GitOps {
         tracing::debug!(repo = ?repo_path, "Fetching all remote refs");
 
         let output = Command::new("git")
-            .args(["fetch", "origin"])
+            .args(["fetch", "origin", "--prune"])
             .current_dir(repo_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -404,9 +429,15 @@ impl GitOps {
         // Validate branch name to prevent injection via crafted branch names
         validate_ref(branch, "branch name")?;
 
-        // Checkout the branch (branch name is validated above)
+        // Force create-or-reset the local branch to the remote tip, discarding any dirty state.
         let output = Command::new("git")
-            .args(["checkout", branch])
+            .args([
+                "checkout",
+                "-f",
+                "-B",
+                branch,
+                &format!("origin/{}", branch),
+            ])
             .current_dir(repo_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
