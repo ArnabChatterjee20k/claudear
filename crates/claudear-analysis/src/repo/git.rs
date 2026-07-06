@@ -431,7 +431,13 @@ impl GitOps {
 
         // Force create-or-reset the local branch to the remote tip, discarding any dirty state.
         let output = Command::new("git")
-            .args(["checkout", "-f", "-B", branch, &format!("origin/{}", branch)])
+            .args([
+                "checkout",
+                "-f",
+                "-B",
+                branch,
+                &format!("origin/{}", branch),
+            ])
             .current_dir(repo_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
