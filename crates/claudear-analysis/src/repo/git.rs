@@ -99,10 +99,14 @@ impl GitOps {
             .stderr(Stdio::piped())
             .output()
             .await;
-        if let Ok(o) = output {
-            if !o.status.success() {
+        match output {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 tracing::debug!(repo = ?repo_path, error = %stderr, "Failed to widen fetch refspec");
+            }
+            Err(e) => {
+                tracing::debug!(repo = ?repo_path, error = %e, "Failed to run git remote set-branches");
             }
         }
     }
