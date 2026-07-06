@@ -774,26 +774,27 @@ impl IssueProcessor {
         let similar_issues_context =
             if let Some(ref embedding_service) = self.issue_embedding_service {
                 match embedding_service.find_similar(issue, source_name).await {
-                    Ok(similar) if !similar.is_empty() => {
-                        let metric = ProcessingMetric::new("similar_issues_context_added", 1.0)
-                            .with_source(source_name.to_string());
-                        self.tracker.record_metric(&metric).ok();
-                        format_similar_issues_context(&similar)
+                    Ok(similar) => {
+                        self.record_timeline_event(
+                            issue,
+                            TimelineEventStatus::EmbeddingsGenerated,
+                            format!("Generated embeddings context for {}", issue.short_id),
+                            json!({ "similar_count": similar.len() }),
+                        );
+                        if similar.is_empty() {
+                            String::new()
+                        } else {
+                            let metric = ProcessingMetric::new("similar_issues_context_added", 1.0)
+                                .with_source(source_name.to_string());
+                            self.tracker.record_metric(&metric).ok();
+                            format_similar_issues_context(&similar)
+                        }
                     }
-                    _ => String::new(),
+                    Err(_) => String::new(),
                 }
             } else {
                 String::new()
             };
-
-        if self.issue_embedding_service.is_some() {
-            self.record_timeline_event(
-                issue,
-                TimelineEventStatus::EmbeddingsGenerated,
-                format!("Generated embeddings context for {}", issue.short_id),
-                json!({}),
-            );
-        }
 
         // Build context from source/handler
         let mut context = context_provider.build_issue_context(issue).await?;
