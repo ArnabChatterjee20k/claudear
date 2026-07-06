@@ -515,4 +515,15 @@ impl AgentRunner for InstrumentedRunner {
             .generate_reply(issue, context, guideline, kind, project_dir)
             .await
     }
+
+    async fn structured_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+    ) -> Result<serde_json::Value> {
+        self.inner
+            .structured_query(prompt, json_schema, project_dir)
+            .await
+    }
 }

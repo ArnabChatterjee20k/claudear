@@ -106,6 +106,23 @@ pub trait AgentRunner: Send + Sync {
             "generate_reply is not supported by this provider",
         ))
     }
+
+    /// Run a read-only, schema-constrained query and return the JSON object the
+    /// model produced under constrained decoding. Providers that support it
+    /// (e.g. Claude via `--json-schema`) guarantee the result matches `json_schema`.
+    ///
+    /// Default: not supported. Callers should fall back (e.g. to a heuristic)
+    /// when this returns an error.
+    async fn structured_query(
+        &self,
+        _prompt: &str,
+        _json_schema: &str,
+        _project_dir: &Path,
+    ) -> Result<serde_json::Value> {
+        Err(claudear_core::error::Error::runner(
+            "structured_query is not supported by this provider",
+        ))
+    }
 }
 
 /// Best-effort detection for rate limit failures (generic, not provider-specific).

@@ -1,6 +1,6 @@
 //! Main watcher that coordinates sources, Claude, and notifications.
 
-use crate::llm_analyzer::Intent;
+use crate::intent::Intent;
 use crate::llm_classifier::LlmRepoClassifier;
 use crate::repo_index::build_repo_index_with_fallback;
 use crate::retry::RetryManager;
@@ -204,6 +204,10 @@ pub struct Watcher {
     slot_available: Notify,
     /// Optional LLM analyzer for enhanced analysis across the pipeline.
     llm_analyzer: Option<Arc<crate::llm_analyzer::LlmAnalyzerImpl>>,
+    /// Intent classifier for QA-vs-fix routing. Follows the agent-runner choice:
+    /// agent-based when running an external provider, local-LLM-based when
+    /// `agent.use_llm` is set.
+    intent_classifier: Option<Arc<dyn crate::intent::IntentClassifier>>,
     /// Join handles for spawned issue-processing tasks (used by tests to drain).
     spawn_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
@@ -238,6 +242,28 @@ impl Watcher {
             Arc::new(crate::llm_analyzer::LlmAnalyzerImpl::new(engine.clone()))
         });
 
+        // Choose the intent classifier to follow the agent-runner choice: when the
+        // agent runner is an external provider (`agent.use_llm = false`) classify
+        // via that agent (Claude Code), preferring the cheaper classification agent
+        // if configured; otherwise use the offline local LLM engine.
+        let intent_classifier: Option<Arc<dyn crate::intent::IntentClassifier>> =
+            if !options.config.agent.use_llm {
+                let classifier_runner = options
+                    .classification_agent
+                    .clone()
+                    .unwrap_or_else(|| options.agent.clone());
+                tracing::info!("Agent-based intent classifier enabled (using configured agent)");
+                Some(Arc::new(
+                    crate::agent_classifier::AgentIntentClassifier::new(classifier_runner),
+                ))
+            } else {
+                options.llm_engine.clone().map(|engine| {
+                    tracing::info!("Local-LLM intent classifier enabled (agent.use_llm = true)");
+                    Arc::new(crate::llm_classifier::LocalLlmIntentClassifier::new(engine))
+                        as Arc<dyn crate::intent::IntentClassifier>
+                })
+            };
+
         Self {
             agent: options.agent,
             config: options.config,
@@ -264,6 +290,7 @@ impl Watcher {
             rate_limit_pause_until: RwLock::new(HashMap::new()),
             slot_available: Notify::new(),
             llm_analyzer,
+            intent_classifier,
             spawn_handles: tokio::sync::Mutex::new(Vec::new()),
         }
     }
@@ -3107,27 +3134,27 @@ Create a PR with your changes.{custom_instructions}"#,
         // single-cap behaviour with no carried type.
         let qa_split_enabled = self.config.qa.enabled
             && crate::processing::qa_eligible_source(source.name())
-            && self.llm_analyzer.is_some();
+            && self.intent_classifier.is_some();
 
         let to_process: Vec<(Issue, MatchResult, Option<Intent>)> = if qa_split_enabled {
-            // Classify all ordered issues in a single blocking task (the analyzer call is
-            // synchronous, CPU-bound local inference). Fix-bias on ambiguity / errors, matching
-            // `classify_intent`'s contract.
-            let analyzer = self
-                .llm_analyzer
+            // Classify each ordered issue via the configured backend. The local LLM
+            // backend offloads its synchronous inference to a blocking thread; the
+            // agent backend awaits an agent run. Fix-bias on ambiguity / errors,
+            // matching `classify_intent`'s contract. Sequential to avoid fanning out
+            // many concurrent agent runs.
+            let classifier = self
+                .intent_classifier
                 .clone()
-                .expect("llm_analyzer present (checked by qa_split_enabled)");
-            let issues_for_intent: Vec<Issue> =
-                ordered.iter().map(|(issue, _)| issue.clone()).collect();
-            let ordered_len = ordered.len();
-            let intents: Vec<Intent> = tokio::task::spawn_blocking(move || {
-                issues_for_intent
-                    .iter()
-                    .map(|issue| analyzer.classify_intent(issue).unwrap_or(Intent::Fix))
-                    .collect()
-            })
-            .await
-            .unwrap_or_else(|_| vec![Intent::Fix; ordered_len]);
+                .expect("intent_classifier present (checked by qa_split_enabled)");
+            let mut intents: Vec<Intent> = Vec::with_capacity(ordered.len());
+            for (issue, _) in &ordered {
+                intents.push(
+                    classifier
+                        .classify_intent(issue)
+                        .await
+                        .unwrap_or(Intent::Fix),
+                );
+            }
 
             // Partition preserving prioritisation order within each bucket. Only
             // pure questions take the QA bucket; bug/security/fix are processed.
@@ -3732,6 +3759,7 @@ Create a PR with your changes.{custom_instructions}"#,
             user_registry: self.user_registry.clone(),
             github_client: self.github_client.clone(),
             llm_analyzer: self.llm_analyzer.clone(),
+            intent_classifier: self.intent_classifier.clone(),
         };
 
         let input = ProcessingInput {
@@ -4429,6 +4457,7 @@ Create a PR with your changes.{custom_instructions}"#,
             user_registry: self.user_registry.clone(),
             github_client: self.github_client.clone(),
             llm_analyzer: self.llm_analyzer.clone(),
+            intent_classifier: self.intent_classifier.clone(),
         };
 
         let input = ProcessingInput {

@@ -1007,6 +1007,7 @@ async fn process_issue(
         user_registry: state.user_registry.clone(),
         github_client: None,
         llm_analyzer: None,
+        intent_classifier: None,
     };
 
     let input = ProcessingInput {
@@ -1017,8 +1018,9 @@ async fn process_issue(
         attempt_id,
         review_feedback: None,
         existing_pr_branch: None,
-        // Webhook path builds its IssueProcessor with `llm_analyzer: None`, so it never took
-        // the QA branch; `None` keeps it on the fix pipeline (behaviour-preserving).
+        // Webhook path builds its IssueProcessor with `intent_classifier: None`, so intent
+        // classification falls back to the heuristic; `None` keeps it on the fix pipeline
+        // (behaviour-preserving).
         intent: None,
     };
 
