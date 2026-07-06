@@ -238,6 +238,23 @@ impl AgentRunner for AgentOrchestrator {
             .generate_reply(issue, context, guideline, kind, project_dir)
             .await
     }
+
+    async fn structured_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+    ) -> Result<serde_json::Value> {
+        // Read-only structured queries always use the primary provider.
+        let provider = self
+            .providers
+            .first()
+            .map(|p| &p.provider)
+            .ok_or_else(|| Error::runner("No providers configured in orchestrator"))?;
+        provider
+            .structured_query(prompt, json_schema, project_dir)
+            .await
+    }
 }
 
 #[cfg(test)]
