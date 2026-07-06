@@ -3159,9 +3159,220 @@ pub trait SentryHttpClient: Send + Sync {
     ) -> crate::Result<crate::http::HttpResponse>;
 }
 
+/// timeline for metadata of an issue
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimelineEventStatus {
+    #[serde(rename = "processing_started")]
+    ProcessingStarted,
+
+    #[serde(rename = "repo_resolved")]
+    RepoResolved,
+
+    #[serde(rename = "embeddings_generated")]
+    EmbeddingsGenerated,
+
+    #[serde(rename = "fix_started")]
+    FixStarted,
+
+    #[serde(rename = "verify_started")]
+    VerifyStarted,
+
+    #[serde(rename = "verify_completed")]
+    VerifyCompleted,
+
+    #[serde(rename = "reply_started")]
+    ReplyStarted,
+
+    #[serde(rename = "reply_sent")]
+    ReplySent,
+
+    #[serde(rename = "fix_succeeded")]
+    FixSucceeded,
+
+    #[serde(rename = "fix_failed")]
+    FixFailed,
+
+    #[serde(rename = "completed_no_pr")]
+    CompletedNoPr,
+
+    /// A question-answering (QA) run began.
+    #[serde(rename = "qa_started")]
+    QaStarted,
+
+    /// A QA run finished successfully (question answered).
+    #[serde(rename = "qa_completed")]
+    QaCompleted,
+
+    /// A QA run failed (no answer produced).
+    #[serde(rename = "qa_failed")]
+    QaFailed,
+
+    #[serde(rename = "pr_merged")]
+    PrMerged,
+
+    #[serde(rename = "pr_closed")]
+    PrClosed,
+
+    #[serde(rename = "fix_abandoned")]
+    FixAbandoned,
+}
+
+impl TimelineEventStatus {
+    /// Stable identifier used as the `activity_log.activity_type` for this event
+    /// (matches the `#[serde(rename)]` value).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProcessingStarted => "processing_started",
+            Self::RepoResolved => "repo_resolved",
+            Self::EmbeddingsGenerated => "embeddings_generated",
+            Self::FixStarted => "fix_started",
+            Self::VerifyStarted => "verify_started",
+            Self::VerifyCompleted => "verify_completed",
+            Self::ReplyStarted => "reply_started",
+            Self::ReplySent => "reply_sent",
+            Self::FixSucceeded => "fix_succeeded",
+            Self::FixFailed => "fix_failed",
+            Self::CompletedNoPr => "completed_no_pr",
+            Self::QaStarted => "qa_started",
+            Self::QaCompleted => "qa_completed",
+            Self::QaFailed => "qa_failed",
+            Self::PrMerged => "pr_merged",
+            Self::PrClosed => "pr_closed",
+            Self::FixAbandoned => "fix_abandoned",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEvent {
+    pub time: DateTime<Utc>,
+    pub event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Context carried from the activity's metadata, flattened onto the event
+    /// (e.g. `"repo": "appwrite"`, `"pr": 123`).
+    #[serde(flatten)]
+    pub context: serde_json::Map<String, serde_json::Value>,
+}
+
+impl From<ActivityLogEntry> for TimelineEvent {
+    fn from(e: ActivityLogEntry) -> Self {
+        let context = match e.metadata {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        TimelineEvent {
+            time: e.timestamp,
+            event: e.activity_type,
+            message: if e.message.is_empty() {
+                None
+            } else {
+                Some(e.message)
+            },
+            context,
+        }
+    }
+}
+
+/// Ordered state timeline for a single issue, keyed by `short_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueTimeline {
+    /// Human-readable issue id (`short_id`), e.g. `"GH-123"`.
+    pub issue: String,
+    /// Events in chronological order.
+    pub events: Vec<TimelineEvent>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `TimelineEventStatus` variant. Update when adding a variant so the
+    /// drift test below stays exhaustive.
+    const ALL_TIMELINE_EVENTS: [TimelineEventStatus; 17] = [
+        TimelineEventStatus::ProcessingStarted,
+        TimelineEventStatus::RepoResolved,
+        TimelineEventStatus::EmbeddingsGenerated,
+        TimelineEventStatus::FixStarted,
+        TimelineEventStatus::VerifyStarted,
+        TimelineEventStatus::VerifyCompleted,
+        TimelineEventStatus::ReplyStarted,
+        TimelineEventStatus::ReplySent,
+        TimelineEventStatus::FixSucceeded,
+        TimelineEventStatus::FixFailed,
+        TimelineEventStatus::CompletedNoPr,
+        TimelineEventStatus::QaStarted,
+        TimelineEventStatus::QaCompleted,
+        TimelineEventStatus::QaFailed,
+        TimelineEventStatus::PrMerged,
+        TimelineEventStatus::PrClosed,
+        TimelineEventStatus::FixAbandoned,
+    ];
+
+    #[test]
+    fn timeline_event_as_str_matches_serde_rename() {
+        // `as_str()` is what gets persisted as `activity_log.activity_type`, and
+        // `#[serde(rename)]` is what the API serializes — they must never drift.
+        for ev in ALL_TIMELINE_EVENTS {
+            let serialized = serde_json::to_value(ev).unwrap();
+            assert_eq!(
+                serialized,
+                serde_json::json!(ev.as_str()),
+                "as_str()/serde drift for {:?}",
+                ev
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_event_as_str_values_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for ev in ALL_TIMELINE_EVENTS {
+            assert!(
+                seen.insert(ev.as_str()),
+                "duplicate event name {}",
+                ev.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn timeline_event_from_activity_flattens_object_metadata() {
+        let entry = ActivityLogEntry::new(TimelineEventStatus::RepoResolved.as_str(), "resolved")
+            .with_source("linear")
+            .with_issue("i1", "S-1")
+            .with_metadata(serde_json::json!({ "repo": "appwrite" }));
+        let ev = TimelineEvent::from(entry);
+        assert_eq!(ev.event, "repo_resolved");
+        assert_eq!(ev.context.get("repo").unwrap(), "appwrite");
+    }
+
+    #[test]
+    fn timeline_event_from_activity_ignores_non_object_metadata() {
+        // None metadata -> empty context.
+        let ev = TimelineEvent::from(ActivityLogEntry::new("fix_started", "m"));
+        assert!(ev.context.is_empty());
+        // A scalar (non-object) metadata value -> empty context, not a panic.
+        let entry = ActivityLogEntry::new("x", "m").with_metadata(serde_json::json!("scalar"));
+        assert!(TimelineEvent::from(entry).context.is_empty());
+    }
+
+    #[test]
+    fn issue_timeline_serializes_with_flattened_context() {
+        let events = vec![TimelineEvent::from(
+            ActivityLogEntry::new(TimelineEventStatus::FixSucceeded.as_str(), "ok")
+                .with_metadata(serde_json::json!({ "pr": 123 })),
+        )];
+        let tl = IssueTimeline {
+            issue: "GH-123".to_string(),
+            events,
+        };
+        let v = serde_json::to_value(&tl).unwrap();
+        assert_eq!(v["issue"], "GH-123");
+        assert_eq!(v["events"][0]["event"], "fix_succeeded");
+        // Context is flattened onto the event, not nested under a key.
+        assert_eq!(v["events"][0]["pr"], 123);
+    }
 
     #[test]
     fn test_issue_creation() {

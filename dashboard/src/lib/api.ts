@@ -823,6 +823,28 @@ export async function fetchActivity(params?: {
   return fetchJson(`${API_BASE}/activity?${searchParams}`);
 }
 
+export interface TimelineEvent {
+  time: string;
+  event: string;
+  message?: string;
+  // Flattened metadata context (e.g. `repo`, `pr`).
+  [key: string]: unknown;
+}
+
+export interface IssueTimeline {
+  issue: string;
+  events: TimelineEvent[];
+}
+
+export async function fetchIssueTimeline(
+  source: string,
+  issueId: string,
+): Promise<IssueTimeline> {
+  return fetchJson(
+    `${API_BASE}/issues/${encodeURIComponent(source)}/${encodeURIComponent(issueId)}/timeline`,
+  );
+}
+
 export async function fetchAttemptDetail(attemptId: number): Promise<AttemptDetailResponse> {
   return fetchJson(`${API_BASE}/attempts/${attemptId}/detail`);
 }

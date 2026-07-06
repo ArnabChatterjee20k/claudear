@@ -119,6 +119,10 @@ pub fn create_api_router_full(
         .route("/api/metrics", get(metrics_handler))
         .route("/api/errors", get(errors_handler))
         .route("/api/issues", get(issues_handler))
+        .route(
+            "/api/issues/{source}/{issue_id}/timeline",
+            get(issue_timeline_handler),
+        )
         .route("/api/prs", get(prs_handler))
         .route("/api/prs/analytics", get(pr_analytics_handler))
         .route("/api/support/replies", get(support_replies_handler))
@@ -1289,6 +1293,23 @@ async fn activity_handler(
     state
         .tracker
         .get_recent_activities_filtered(limit, source_filter)
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!(error = %e, "Internal server error");
+            sentry::capture_error(&e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Return the timeline for a single issue.
+async fn issue_timeline_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+    Path((source, issue_id)): Path<(String, String)>,
+) -> Result<Json<claudear_core::types::IssueTimeline>, StatusCode> {
+    state
+        .tracker
+        .get_issue_timeline(&source, &issue_id)
         .map(Json)
         .map_err(|e| {
             tracing::error!(error = %e, "Internal server error");

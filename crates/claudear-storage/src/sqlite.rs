@@ -15,8 +15,8 @@ use claudear_core::error::Result;
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
     ExperimentProviderStats, FixAttempt, FixAttemptStats, FixAttemptStatus, FixOutcome,
-    IssueEmbedding, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment, QaKnowledgeEntry,
-    QaMatch, SimilarIssue, SourceStats,
+    IssueEmbedding, IssueTimeline, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment,
+    QaKnowledgeEntry, QaMatch, SimilarIssue, SourceStats, TimelineEvent,
 };
 use rand::RngExt;
 use rusqlite::OptionalExtension;
@@ -1538,6 +1538,14 @@ impl ActivityStore for SqliteTracker {
         SqliteTracker::get_recent_activities(self, limit, source_filter)
     }
 
+    fn get_activities_for_issue(
+        &self,
+        source: &str,
+        issue_id: &str,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        SqliteTracker::get_activities_for_issue(self, source, issue_id)
+    }
+
     fn get_attempt_by_id(&self, id: i64) -> Result<Option<FixAttempt>> {
         SqliteTracker::get_attempt_by_id(self, id)
     }
@@ -2752,6 +2760,17 @@ impl ActivityStore for SqliteTracker {
 
     fn get_success_rate(&self) -> Result<f64> {
         SqliteTracker::get_success_rate(self)
+    }
+
+    fn get_issue_timeline(&self, source: &str, issue_id: &str) -> Result<IssueTimeline> {
+        // `get_activities_for_issue` returns newest-first.
+        let mut rows = self.get_activities_for_issue(source, issue_id)?;
+        rows.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id)));
+
+        Ok(IssueTimeline {
+            issue: issue_id.to_owned(),
+            events: rows.into_iter().map(TimelineEvent::from).collect(),
+        })
     }
 
     // --- Code Indexing ---
@@ -11572,6 +11591,111 @@ mod tests {
         let tracker = SqliteTracker::in_memory().unwrap();
         let activities = tracker.get_recent_activities(10, None).unwrap();
         assert!(activities.is_empty());
+    }
+
+    #[test]
+    fn test_get_issue_timeline_rolls_up_this_issues_events_only() {
+        use claudear_core::types::TimelineEventStatus;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let events = [
+            TimelineEventStatus::ProcessingStarted,
+            TimelineEventStatus::RepoResolved,
+            TimelineEventStatus::FixStarted,
+            TimelineEventStatus::FixSucceeded,
+        ];
+        for ev in events {
+            tracker
+                .record_activity(
+                    &ActivityLogEntry::new(ev.as_str(), "msg")
+                        .with_source("linear")
+                        .with_issue("issue-1", "LIN-1"),
+                )
+                .unwrap();
+        }
+        // A different issue's event must not leak into this timeline.
+        tracker
+            .record_activity(
+                &ActivityLogEntry::new(TimelineEventStatus::FixFailed.as_str(), "other")
+                    .with_source("linear")
+                    .with_issue("issue-2", "LIN-2"),
+            )
+            .unwrap();
+
+        let timeline = tracker.get_issue_timeline("linear", "issue-1").unwrap();
+        assert_eq!(timeline.issue, "issue-1");
+        let got: std::collections::HashSet<&str> =
+            timeline.events.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(got.len(), events.len());
+        for ev in events {
+            assert!(got.contains(ev.as_str()), "missing event {}", ev.as_str());
+        }
+        assert!(!got.contains("fix_failed"), "leaked another issue's event");
+    }
+
+    #[test]
+    fn test_get_issue_timeline_flattens_metadata_context() {
+        use claudear_core::types::TimelineEventStatus;
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_activity(
+                &ActivityLogEntry::new(TimelineEventStatus::FixSucceeded.as_str(), "ok")
+                    .with_source("linear")
+                    .with_issue("issue-9", "LIN-9")
+                    .with_metadata(serde_json::json!({ "pr": 123 })),
+            )
+            .unwrap();
+
+        let timeline = tracker.get_issue_timeline("linear", "issue-9").unwrap();
+        assert_eq!(timeline.events.len(), 1);
+        assert_eq!(timeline.events[0].event, "fix_succeeded");
+        assert_eq!(
+            timeline.events[0].context.get("pr").unwrap(),
+            &serde_json::json!(123)
+        );
+    }
+
+    #[test]
+    fn test_get_issue_timeline_empty_for_unknown_issue() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let timeline = tracker.get_issue_timeline("linear", "nope").unwrap();
+        assert_eq!(timeline.issue, "nope");
+        assert!(timeline.events.is_empty());
+    }
+
+    #[test]
+    fn test_get_issue_timeline_is_chronological() {
+        use claudear_core::types::TimelineEventStatus;
+        let tracker = SqliteTracker::in_memory().unwrap();
+        // Recorded in lifecycle order; timeline must return them oldest-first
+        // (get_activities_for_issue is newest-first, so this guards the sort).
+        let seq = [
+            TimelineEventStatus::ProcessingStarted,
+            TimelineEventStatus::RepoResolved,
+            TimelineEventStatus::FixStarted,
+            TimelineEventStatus::FixSucceeded,
+        ];
+        for ev in seq {
+            tracker
+                .record_activity(
+                    &ActivityLogEntry::new(ev.as_str(), "m")
+                        .with_source("linear")
+                        .with_issue("issue-7", "LIN-7"),
+                )
+                .unwrap();
+        }
+
+        let timeline = tracker.get_issue_timeline("linear", "issue-7").unwrap();
+        let got: Vec<&str> = timeline.events.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(
+            got,
+            vec![
+                "processing_started",
+                "repo_resolved",
+                "fix_started",
+                "fix_succeeded"
+            ]
+        );
     }
 
     #[test]

@@ -27,9 +27,9 @@ use chrono::{DateTime, Utc};
 use claudear_core::error::Result;
 use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, ErrorPattern, FixAttempt, FixAttemptStats,
-    FixAttemptStatus, IssueEmbedding, PrAnalytics, PrRecord, PrReviewRecord, ProcessingMetric,
-    PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck, RegressionWatch,
-    RegressionWatchStatus, SimilarIssue,
+    FixAttemptStatus, IssueEmbedding, IssueTimeline, PrAnalytics, PrRecord, PrReviewRecord,
+    ProcessingMetric, PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck,
+    RegressionWatch, RegressionWatchStatus, SimilarIssue,
 };
 use claudear_core::types::{CrossRepoCorrelation, FixOutcome};
 use std::collections::{HashMap, HashSet};
@@ -236,6 +236,15 @@ pub trait ActivityStore: Send + Sync {
         &self,
         _limit: usize,
         _source_filter: Option<&str>,
+    ) -> Result<Vec<ActivityLogEntry>> {
+        Ok(Vec::new())
+    }
+
+    /// Get all activity entries for a single issue, most recent first.
+    fn get_activities_for_issue(
+        &self,
+        _source: &str,
+        _issue_id: &str,
     ) -> Result<Vec<ActivityLogEntry>> {
         Ok(Vec::new())
     }
@@ -636,6 +645,13 @@ pub trait ActivityStore: Send + Sync {
     /// System 7: Update a PR's fix quality score.
     fn update_pr_fix_quality_score(&self, _pr_url: &str, _score: f64) -> Result<()> {
         Ok(())
+    }
+
+    fn get_issue_timeline(&self, _source: &str, _issue_id: &str) -> Result<IssueTimeline> {
+        Ok(IssueTimeline {
+            events: Vec::new(),
+            issue: String::new(),
+        })
     }
 }
 
