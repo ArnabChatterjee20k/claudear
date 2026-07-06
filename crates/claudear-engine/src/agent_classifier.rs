@@ -1,9 +1,16 @@
-//! Agent-based repository classifier.
+//! Agent-based classifiers.
 //!
-//! Uses the configured agent (claude/codex) for repo classification instead of
-//! the local LLM. Much faster but costs API credits.
+//! Uses the configured agent (claude/codex) for classification instead of the
+//! local LLM. Much faster but costs API credits. Provides [`AgentRepoClassifier`]
+//! (which repo an issue belongs to) and [`AgentIntentClassifier`] (bug/security
+//! vs question/fix routing). The intent classifier uses schema-constrained
+//! structured output (`--json-schema`) so the reply is a guaranteed enum value.
 
+use crate::intent::CATEGORY_RULES;
+use crate::intent::{intent_body, intent_title, parse_intent, Intent, IntentClassifier};
+use async_trait::async_trait;
 use claudear_analysis::inference::{ClassificationRequest, RepoClassifier};
+use claudear_core::types::Issue;
 use claudear_integrations::runner::AgentRunner;
 use std::sync::Arc;
 use std::time::Instant;
@@ -177,11 +184,91 @@ fn parse_response(response: &str, candidates: &[&str]) -> Option<(String, f32)> 
     None
 }
 
+/// JSON schema constraining the agent's intent reply to a single enum value.
+/// Under `--json-schema` constrained decoding the result is guaranteed to be one
+/// of the four categories.
+const INTENT_SCHEMA: &str = r#"{
+    "type": "object",
+    "required": ["intent"],
+    "additionalProperties": false,
+    "properties": {
+        "intent": {
+            "type": "string",
+            "enum": ["bug", "security", "question", "fix"],
+            "description": "The single category the message belongs to"
+        }
+    }
+}"#;
+
+/// Agent-based intent classifier (Claude Code / configured provider).
+///
+/// Uses `--json-schema` constrained decoding via [`AgentRunner::structured_query`]
+/// so the reply is a guaranteed one of `bug | security | question | fix`. Returns
+/// `None` if the provider doesn't support structured output or the call fails, so
+/// the caller falls back to the heuristic.
+pub struct AgentIntentClassifier {
+    agent: Arc<dyn AgentRunner>,
+}
+
+impl AgentIntentClassifier {
+    /// Create a new intent classifier with the given agent runner.
+    pub fn new(agent: Arc<dyn AgentRunner>) -> Self {
+        Self { agent }
+    }
+}
+
+#[async_trait]
+impl IntentClassifier for AgentIntentClassifier {
+    async fn classify_intent(&self, issue: &Issue) -> Option<Intent> {
+        let prompt = build_intent_prompt(issue);
+        let temp_dir = std::env::temp_dir();
+
+        let start = Instant::now();
+        let result = self
+            .agent
+            .structured_query(&prompt, INTENT_SCHEMA, &temp_dir)
+            .await;
+
+        match result {
+            Ok(value) => {
+                tracing::debug!(
+                    response = %value,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Agent intent classifier structured response"
+                );
+                value
+                    .get("intent")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_intent)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Agent intent classifier failed");
+                None
+            }
+        }
+    }
+}
+
+/// Build the intent-classification prompt for the coding agent (plain text; the
+/// `--json-schema` result shape is enforced by constrained decoding, not prose).
+fn build_intent_prompt(issue: &Issue) -> String {
+    format!(
+        "You classify an incoming developer-support message into exactly one of:\n\
+         {rules}\n\
+         Set `intent` to the single matching category.\n\n\
+         Title: {title}\n\
+         {body}",
+        rules = CATEGORY_RULES,
+        title = intent_title(issue),
+        body = intent_body(issue),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use claudear_core::types::{AgentResult, Issue};
+    use claudear_core::types::AgentResult;
     use claudear_integrations::runner::ProviderCapabilities;
     use std::collections::HashMap;
     use std::path::Path;
@@ -332,5 +419,104 @@ mod tests {
         let request = sample_request();
         let result = classifier.classify(&request);
         assert_eq!(result, Some(("appwrite/cloud".to_string(), 1.0)));
+    }
+
+    // --- Intent classifier ---
+
+    /// Mock agent whose `structured_query` returns a fixed JSON value (or errors).
+    struct StructuredMock {
+        response: Result<serde_json::Value, String>,
+    }
+
+    #[async_trait]
+    impl AgentRunner for StructuredMock {
+        fn name(&self) -> &str {
+            "structured-mock"
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+        fn build_prompt_for_issue(&self, _: &Issue, _: &str, _: &Path) -> String {
+            String::new()
+        }
+        async fn execute_with_attempt(
+            &self,
+            _prompt: &str,
+            _issue: Option<&Issue>,
+            _attempt_id: Option<i64>,
+            _project_dir: &Path,
+        ) -> claudear_core::error::Result<AgentResult> {
+            Err(claudear_core::error::Error::runner("unused"))
+        }
+        async fn structured_query(
+            &self,
+            _prompt: &str,
+            _json_schema: &str,
+            _project_dir: &Path,
+        ) -> claudear_core::error::Result<serde_json::Value> {
+            match &self.response {
+                Ok(v) => Ok(v.clone()),
+                Err(e) => Err(claudear_core::error::Error::runner(e)),
+            }
+        }
+    }
+
+    fn intent_issue(title: &str, description: Option<&str>) -> Issue {
+        use claudear_core::types::{IssuePriority, IssueStatus};
+        Issue {
+            id: "ID-1".to_string(),
+            short_id: "ID-1".to_string(),
+            title: title.to_string(),
+            description: description.map(|s| s.to_string()),
+            url: String::new(),
+            source: "discord".to_string(),
+            priority: IssuePriority::Medium,
+            status: IssueStatus::Open,
+            metadata: HashMap::new(),
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn test_intent_prompt_is_plain_text_with_contract() {
+        let issue = intent_issue("Realtime onClose error", Some("triggerStats() null given"));
+        let prompt = build_intent_prompt(&issue);
+
+        assert!(prompt.contains("Realtime onClose error"));
+        assert!(prompt.contains("triggerStats()"));
+        assert!(prompt.contains("\"bug\""));
+        assert!(prompt.contains("Set `intent`"));
+        // No local-LLM control tokens leak into an external-agent prompt.
+        assert!(!prompt.contains("<|system|>"));
+        assert!(!prompt.contains("<|assistant|>"));
+    }
+
+    #[test]
+    fn test_intent_schema_is_valid_json_with_enum() {
+        let schema: serde_json::Value = serde_json::from_str(INTENT_SCHEMA).unwrap();
+        let variants = schema["properties"]["intent"]["enum"].as_array().unwrap();
+        assert_eq!(variants.len(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_agent_intent_classifier_parses_structured_value() {
+        let classifier = AgentIntentClassifier::new(Arc::new(StructuredMock {
+            response: Ok(serde_json::json!({ "intent": "security" })),
+        }));
+        let issue = intent_issue("SQL injection in login", None);
+        assert_eq!(
+            classifier.classify_intent(&issue).await,
+            Some(Intent::Security)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_agent_intent_classifier_error_returns_none() {
+        let classifier = AgentIntentClassifier::new(Arc::new(StructuredMock {
+            response: Err("not supported".to_string()),
+        }));
+        let issue = intent_issue("anything", None);
+        assert_eq!(classifier.classify_intent(&issue).await, None);
     }
 }
