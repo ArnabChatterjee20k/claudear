@@ -29,7 +29,7 @@ use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, ErrorPattern, FixAttempt, FixAttemptStats,
     FixAttemptStatus, IssueEmbedding, IssueTimeline, PrAnalytics, PrRecord, PrReviewRecord,
     ProcessingMetric, PromptExperiment, QaKnowledgeEntry, QaMatch, RegressionCheck,
-    RegressionWatch, RegressionWatchStatus, SimilarIssue, TimelineEvent,
+    RegressionWatch, RegressionWatchStatus, SimilarIssue,
 };
 use claudear_core::types::{CrossRepoCorrelation, FixOutcome};
 use std::collections::{HashMap, HashSet};

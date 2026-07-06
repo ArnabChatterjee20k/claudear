@@ -19,8 +19,8 @@ use claudear_core::types::{
     QaKnowledgeEntry, QaMatch, SimilarIssue, SourceStats, TimelineEvent,
 };
 use rand::RngExt;
+use rusqlite::OptionalExtension;
 use rusqlite::{params, Connection, TransactionBehavior};
-use rusqlite::{Name, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -2763,15 +2763,17 @@ impl ActivityStore for SqliteTracker {
     }
 
     fn get_issue_timeline(&self, source: &str, issue_id: &str) -> Result<IssueTimeline> {
+        // get_activities_for_issue returns newest-first
         let events: Vec<TimelineEvent> = self
             .get_activities_for_issue(source, issue_id)?
             .into_iter()
+            .rev()
             .map(TimelineEvent::from)
             .collect();
 
         Ok(IssueTimeline {
             issue: issue_id.to_owned(),
-            events: events,
+            events,
         })
     }
 
