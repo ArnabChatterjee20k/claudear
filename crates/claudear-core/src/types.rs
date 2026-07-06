@@ -3247,6 +3247,9 @@ impl TimelineEventStatus {
 pub struct TimelineEvent {
     pub time: DateTime<Utc>,
     pub event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Context carried from the activity's metadata, flattened onto the event
     /// (e.g. `"repo": "appwrite"`, `"pr": 123`).
     #[serde(flatten)]
     pub context: serde_json::Map<String, serde_json::Value>,
@@ -3261,6 +3264,11 @@ impl From<ActivityLogEntry> for TimelineEvent {
         TimelineEvent {
             time: e.timestamp,
             event: e.activity_type,
+            message: if e.message.is_empty() {
+                None
+            } else {
+                Some(e.message)
+            },
             context,
         }
     }
