@@ -17,7 +17,7 @@ use claudear_core::error::Result;
 use claudear_core::types::{
     ActivityLogEntry, AskRequest, BlockingQuestion, FixAttempt, FixAttemptStats, FixAttemptStatus,
     Issue, IssueEmbedding, IssueType, MatchPriority, MatchResult, ProcessingMetric,
-    RegressionWatch, ReplyKind,
+    RegressionWatch, ReplyKind, TimelineEventStatus,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
@@ -2696,6 +2696,18 @@ Create a PR with your changes.{custom_instructions}"#,
                     pr_status_merged += 1;
                     self.tracker
                         .mark_merged(&attempt.source, &attempt.issue_id)?;
+                    // Timeline: PR merged.
+                    self.tracker
+                        .record_activity(
+                            &ActivityLogEntry::new(
+                                TimelineEventStatus::PrMerged.as_str(),
+                                format!("PR merged for {}", attempt.short_id),
+                            )
+                            .with_source(attempt.source.clone())
+                            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                            .with_metadata(json!({ "pr_url": attempt.pr_url })),
+                        )
+                        .ok();
                     let _ = self
                         .tracker
                         .update_qa_outcome_stats_for_attempt(attempt.id, true);
@@ -2833,6 +2845,18 @@ Create a PR with your changes.{custom_instructions}"#,
                     pr_status_closed += 1;
                     self.tracker
                         .mark_closed(&attempt.source, &attempt.issue_id)?;
+                    // Timeline: PR closed without merging.
+                    self.tracker
+                        .record_activity(
+                            &ActivityLogEntry::new(
+                                TimelineEventStatus::PrClosed.as_str(),
+                                format!("PR closed for {}", attempt.short_id),
+                            )
+                            .with_source(attempt.source.clone())
+                            .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                            .with_metadata(json!({ "pr_url": attempt.pr_url })),
+                        )
+                        .ok();
                     let _ = self
                         .tracker
                         .update_qa_outcome_stats_for_attempt(attempt.id, false);
@@ -3571,6 +3595,18 @@ Create a PR with your changes.{custom_instructions}"#,
             tracing::error!(short_id = %issue.short_id, error = %e, "Failed to record attempt");
         }
 
+        // Timeline: attempt created (pending).
+        self.tracker
+            .record_activity(
+                &ActivityLogEntry::new(
+                    TimelineEventStatus::ProcessingStarted.as_str(),
+                    format!("Started processing {}", issue.short_id),
+                )
+                .with_source(issue.source.clone())
+                .with_issue(issue.id.clone(), issue.short_id.clone()),
+            )
+            .ok();
+
         // Persist full issue content to the issues table (independent of embeddings)
         {
             let stored = IssueEmbedding::from_issue(&issue);
@@ -3620,6 +3656,18 @@ Create a PR with your changes.{custom_instructions}"#,
                         "project_dir": project_dir.display().to_string(),
                     }),
                 );
+                // Timeline: repository resolved.
+                self.tracker
+                    .record_activity(
+                        &ActivityLogEntry::new(
+                            TimelineEventStatus::RepoResolved.as_str(),
+                            format!("Resolved repository for {}", issue.short_id),
+                        )
+                        .with_source(issue.source.clone())
+                        .with_issue(issue.id.clone(), issue.short_id.clone())
+                        .with_metadata(json!({ "repo": resolution.repo_name() })),
+                    )
+                    .ok();
             }
             RepoResolution::Skip { .. } => {}
         }
@@ -4464,6 +4512,18 @@ Create a PR with your changes.{custom_instructions}"#,
                                 "Failed to mark attempt as closed"
                             );
                         }
+                        // Timeline: PR closed (issue reached terminal state).
+                        self.tracker
+                            .record_activity(
+                                &ActivityLogEntry::new(
+                                    TimelineEventStatus::PrClosed.as_str(),
+                                    format!("PR closed for {}", attempt.short_id),
+                                )
+                                .with_source(attempt.source.clone())
+                                .with_issue(attempt.issue_id.clone(), attempt.short_id.clone())
+                                .with_metadata(json!({ "pr_url": attempt.pr_url })),
+                            )
+                            .ok();
                         let _ = self
                             .tracker
                             .update_qa_outcome_stats_for_attempt(attempt.id, false);
