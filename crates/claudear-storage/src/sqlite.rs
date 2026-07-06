@@ -11588,6 +11588,76 @@ mod tests {
     }
 
     #[test]
+    fn test_get_issue_timeline_rolls_up_this_issues_events_only() {
+        use claudear_core::types::TimelineEventStatus;
+        let tracker = SqliteTracker::in_memory().unwrap();
+
+        let events = [
+            TimelineEventStatus::ProcessingStarted,
+            TimelineEventStatus::RepoResolved,
+            TimelineEventStatus::FixStarted,
+            TimelineEventStatus::FixSucceeded,
+        ];
+        for ev in events {
+            tracker
+                .record_activity(
+                    &ActivityLogEntry::new(ev.as_str(), "msg")
+                        .with_source("linear")
+                        .with_issue("issue-1", "LIN-1"),
+                )
+                .unwrap();
+        }
+        // A different issue's event must not leak into this timeline.
+        tracker
+            .record_activity(
+                &ActivityLogEntry::new(TimelineEventStatus::FixFailed.as_str(), "other")
+                    .with_source("linear")
+                    .with_issue("issue-2", "LIN-2"),
+            )
+            .unwrap();
+
+        let timeline = tracker.get_issue_timeline("linear", "issue-1").unwrap();
+        assert_eq!(timeline.issue, "issue-1");
+        let got: std::collections::HashSet<&str> =
+            timeline.events.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(got.len(), events.len());
+        for ev in events {
+            assert!(got.contains(ev.as_str()), "missing event {}", ev.as_str());
+        }
+        assert!(!got.contains("fix_failed"), "leaked another issue's event");
+    }
+
+    #[test]
+    fn test_get_issue_timeline_flattens_metadata_context() {
+        use claudear_core::types::TimelineEventStatus;
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_activity(
+                &ActivityLogEntry::new(TimelineEventStatus::FixSucceeded.as_str(), "ok")
+                    .with_source("linear")
+                    .with_issue("issue-9", "LIN-9")
+                    .with_metadata(serde_json::json!({ "pr": 123 })),
+            )
+            .unwrap();
+
+        let timeline = tracker.get_issue_timeline("linear", "issue-9").unwrap();
+        assert_eq!(timeline.events.len(), 1);
+        assert_eq!(timeline.events[0].event, "fix_succeeded");
+        assert_eq!(
+            timeline.events[0].context.get("pr").unwrap(),
+            &serde_json::json!(123)
+        );
+    }
+
+    #[test]
+    fn test_get_issue_timeline_empty_for_unknown_issue() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        let timeline = tracker.get_issue_timeline("linear", "nope").unwrap();
+        assert_eq!(timeline.issue, "nope");
+        assert!(timeline.events.is_empty());
+    }
+
+    #[test]
     fn test_get_recent_activities_respects_limit() {
         let tracker = SqliteTracker::in_memory().unwrap();
         for i in 0..5 {
