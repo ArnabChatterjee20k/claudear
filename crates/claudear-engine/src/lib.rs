@@ -8,6 +8,7 @@ pub mod api;
 pub mod api_events;
 pub mod discord_index;
 pub mod housekeeping;
+pub mod intent;
 pub mod ipc;
 pub mod llm_agent_runner;
 pub mod llm_analyzer;

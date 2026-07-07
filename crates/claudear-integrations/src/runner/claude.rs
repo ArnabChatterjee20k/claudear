@@ -27,6 +27,10 @@ const EXECUTION_LOG_PREVIEW_LIMIT: usize = 2000;
 /// doesn't specify its own set
 const DEFAULT_READONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob", "WebFetch", "WebSearch"];
 
+/// Timeout for read-only structured queries (classification-scale, not the long
+/// fix-run timeout).
+const STRUCTURED_QUERY_TIMEOUT_SECS: u64 = 120;
+
 /// Resolve the root directory for execution logs.
 /// Used by both the runner and the API to validate log file paths.
 pub fn resolve_log_root() -> PathBuf {
@@ -589,6 +593,102 @@ The PR title should include the issue ID: {}
     ) -> Result<AgentResult> {
         self.execute_with_env_and_attempt(prompt, label, env, None, project_dir, true)
             .await
+    }
+
+    /// Run a read-only, schema-constrained query via `--json-schema` and return
+    /// the object from the `result` stream event. Read-only tools, no permission
+    /// skipping, short classification-scale timeout.
+    async fn run_structured_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+    ) -> Result<serde_json::Value> {
+        let mut args = vec![
+            "--verbose".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--json-schema".to_string(),
+            json_schema.to_string(),
+        ];
+        if let Some(ref model) = self.config.model {
+            args.push("--model".to_string());
+            args.push(model.clone());
+        }
+        if let Some(ref instructions) = self.config.instructions {
+            args.push("--append-system-prompt".to_string());
+            args.push(instructions.clone());
+        }
+        let readonly_tools: Vec<String> = if self.config.readonly_tools.is_empty() {
+            DEFAULT_READONLY_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            self.config.readonly_tools.clone()
+        };
+        for perm in &readonly_tools {
+            args.push("--allowedTools".to_string());
+            args.push(perm.clone());
+        }
+        args.push("--print".to_string());
+        args.push(prompt.to_string());
+
+        let (env, _label) = self.prepare_env_and_label(None);
+
+        let mut child = Command::new(&self.config.binary)
+            .args(&args)
+            .current_dir(project_dir)
+            .envs(env)
+            .env_remove("CLAUDECODE")
+            .stdout(Stdio::piped())
+            // Discard stderr: this lean path never reads it, and leaving it piped
+            // would let `--verbose` diagnostics fill the OS buffer and block the
+            // child before it writes the `result` event to stdout.
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| Error::runner(format!("Failed to spawn {}: {}", self.config.binary, e)))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::runner("Failed to capture stdout"))?;
+
+        let collect = async {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut structured: Option<serde_json::Value> = None;
+            while let Ok(Some(line)) = lines.next_line().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(StreamEvent::Result {
+                    structured_output: Some(v),
+                    ..
+                }) = serde_json::from_str::<StreamEvent>(trimmed)
+                {
+                    structured = Some(v);
+                }
+            }
+            structured
+        };
+
+        let timeout = std::time::Duration::from_secs(STRUCTURED_QUERY_TIMEOUT_SECS);
+        let structured = match tokio::time::timeout(timeout, collect).await {
+            Ok(s) => {
+                let _ = child.wait().await;
+                s
+            }
+            Err(_) => {
+                let _ = child.start_kill();
+                return Err(Error::runner(format!(
+                    "structured query timed out after {}s",
+                    STRUCTURED_QUERY_TIMEOUT_SECS
+                )));
+            }
+        };
+
+        structured.ok_or_else(|| Error::runner("no structured output in response"))
     }
 
     /// Attempt to reproduce a reported issue, read-only. Returns a structured
@@ -1880,6 +1980,16 @@ impl AgentRunner for ClaudeAgentRunner {
         project_dir: &Path,
     ) -> Result<String> {
         self.run_reply(issue, context, guideline, kind, project_dir)
+            .await
+    }
+
+    async fn structured_query(
+        &self,
+        prompt: &str,
+        json_schema: &str,
+        project_dir: &Path,
+    ) -> Result<serde_json::Value> {
+        self.run_structured_query(prompt, json_schema, project_dir)
             .await
     }
 }

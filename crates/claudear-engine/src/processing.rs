@@ -28,7 +28,7 @@ use claudear_storage::{classify_error, compute_error_hash, FixAttemptTracker};
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::llm_analyzer::Intent;
+use crate::intent::{Intent, IntentClassifier};
 
 /// Trait for building issue context. Both `IssueSource` and `WebhookHandler` satisfy this.
 #[async_trait]
@@ -174,6 +174,11 @@ pub struct IssueProcessor {
     pub user_registry: UserRegistry,
     pub github_client: Option<Arc<GitHubClient>>,
     pub llm_analyzer: Option<Arc<crate::llm_analyzer::LlmAnalyzerImpl>>,
+    /// Backend used to classify payload intent (bug/security vs question/fix).
+    /// Follows the agent-runner choice: agent-based when running an external
+    /// provider, local-LLM-based when `agent.use_llm` is set. `None` falls back
+    /// to the label/source heuristic.
+    pub intent_classifier: Option<Arc<dyn IntentClassifier>>,
 }
 
 /// Everything the caller provides to `IssueProcessor::run()`.
@@ -1744,7 +1749,7 @@ impl IssueProcessor {
         // here as a fallback when the caller didn't pre-classify.
         let is_bug_or_security = match input.intent {
             Some(intent) => intent.is_bug_or_security(),
-            None => self.classify_is_bug_or_security(&input.issue),
+            None => self.classify_is_bug_or_security(&input.issue).await,
         };
         if is_bug_or_security {
             // Verify before spending an expensive fix run.
@@ -1847,9 +1852,9 @@ impl IssueProcessor {
     /// Classify a payload as a bug/security report (routes to Verify) vs anything
     /// else (routes to Reply). Uses the LLM classifier when available, falling
     /// back to the label/source heuristic (matching `FixAttempt::is_bug`).
-    fn classify_is_bug_or_security(&self, issue: &Issue) -> bool {
-        if let Some(analyzer) = self.llm_analyzer.as_ref() {
-            if let Some(intent) = analyzer.classify_intent(issue) {
+    async fn classify_is_bug_or_security(&self, issue: &Issue) -> bool {
+        if let Some(classifier) = self.intent_classifier.as_ref() {
+            if let Some(intent) = classifier.classify_intent(issue).await {
                 return intent.is_bug_or_security();
             }
         }
@@ -3575,6 +3580,7 @@ mod tests {
             ),
             github_client: None,
             llm_analyzer: None,
+            intent_classifier: None,
         };
 
         let input = ProcessingInput {

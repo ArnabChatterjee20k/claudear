@@ -25,31 +25,6 @@ const MAX_COMMENT_CHARS: usize = 800;
 /// Maximum log text length (prioritize end of log).
 const MAX_LOG_CHARS: usize = 8192;
 
-/// Classification of an incoming payload, used to route it into the action
-/// pipeline. `Bug`/`Security` start the verify -> resolve chain; `Question`/`Fix`
-/// start a reply. `Bug` is the safe default on any doubt about a code problem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Intent {
-    /// Reports something broken: an error, crash, incorrect behavior, or regression.
-    Bug,
-    /// Reports a security vulnerability, exploit, data leak, or auth problem.
-    Security,
-    /// The user is only asking for information/explanation; no code change wanted.
-    Question,
-    /// Requests a feature/change/improvement that is not itself a bug or security issue.
-    Fix,
-}
-
-impl Intent {
-    /// Whether this category is a bug or security report (routes to Verify).
-    pub fn is_bug_or_security(&self) -> bool {
-        matches!(self, Intent::Bug | Intent::Security)
-    }
-}
-
-/// Maximum description length included in the intent-classification prompt.
-const MAX_INTENT_DESC_CHARS: usize = 1500;
-
 pub struct LlmAnalyzerImpl {
     engine: Arc<LlmEngine>,
 }
@@ -57,17 +32,6 @@ pub struct LlmAnalyzerImpl {
 impl LlmAnalyzerImpl {
     pub fn new(engine: Arc<LlmEngine>) -> Self {
         Self { engine }
-    }
-
-    /// Classify an incoming message into one of `bug | security | question | fix`.
-    ///
-    /// Returns `None` when the model is unavailable or the response cannot be
-    /// parsed. Callers should fall back to a heuristic (e.g. `FixAttempt::is_bug`)
-    /// when `None`, preserving the default issue-resolution behaviour.
-    pub fn classify_intent(&self, issue: &Issue) -> Option<Intent> {
-        let prompt = build_intent_prompt(issue);
-        let response = self.complete(&prompt, 8)?;
-        parse_intent(&response)
     }
 
     /// Run a completion against the LLM engine.
@@ -167,7 +131,7 @@ fn parse_json_response<T: DeserializeOwned>(response: &str) -> Option<T> {
 
 /// Truncate a string to approximately `max_chars` bytes, safely respecting
 /// UTF-8 char boundaries. Appends "..." when truncated.
-fn truncate(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate(s: &str, max_chars: usize) -> String {
     if s.len() <= max_chars {
         return s.to_string();
     }
@@ -321,75 +285,6 @@ fn build_correlation_prompt(
          <|assistant|>",
         pairs, issues_context
     )
-}
-
-/// Build the payload classification prompt.
-///
-/// Classifies into `bug | security | question | fix`. The prompt is biased
-/// toward `bug` on any doubt about a code problem, preserving the
-/// issue-resolution default.
-fn build_intent_prompt(issue: &Issue) -> String {
-    let mut body = String::new();
-    if let Some(desc) = issue.description.as_deref() {
-        let desc = desc.trim();
-        if !desc.is_empty() && desc != issue.title {
-            body = truncate(desc, MAX_INTENT_DESC_CHARS);
-        }
-    }
-
-    format!(
-        "<|system|>\n\
-         You classify an incoming developer-support message into exactly one of:\n\
-         - \"bug\": reports something broken — an error, crash, incorrect behavior, or regression.\n\
-         - \"security\": reports a security vulnerability, exploit, data leak, or authentication problem.\n\
-         - \"question\": ONLY asks for information, an explanation, or how something works, and does NOT want any code changed.\n\
-         - \"fix\": requests a feature, change, or improvement that is NOT itself a bug or security issue.\n\
-         When in doubt about a code problem, answer \"bug\".\n\
-         Respond with ONLY one word: bug, security, question, or fix.\n\
-         <|end|>\n\
-         <|user|>\n\
-         Title: {}\n\
-         {}\n\
-         <|end|>\n\
-         <|assistant|>",
-        truncate(&issue.title, MAX_METADATA_CHARS * 4),
-        body
-    )
-}
-
-/// Parse the classification response into an `Intent`. The first clean token
-/// among `bug | security | question | fix` wins; otherwise a contains-fallback
-/// is applied (biased toward `bug` for code problems). Returns `None` when no
-/// category can be determined.
-fn parse_intent(s: &str) -> Option<Intent> {
-    let lower = s.trim().to_lowercase();
-
-    // First clean alphanumeric token decides when it is an exact category.
-    let first = lower
-        .split(|c: char| !c.is_alphanumeric())
-        .find(|t| !t.is_empty())
-        .unwrap_or("");
-    match first {
-        "bug" => return Some(Intent::Bug),
-        "security" => return Some(Intent::Security),
-        "question" => return Some(Intent::Question),
-        "fix" => return Some(Intent::Fix),
-        _ => {}
-    }
-
-    // Contains-fallback for noisy output. Order matters: a mentioned bug/security
-    // problem dominates a generic "fix" verb that often co-occurs with it.
-    if lower.contains("security") {
-        Some(Intent::Security)
-    } else if lower.contains("bug") {
-        Some(Intent::Bug)
-    } else if lower.contains("question") && !lower.contains("fix") {
-        Some(Intent::Question)
-    } else if lower.contains("fix") {
-        Some(Intent::Fix)
-    } else {
-        None
-    }
 }
 
 /// Parse a blast radius string (case-insensitive) into the enum.
@@ -826,142 +721,6 @@ mod tests {
     #[test]
     fn test_parse_review_category_invalid() {
         assert_eq!(parse_review_category("hello world"), None);
-    }
-
-    // --- Intent classification parsing ---
-
-    #[test]
-    fn test_parse_intent_question() {
-        assert_eq!(parse_intent("question"), Some(Intent::Question));
-        assert_eq!(parse_intent("  Question\n"), Some(Intent::Question));
-        assert_eq!(parse_intent("question."), Some(Intent::Question));
-    }
-
-    #[test]
-    fn test_parse_intent_fix() {
-        assert_eq!(parse_intent("fix"), Some(Intent::Fix));
-        assert_eq!(parse_intent("FIX"), Some(Intent::Fix));
-        assert_eq!(parse_intent("fix request"), Some(Intent::Fix));
-    }
-
-    #[test]
-    fn test_parse_intent_bug_and_security() {
-        assert_eq!(parse_intent("bug"), Some(Intent::Bug));
-        assert_eq!(parse_intent("BUG\n"), Some(Intent::Bug));
-        assert_eq!(parse_intent("security"), Some(Intent::Security));
-        assert_eq!(parse_intent("Security."), Some(Intent::Security));
-        assert!(Intent::Bug.is_bug_or_security());
-        assert!(Intent::Security.is_bug_or_security());
-        assert!(!Intent::Question.is_bug_or_security());
-        assert!(!Intent::Fix.is_bug_or_security());
-    }
-
-    #[test]
-    fn test_parse_intent_first_clean_token_decides() {
-        // A clean leading verdict wins even if other category words follow.
-        assert_eq!(
-            parse_intent("bug, though it could be a question"),
-            Some(Intent::Bug)
-        );
-        assert_eq!(parse_intent("- security issue"), Some(Intent::Security));
-        assert_eq!(parse_intent("Answer: question"), Some(Intent::Question));
-    }
-
-    #[test]
-    fn test_parse_intent_contains_fallback_prefers_problem() {
-        // No clean leading token: a mentioned security/bug problem dominates a
-        // generic "fix" verb that often co-occurs with it.
-        assert_eq!(
-            parse_intent("this looks like a security vulnerability we should fix"),
-            Some(Intent::Security)
-        );
-        assert_eq!(
-            parse_intent("seems to be a bug that needs a fix"),
-            Some(Intent::Bug)
-        );
-        // Question only when no bug/security/fix signal is present.
-        assert_eq!(
-            parse_intent("just a quick question about usage"),
-            Some(Intent::Question)
-        );
-    }
-
-    #[test]
-    fn test_parse_intent_unparseable_is_none() {
-        // None must be handled by the caller (heuristic fallback).
-        assert_eq!(parse_intent("i am not sure"), None);
-        assert_eq!(parse_intent(""), None);
-    }
-
-    #[test]
-    fn test_parse_intent_handles_noisy_model_output() {
-        // Real local-LLM outputs are rarely a bare word: leading labels,
-        // punctuation, code fences, and trailing prose all appear in practice.
-        assert_eq!(parse_intent("question\n"), Some(Intent::Question));
-        assert_eq!(parse_intent("\"question\""), Some(Intent::Question));
-        assert_eq!(parse_intent("- fix"), Some(Intent::Fix));
-        assert_eq!(parse_intent("Answer: question"), Some(Intent::Question));
-        // "bug" leads cleanly even when followed by other prose.
-        assert_eq!(parse_intent("bug\nbecause it crashes"), Some(Intent::Bug));
-    }
-
-    // --- Intent prompt construction (what the model actually sees) ---
-
-    #[test]
-    fn test_build_intent_prompt_embeds_title_and_instructions() {
-        let issue = sample_issue("DISCORD-1", "what is query not equal syntax?");
-        let prompt = build_intent_prompt(&issue);
-
-        // The user's actual message must reach the model.
-        assert!(prompt.contains("what is query not equal syntax?"));
-        // The classification contract (all four categories) must be present.
-        assert!(prompt.contains("\"bug\""));
-        assert!(prompt.contains("\"security\""));
-        assert!(prompt.contains("\"question\""));
-        assert!(prompt.contains("\"fix\""));
-        assert!(prompt.contains("When in doubt about a code problem, answer \"bug\"."));
-        assert!(prompt.contains("ONLY one word"));
-    }
-
-    #[test]
-    fn test_build_intent_prompt_includes_distinct_description() {
-        let mut issue = sample_issue("DISCORD-2", "Realtime onClose error");
-        issue.description = Some(
-            "triggerStats(): Argument #2 ($projectId) must be of type string, null given".into(),
-        );
-        let prompt = build_intent_prompt(&issue);
-
-        assert!(prompt.contains("Realtime onClose error"));
-        assert!(prompt.contains("triggerStats()"));
-    }
-
-    #[test]
-    fn test_build_intent_prompt_omits_description_when_same_as_title() {
-        // Avoid duplicating the title into the body (wastes context / confuses
-        // the classifier).
-        let mut issue = sample_issue("DISCORD-3", "how do I paginate results?");
-        issue.description = Some("how do I paginate results?".into());
-        let prompt = build_intent_prompt(&issue);
-
-        // Title appears exactly once (in the `Title:` line), not duplicated.
-        assert_eq!(prompt.matches("how do I paginate results?").count(), 1);
-    }
-
-    #[test]
-    fn test_build_intent_prompt_truncates_long_description() {
-        let mut issue = sample_issue("DISCORD-4", "long one");
-        // Use 'Z', which never appears in the static prompt template, so the
-        // count reflects only the (truncated) description body.
-        issue.description = Some("Z".repeat(MAX_INTENT_DESC_CHARS * 4));
-        let prompt = build_intent_prompt(&issue);
-
-        let body_len = prompt.matches('Z').count();
-        assert!(body_len > 0, "description missing from prompt");
-        assert!(
-            body_len <= MAX_INTENT_DESC_CHARS,
-            "body not truncated: {body_len}"
-        );
-        assert!(!prompt.contains(&"Z".repeat(MAX_INTENT_DESC_CHARS * 4)));
     }
 
     // --- Assessment response parsing ---
