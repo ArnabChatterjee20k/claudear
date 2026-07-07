@@ -690,6 +690,11 @@ pub struct QaConfig {
     pub answer_timeout_secs: u64,
     /// Maximum qa to process per poll cycle (independent from issue limits).
     pub max_qa_per_cycle: usize,
+    /// Backend for intent classification (bug/security/question/fix routing).
+    /// `false` (default) classifies via the coding agent (Claude Code) with
+    /// schema-constrained output; `true` uses the offline local LLM. Independent
+    /// of the global `agent.use_llm`, which only swaps the agent *runner*.
+    pub use_llm: bool,
 }
 
 impl Default for QaConfig {
@@ -699,6 +704,7 @@ impl Default for QaConfig {
             max_context_chunks: 8,
             answer_timeout_secs: 600,
             max_qa_per_cycle: 20,
+            use_llm: false,
         }
     }
 }
@@ -8714,5 +8720,26 @@ workspace = "/tmp/repos"
             wrapper.qa.max_qa_per_cycle,
             QaConfig::default().max_qa_per_cycle
         );
+    }
+
+    #[test]
+    fn test_qa_use_llm_default_false() {
+        // Intent classification defaults to the agent backend.
+        assert!(!QaConfig::default().use_llm);
+    }
+
+    #[test]
+    fn test_qa_use_llm_from_toml() {
+        let toml_str = r#"
+            [qa]
+            enabled = true
+            use_llm = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert!(wrapper.qa.use_llm);
     }
 }

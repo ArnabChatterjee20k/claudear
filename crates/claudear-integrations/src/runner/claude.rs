@@ -595,13 +595,9 @@ The PR title should include the issue ID: {}
             .await
     }
 
-    /// Run a read-only, schema-constrained query via `--json-schema`.
-    ///
-    /// Constrained decoding guarantees the model's final answer matches
-    /// `json_schema`; the parsed object is returned from the `result` stream
-    /// event. Read-only: uses the read-only tool set, never skips permission
-    /// prompts, and applies a short classification-scale timeout (not the long
-    /// fix-run timeout). Lean by design — no analytics/attempt bookkeeping.
+    /// Run a read-only, schema-constrained query via `--json-schema` and return
+    /// the object from the `result` stream event. Read-only tools, no permission
+    /// skipping, short classification-scale timeout.
     async fn run_structured_query(
         &self,
         prompt: &str,
@@ -623,7 +619,6 @@ The PR title should include the issue ID: {}
             args.push("--append-system-prompt".to_string());
             args.push(instructions.clone());
         }
-        // Read-only: never skip permissions, restrict to a read-only tool set.
         let readonly_tools: Vec<String> = if self.config.readonly_tools.is_empty() {
             DEFAULT_READONLY_TOOLS
                 .iter()
@@ -659,8 +654,6 @@ The PR title should include the issue ID: {}
             .take()
             .ok_or_else(|| Error::runner("Failed to capture stdout"))?;
 
-        // Read the NDJSON stream, keeping the last structured_output from a
-        // `result` event.
         let collect = async {
             let mut lines = BufReader::new(stdout).lines();
             let mut structured: Option<serde_json::Value> = None;

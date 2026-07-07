@@ -1,19 +1,10 @@
 //! Intent classification contract.
 //!
-//! Centralizes the shared pieces of intent classification — the [`Intent`]
-//! type, the [`IntentClassifier`] trait, and the prompt/response helpers common
-//! to every backend. The concrete classifiers live with their execution
-//! machinery, mirroring the `RepoClassifier` split:
-//!
-//! - [`crate::llm_classifier::LocalLlmIntentClassifier`] — offline GGUF model,
-//!   freeform completion + tolerant parsing (used when `agent.use_llm = true`).
-//! - [`crate::agent_classifier::AgentIntentClassifier`] — the coding agent
-//!   (Claude Code) with `--json-schema` constrained decoding (used when the
-//!   agent runner is an external provider).
-//!
-//! Each backend executes "the way it wants"; this module only defines what an
-//! intent classifier *is* and the wording of the classification contract so the
-//! two prompts stay in sync.
+//! Defines the [`Intent`] type, the [`IntentClassifier`] trait, and the
+//! prompt/response helpers shared by both backends. The concrete classifiers
+//! live with their execution machinery (mirroring the `RepoClassifier` split):
+//! [`crate::llm_classifier::LocalLlmIntentClassifier`] (offline GGUF) and
+//! [`crate::agent_classifier::AgentIntentClassifier`] (agent, `--json-schema`).
 
 use crate::llm_analyzer::truncate;
 use async_trait::async_trait;
@@ -25,10 +16,8 @@ pub(crate) const MAX_INTENT_DESC_CHARS: usize = 1500;
 /// Maximum title length included in an intent-classification prompt.
 pub(crate) const MAX_INTENT_TITLE_CHARS: usize = 400;
 
-/// The category definitions shared by every backend's prompt. Kept here so the
-/// local-LLM and agent prompts classify against identical wording; each backend
-/// wraps this with its own framing (control tokens vs plain text) and response
-/// instruction (one word vs JSON schema).
+/// Category definitions shared by both backends' prompts, so they classify
+/// against identical wording.
 pub(crate) const CATEGORY_RULES: &str = "\
 - \"bug\": reports something broken — an error, crash, incorrect behavior, or regression.\n\
 - \"security\": reports a security vulnerability, exploit, data leak, or authentication problem.\n\

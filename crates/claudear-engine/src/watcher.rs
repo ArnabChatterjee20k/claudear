@@ -204,9 +204,9 @@ pub struct Watcher {
     slot_available: Notify,
     /// Optional LLM analyzer for enhanced analysis across the pipeline.
     llm_analyzer: Option<Arc<crate::llm_analyzer::LlmAnalyzerImpl>>,
-    /// Intent classifier for QA-vs-fix routing. Follows the agent-runner choice:
-    /// agent-based when running an external provider, local-LLM-based when
-    /// `agent.use_llm` is set.
+    /// Intent classifier for QA-vs-fix routing. Backend selected by `qa.use_llm`:
+    /// agent-based (Claude Code) by default, local-LLM-based when `qa.use_llm` is
+    /// set.
     intent_classifier: Option<Arc<dyn crate::intent::IntentClassifier>>,
     /// Join handles for spawned issue-processing tasks (used by tests to drain).
     spawn_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -242,12 +242,16 @@ impl Watcher {
             Arc::new(crate::llm_analyzer::LlmAnalyzerImpl::new(engine.clone()))
         });
 
-        // Choose the intent classifier to follow the agent-runner choice: when the
-        // agent runner is an external provider (`agent.use_llm = false`) classify
-        // via that agent (Claude Code), preferring the cheaper classification agent
-        // if configured; otherwise use the offline local LLM engine.
+        // Intent-classification backend, selected by `qa.use_llm`: local LLM when
+        // set, else the coding agent (preferring the cheaper classification agent).
         let intent_classifier: Option<Arc<dyn crate::intent::IntentClassifier>> =
-            if !options.config.agent.use_llm {
+            if options.config.qa.use_llm {
+                options.llm_engine.clone().map(|engine| {
+                    tracing::info!("Local-LLM intent classifier enabled (qa.use_llm = true)");
+                    Arc::new(crate::llm_classifier::LocalLlmIntentClassifier::new(engine))
+                        as Arc<dyn crate::intent::IntentClassifier>
+                })
+            } else {
                 let classifier_runner = options
                     .classification_agent
                     .clone()
@@ -256,12 +260,6 @@ impl Watcher {
                 Some(Arc::new(
                     crate::agent_classifier::AgentIntentClassifier::new(classifier_runner),
                 ))
-            } else {
-                options.llm_engine.clone().map(|engine| {
-                    tracing::info!("Local-LLM intent classifier enabled (agent.use_llm = true)");
-                    Arc::new(crate::llm_classifier::LocalLlmIntentClassifier::new(engine))
-                        as Arc<dyn crate::intent::IntentClassifier>
-                })
             };
 
         Self {

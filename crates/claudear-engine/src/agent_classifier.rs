@@ -184,9 +184,7 @@ fn parse_response(response: &str, candidates: &[&str]) -> Option<(String, f32)> 
     None
 }
 
-/// JSON schema constraining the agent's intent reply to a single enum value.
-/// Under `--json-schema` constrained decoding the result is guaranteed to be one
-/// of the four categories.
+/// Schema constraining the agent's reply to one of the four intent categories.
 const INTENT_SCHEMA: &str = r#"{
     "type": "object",
     "required": ["intent"],
