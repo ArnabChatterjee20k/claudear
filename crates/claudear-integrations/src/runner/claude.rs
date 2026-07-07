@@ -647,7 +647,10 @@ The PR title should include the issue ID: {}
             .envs(env)
             .env_remove("CLAUDECODE")
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // Discard stderr: this lean path never reads it, and leaving it piped
+            // would let `--verbose` diagnostics fill the OS buffer and block the
+            // child before it writes the `result` event to stdout.
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| Error::runner(format!("Failed to spawn {}: {}", self.config.binary, e)))?;
 
