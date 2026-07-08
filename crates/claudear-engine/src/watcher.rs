@@ -36,6 +36,10 @@ use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{interval, Duration};
 
+/// A candidate issue ready for dispatch: the issue, its match result, and the
+/// decided routing `Intent` (`None` for non-QA-eligible / QA-disabled sources).
+type QueuedIssue = (Issue, MatchResult, Option<Intent>);
+
 /// Extracts the source name from a processing key of the form "source:issue_id".
 fn source_from_processing_key(key: &str) -> &str {
     key.split_once(':').map_or(key, |(source, _)| source)
@@ -3360,10 +3364,7 @@ Create a PR with your changes.{custom_instructions}"#,
             );
         }
 
-        let (questions, fixes): (
-            Vec<(Issue, MatchResult, Option<Intent>)>,
-            Vec<(Issue, MatchResult, Option<Intent>)>,
-        ) = to_process
+        let (questions, fixes): (Vec<QueuedIssue>, Vec<QueuedIssue>) = to_process
             .into_iter()
             .partition(|(_, _, intent)| matches!(intent, Some(Intent::Question)));
 
@@ -3402,7 +3403,7 @@ Create a PR with your changes.{custom_instructions}"#,
     async fn dispatch_lane(
         self: &Arc<Self>,
         source: &Arc<dyn IssueSource>,
-        items: Vec<(Issue, MatchResult, Option<Intent>)>,
+        items: Vec<QueuedIssue>,
         max_concurrent: usize,
         is_qa: bool,
     ) {
