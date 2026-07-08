@@ -87,6 +87,8 @@ fn parse_approval_reply(answer: &str) -> ApprovalDecision {
 struct ProcessingState {
     keys: HashSet<String>,
     source_counts: HashMap<String, usize>,
+    qa_source_counts: HashMap<String, usize>,
+    qa_keys: HashSet<String>,
 }
 
 impl ProcessingState {
@@ -94,6 +96,8 @@ impl ProcessingState {
         Self {
             keys: HashSet::new(),
             source_counts: HashMap::new(),
+            qa_source_counts: HashMap::new(),
+            qa_keys: HashSet::new(),
         }
     }
 
@@ -112,7 +116,14 @@ impl ProcessingState {
     fn remove(&mut self, key: &str) -> bool {
         if self.keys.remove(key) {
             let source = source_from_processing_key(key).to_string();
-            if let Some(count) = self.source_counts.get_mut(&source) {
+            if self.qa_keys.remove(key) {
+                if let Some(count) = self.qa_source_counts.get_mut(&source) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.qa_source_counts.remove(&source);
+                    }
+                }
+            } else if let Some(count) = self.source_counts.get_mut(&source) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
                     self.source_counts.remove(&source);
@@ -131,6 +142,21 @@ impl ProcessingState {
     /// O(1) count of active processing items for a given source.
     fn source_count(&self, source: &str) -> usize {
         self.source_counts.get(source).copied().unwrap_or(0)
+    }
+
+    fn insert_qa(&mut self, key: String) -> bool {
+        if self.keys.insert(key.clone()) {
+            let source = source_from_processing_key(&key).to_string();
+            *self.qa_source_counts.entry(source).or_insert(0) += 1;
+            self.qa_keys.insert(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn qa_source_count(&self, source: &str) -> usize {
+        self.qa_source_counts.get(source).copied().unwrap_or(0)
     }
 
     #[allow(dead_code)]
@@ -3315,58 +3341,33 @@ Create a PR with your changes.{custom_instructions}"#,
             return Ok(());
         }
 
-        // Process issues with rate limiting (per-source limit, clamped to 1 to avoid deadlock).
-        let configured_source_max_concurrent = self.config.max_concurrent_for(source.name());
-        let source_max_concurrent = configured_source_max_concurrent.max(1);
-        if configured_source_max_concurrent == 0 {
+        // Process issues with rate limiting. Questions and fixes run in independent
+        // concurrency lanes so a burst of slow fixes can never starve fast, read-only
+        // QA answers. Each lane gates on its own per-source in-flight counter
+        // (clamped to 1 to avoid deadlock).
+        let fix_max = self.config.max_concurrent_for(source.name()).max(1);
+        if self.config.max_concurrent_for(source.name()) == 0 {
             tracing::warn!(
                 source = source.name(),
                 "max_concurrent_for source evaluated to 0, clamping to 1"
             );
         }
-        for (i, (issue, match_result, intent)) in to_process.into_iter().enumerate() {
-            if !self.is_running.load(Ordering::SeqCst) {
-                break;
-            }
-            if self.is_rate_limit_paused().await {
-                tracing::info!(
-                    source = source.name(),
-                    "Stopping source batch early due to Claude rate-limit pause"
-                );
-                break;
-            }
+        let qa_max = self.config.qa.max_concurrent.max(1);
 
-            // Wait for concurrency slot (per-source limit)
-            while self.active_processing_for_source(source.name()).await >= source_max_concurrent {
-                if !self.is_running.load(Ordering::SeqCst) {
-                    return Ok(());
-                }
-                if self.is_provider_rate_limited().await {
-                    tracing::info!(
-                        source = source.name(),
-                        "Stopping source batch while waiting for slot due to provider rate-limit pause"
-                    );
-                    return Ok(());
-                }
-                self.slot_available.notified().await;
-            }
+        let (questions, fixes): (
+            Vec<(Issue, MatchResult, Option<Intent>)>,
+            Vec<(Issue, MatchResult, Option<Intent>)>,
+        ) = to_process
+            .into_iter()
+            .partition(|(_, _, intent)| matches!(intent, Some(Intent::Question)));
 
-            // Spawn processing as a background task so poll_source returns
-            // promptly and the housekeeping loop (review checks, auto-close,
-            // retries) is not starved.
-            let watcher = Arc::clone(self);
-            let source_clone = Arc::clone(source);
-            let handle = tokio::spawn(async move {
-                watcher
-                    .process_issue(source_clone, issue, match_result, None, None, intent)
-                    .await;
-            });
-            self.spawn_handles.lock().await.push(handle);
-
-            // Add delay between starting new issues (skip trailing delay after the last item)
-            if i + 1 < to_process_count && self.config.processing_delay_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
-            }
+        if questions.is_empty() {
+            self.dispatch_lane(source, fixes, fix_max, false).await;
+        } else {
+            tokio::join!(
+                self.dispatch_lane(source, questions, qa_max, true),
+                self.dispatch_lane(source, fixes, fix_max, false),
+            );
         }
 
         // Record how many issues were spawned (don't fail main operation if this fails)
@@ -3382,6 +3383,77 @@ Create a PR with your changes.{custom_instructions}"#,
     /// Number of active processing items for a specific source.
     async fn active_processing_for_source(&self, source_name: &str) -> usize {
         self.processing.read().await.source_count(source_name)
+    }
+
+    async fn active_qa_for_source(&self, source_name: &str) -> usize {
+        self.processing.read().await.qa_source_count(source_name)
+    }
+
+    /// Dispatch one concurrency lane: spawn a processing task per item, gating on the
+    /// lane's own per-source in-flight counter so it never blocks (nor is blocked by) the
+    /// other lane. `is_qa` selects the QA counter/budget vs the fix counter/budget.
+    async fn dispatch_lane(
+        self: &Arc<Self>,
+        source: &Arc<dyn IssueSource>,
+        items: Vec<(Issue, MatchResult, Option<Intent>)>,
+        max_concurrent: usize,
+        is_qa: bool,
+    ) {
+        let lane = if is_qa { "qa" } else { "fix" };
+        let total = items.len();
+        for (i, (issue, match_result, intent)) in items.into_iter().enumerate() {
+            if !self.is_running.load(Ordering::SeqCst) {
+                break;
+            }
+            if self.is_rate_limit_paused().await {
+                tracing::info!(
+                    source = source.name(),
+                    lane,
+                    "Stopping lane early due to Claude rate-limit pause"
+                );
+                break;
+            }
+
+            // Wait for a concurrency slot in THIS lane.
+            loop {
+                let in_flight = if is_qa {
+                    self.active_qa_for_source(source.name()).await
+                } else {
+                    self.active_processing_for_source(source.name()).await
+                };
+                if in_flight < max_concurrent {
+                    break;
+                }
+                if !self.is_running.load(Ordering::SeqCst) {
+                    return;
+                }
+                if self.is_provider_rate_limited().await {
+                    tracing::info!(
+                        source = source.name(),
+                        lane,
+                        "Stopping lane while waiting for slot due to provider rate-limit pause"
+                    );
+                    return;
+                }
+                self.slot_available.notified().await;
+            }
+
+            // Spawn processing as a background task so poll_source returns promptly and
+            // the housekeeping loop (review checks, auto-close, retries) is not starved.
+            let watcher = Arc::clone(self);
+            let source_clone = Arc::clone(source);
+            let handle = tokio::spawn(async move {
+                watcher
+                    .process_issue(source_clone, issue, match_result, None, None, intent)
+                    .await;
+            });
+            self.spawn_handles.lock().await.push(handle);
+
+            // Add delay between starting new issues (skip trailing delay after the last item).
+            if i + 1 < total && self.config.processing_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.config.processing_delay_ms)).await;
+            }
+        }
     }
 
     /// Check whether an approval request should be sent for the given resolution.
@@ -3567,6 +3639,9 @@ Create a PR with your changes.{custom_instructions}"#,
         }
 
         let processing_key = format!("{}:{}", source.name(), issue.id);
+        // Questions are counted in a dedicated QA lane so they never compete with
+        // slow fixes for the same per-source concurrency budget.
+        let is_qa = matches!(intent, Some(Intent::Question));
 
         // Atomic check-and-insert to prevent race conditions.
         {
@@ -3578,7 +3653,11 @@ Create a PR with your changes.{custom_instructions}"#,
                 );
                 return false;
             }
-            processing.insert(processing_key.clone());
+            if is_qa {
+                processing.insert_qa(processing_key.clone());
+            } else {
+                processing.insert(processing_key.clone());
+            }
         }
         self.active_processing.fetch_add(1, Ordering::SeqCst);
 
@@ -11395,6 +11474,55 @@ mod tests {
         state.insert("linear:1".to_string());
         assert_eq!(state.source_count("sentry"), 2);
         assert_eq!(state.source_count("linear"), 1);
+    }
+
+    #[test]
+    fn test_processing_state_insert_qa_counts_only_qa_lane() {
+        // A QA insert increments the QA lane only, leaving the fix lane at zero.
+        let mut state = ProcessingState::new();
+        assert!(state.insert_qa("discord:1".to_string()));
+        assert_eq!(state.qa_source_count("discord"), 1);
+        assert_eq!(state.source_count("discord"), 0);
+        assert!(state.contains("discord:1"));
+    }
+
+    #[test]
+    fn test_processing_state_lanes_are_independent() {
+        // Fixes and questions for the same source count in separate lanes.
+        let mut state = ProcessingState::new();
+        state.insert("discord:fix1".to_string());
+        state.insert("discord:fix2".to_string());
+        state.insert_qa("discord:q1".to_string());
+
+        assert_eq!(state.source_count("discord"), 2);
+        assert_eq!(state.qa_source_count("discord"), 1);
+    }
+
+    #[test]
+    fn test_processing_state_remove_routes_to_correct_lane() {
+        let mut state = ProcessingState::new();
+        state.insert("discord:fix1".to_string());
+        state.insert_qa("discord:q1".to_string());
+        assert_eq!(state.source_count("discord"), 1);
+        assert_eq!(state.qa_source_count("discord"), 1);
+
+        // Removing the QA key decrements only the QA lane.
+        assert!(state.remove("discord:q1"));
+        assert_eq!(state.qa_source_count("discord"), 0);
+        assert_eq!(state.source_count("discord"), 1);
+
+        // Removing the fix key decrements only the fix lane.
+        assert!(state.remove("discord:fix1"));
+        assert_eq!(state.source_count("discord"), 0);
+        assert_eq!(state.qa_source_count("discord"), 0);
+    }
+
+    #[test]
+    fn test_processing_state_insert_qa_duplicate_returns_false() {
+        let mut state = ProcessingState::new();
+        assert!(state.insert_qa("discord:1".to_string()));
+        assert!(!state.insert_qa("discord:1".to_string()));
+        assert_eq!(state.qa_source_count("discord"), 1);
     }
 
     #[test]
