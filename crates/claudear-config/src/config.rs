@@ -695,6 +695,8 @@ pub struct QaConfig {
     /// schema-constrained output; `true` uses the offline local LLM. Independent
     /// of the global `agent.use_llm`, which only swaps the agent *runner*.
     pub use_llm: bool,
+    /// Max questions answered concurrently, independent of the fix budget.
+    pub max_concurrent: usize,
 }
 
 impl Default for QaConfig {
@@ -705,6 +707,7 @@ impl Default for QaConfig {
             answer_timeout_secs: 600,
             max_qa_per_cycle: 20,
             use_llm: false,
+            max_concurrent: 1,
         }
     }
 }
@@ -8719,6 +8722,39 @@ workspace = "/tmp/repos"
         assert_eq!(
             wrapper.qa.max_qa_per_cycle,
             QaConfig::default().max_qa_per_cycle
+        );
+    }
+
+    #[test]
+    fn test_qa_max_concurrent_from_toml() {
+        let toml_str = r#"
+            [qa]
+            enabled = true
+            max_concurrent = 5
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(wrapper.qa.max_concurrent, 5);
+    }
+
+    #[test]
+    fn test_qa_max_concurrent_defaults_when_omitted() {
+        // `[qa]` present but key omitted falls back to the QaConfig default.
+        let toml_str = r#"
+            [qa]
+            enabled = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            qa: QaConfig,
+        }
+        let wrapper: Wrapper = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            wrapper.qa.max_concurrent,
+            QaConfig::default().max_concurrent
         );
     }
 

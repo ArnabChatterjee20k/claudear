@@ -910,6 +910,8 @@ max_qa_per_cycle = 20
 # ([llm]). Independent of the global agent.use_llm, which only swaps the agent runner. (default: false)
 use_llm = false
 
+max_concurrent = 1
+
 # ============================================
 # Reply Action
 # ============================================
