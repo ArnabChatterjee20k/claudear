@@ -3353,6 +3353,12 @@ Create a PR with your changes.{custom_instructions}"#,
             );
         }
         let qa_max = self.config.qa.max_concurrent.max(1);
+        if self.config.qa.max_concurrent == 0 {
+            tracing::warn!(
+                source = source.name(),
+                "qa.max_concurrent evaluated to 0, clamping to 1"
+            );
+        }
 
         let (questions, fixes): (
             Vec<(Issue, MatchResult, Option<Intent>)>,
@@ -3380,7 +3386,8 @@ Create a PR with your changes.{custom_instructions}"#,
         Ok(())
     }
 
-    /// Number of active processing items for a specific source.
+    /// Number of active *fix-lane* processing items for a specific source.
+    /// QA items are tracked separately; see [`Self::active_qa_for_source`].
     async fn active_processing_for_source(&self, source_name: &str) -> usize {
         self.processing.read().await.source_count(source_name)
     }
