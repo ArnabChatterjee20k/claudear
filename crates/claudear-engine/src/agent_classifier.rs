@@ -132,11 +132,16 @@ fn parse_structured_response(
     if repo.is_empty() || repo.eq_ignore_ascii_case("none") {
         return None;
     }
+    // Exact enum match: the model honoured the schema constraint → full confidence.
+    if let Some(c) = candidates.iter().find(|c| **c == repo) {
+        return Some((c.to_string(), 1.0));
+    }
+    // Case-insensitive match: the value didn't match any enum entry verbatim, so
+    // the constraint wasn't perfectly respected — mirror parse_response's 0.9.
     candidates
         .iter()
-        .find(|c| **c == repo)
-        .or_else(|| candidates.iter().find(|c| c.eq_ignore_ascii_case(repo)))
-        .map(|c| (c.to_string(), 1.0))
+        .find(|c| c.eq_ignore_ascii_case(repo))
+        .map(|c| (c.to_string(), 0.9))
 }
 
 /// Build the classification prompt (plain text, no model-specific tokens).
@@ -512,11 +517,12 @@ mod tests {
             parse_structured_response(&v, &candidates),
             Some(("utopia-php/database".to_string(), 1.0))
         );
-        // Case-insensitive still maps back to the canonical candidate.
+        // Case-insensitive maps back to the canonical candidate at reduced
+        // confidence (the value didn't match the enum verbatim).
         let v = serde_json::json!({ "repo": "Appwrite/Cloud" });
         assert_eq!(
             parse_structured_response(&v, &candidates),
-            Some(("appwrite/cloud".to_string(), 1.0))
+            Some(("appwrite/cloud".to_string(), 0.9))
         );
         // Explicit NONE and missing field → no match.
         assert_eq!(
