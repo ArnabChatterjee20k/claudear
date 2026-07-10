@@ -995,6 +995,8 @@ async fn process_issue(
         tracker: state.tracker.clone(),
         notifier: state.notifier.clone(),
         agent: state.agent.clone(),
+        // The webhook server uses a single agent runner; QA falls back to it.
+        qa_agent: None,
         inferrer: state.inferrer.clone(),
         embedding_client: state.embedding_client.clone(),
         issue_embedding_service: state.issue_embedding_service.clone(),

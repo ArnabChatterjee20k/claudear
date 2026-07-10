@@ -707,6 +707,8 @@ struct WatcherDeps {
     discord_index_orchestrator: Option<Arc<claudear::discord_index::DiscordIndexOrchestrator>>,
     agent: Arc<dyn AgentRunner>,
     classification_agent: Option<Arc<dyn AgentRunner>>,
+    repo_classification_agent: Option<Arc<dyn AgentRunner>>,
+    qa_agent: Option<Arc<dyn AgentRunner>>,
     llm_engine: Option<Arc<claudear::chat::llm::LlmEngine>>,
 }
 
@@ -858,45 +860,8 @@ async fn build_watcher_deps(
     };
 
     // Agent runner
-    let agent: Arc<dyn AgentRunner> = InstrumentedRunner::wrap(Arc::new(ClaudeAgentRunner::new(
-        ClaudeRunnerConfig {
-            timeout_secs: config.agent.timeout_secs,
-            model: config
-                .agent
-                .default_provider_config()
-                .and_then(|p| p.model.clone()),
-            instructions: config
-                .agent
-                .default_provider_config()
-                .and_then(|p| p.instructions.clone()),
-            permissions: config
-                .agent
-                .default_provider_config()
-                .map(|p| p.permissions.clone())
-                .unwrap_or_default(),
-            readonly_tools: config
-                .agent
-                .default_provider_config()
-                .map(|p| p.readonly_tools.clone())
-                .unwrap_or_default(),
-            skip_permissions: config
-                .agent
-                .default_provider_config()
-                .map(|p| p.skip_permissions)
-                .unwrap_or(false),
-            binary: config
-                .agent
-                .default_provider_config()
-                .and_then(|p| p.binary.clone())
-                .unwrap_or_else(|| "claude".to_string()),
-            env: config
-                .agent
-                .default_provider_config()
-                .map(|p| p.env.clone())
-                .unwrap_or_default(),
-        },
-        tracker.clone(),
-    )));
+    let agent: Arc<dyn AgentRunner> =
+        claudear::build_provider_runner(config, tracker.clone(), None);
 
     // Eagerly load LLM engine — download model if not present on disk
     let llm_engine = if config.llm.enabled {
@@ -985,51 +950,28 @@ async fn build_watcher_deps(
         agent
     };
 
-    // Build a separate agent runner for classification if a classification_model is configured
-    let classification_agent: Option<Arc<dyn AgentRunner>> = config
-        .agent
-        .default_provider_config()
-        .and_then(|p| p.classification_model.clone())
-        .map(|model| {
-            tracing::info!(model = %model, "Building separate agent runner for classification");
-            let runner = ClaudeAgentRunner::new(
-                ClaudeRunnerConfig {
-                    timeout_secs: config.agent.timeout_secs,
-                    model: Some(model),
-                    instructions: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.instructions.clone()),
-                    permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.permissions.clone())
-                        .unwrap_or_default(),
-                    readonly_tools: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.readonly_tools.clone())
-                        .unwrap_or_default(),
-                    skip_permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.skip_permissions)
-                        .unwrap_or(false),
-                    binary: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.binary.clone())
-                        .unwrap_or_else(|| "claude".to_string()),
-                    env: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.env.clone())
-                        .unwrap_or_default(),
-                },
-                tracker.clone(),
-            );
-            InstrumentedRunner::wrap(Arc::new(runner)) as Arc<dyn AgentRunner>
-        });
+    // Purpose-specific agent runners. Each falls back to a broader runner at the
+    // point of use (see WatcherOptions field docs) when its model is unset.
+    let provider = config.agent.default_provider_config();
+    let classification_model = provider.and_then(|p| p.classification_model.clone());
+    let repo_model = provider.and_then(|p| p.repo_model.clone());
+    let qa_model = provider.and_then(|p| p.qa_model.clone());
+
+    if let Some(ref m) = classification_model {
+        tracing::info!(model = %m, "Building agent runner for classification (intent + repo default)");
+    }
+    if let Some(ref m) = repo_model {
+        tracing::info!(model = %m, "Building agent runner for repo classification");
+    }
+    if let Some(ref m) = qa_model {
+        tracing::info!(model = %m, "Building agent runner for QA");
+    }
+
+    let classification_agent =
+        claudear::build_purpose_runner(config, tracker.clone(), classification_model);
+    let repo_classification_agent =
+        claudear::build_purpose_runner(config, tracker.clone(), repo_model);
+    let qa_agent = claudear::build_purpose_runner(config, tracker.clone(), qa_model);
 
     Ok(WatcherDeps {
         sources,
@@ -1045,6 +987,8 @@ async fn build_watcher_deps(
         discord_index_orchestrator,
         agent,
         classification_agent,
+        repo_classification_agent,
+        qa_agent,
         llm_engine,
     })
 }
@@ -3317,6 +3261,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             user_registry: user_registry.clone(),
             agent: deps.agent.clone(),
             classification_agent: deps.classification_agent.clone(),
+            repo_classification_agent: deps.repo_classification_agent.clone(),
+            qa_agent: deps.qa_agent.clone(),
             dry_run: false,
             llm_engine: deps.llm_engine.clone(),
         }));
@@ -3874,6 +3820,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             user_registry: user_registry.clone(),
             agent,
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         });
@@ -4081,6 +4029,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 user_registry: user_registry.clone(),
                 agent: deps.agent.clone(),
                 classification_agent: deps.classification_agent.clone(),
+                repo_classification_agent: deps.repo_classification_agent.clone(),
+                qa_agent: deps.qa_agent.clone(),
                 dry_run: false,
                 llm_engine: deps.llm_engine.clone(),
             }));
@@ -4204,45 +4154,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             };
 
             let agent: Arc<dyn AgentRunner> =
-                InstrumentedRunner::wrap(Arc::new(ClaudeAgentRunner::new(
-                    ClaudeRunnerConfig {
-                        timeout_secs: config.agent.timeout_secs,
-                        model: config
-                            .agent
-                            .default_provider_config()
-                            .and_then(|p| p.model.clone()),
-                        instructions: config
-                            .agent
-                            .default_provider_config()
-                            .and_then(|p| p.instructions.clone()),
-                        permissions: config
-                            .agent
-                            .default_provider_config()
-                            .map(|p| p.permissions.clone())
-                            .unwrap_or_default(),
-                        readonly_tools: config
-                            .agent
-                            .default_provider_config()
-                            .map(|p| p.readonly_tools.clone())
-                            .unwrap_or_default(),
-                        skip_permissions: config
-                            .agent
-                            .default_provider_config()
-                            .map(|p| p.skip_permissions)
-                            .unwrap_or(false),
-                        binary: config
-                            .agent
-                            .default_provider_config()
-                            .and_then(|p| p.binary.clone())
-                            .unwrap_or_else(|| "claude".to_string()),
-                        env: config
-                            .agent
-                            .default_provider_config()
-                            .map(|p| p.env.clone())
-                            .unwrap_or_default(),
-                    },
-                    tracker.clone(),
-                )));
+                claudear::build_provider_runner(&config, tracker.clone(), None);
 
             // Eagerly load LLM engine — download model if not present on disk
             let llm_engine = if config.llm.enabled {
@@ -4316,50 +4228,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             };
 
             // Build a separate agent runner for classification if configured
-            let classification_agent: Option<Arc<dyn AgentRunner>> = config
-                .agent
-                .default_provider_config()
-                .and_then(|p| p.classification_model.clone())
-                .map(|model| {
-                    tracing::info!(model = %model, "Building separate agent runner for classification");
-                    let runner = ClaudeAgentRunner::new(
-                        ClaudeRunnerConfig {
-                            timeout_secs: config.agent.timeout_secs,
-                            model: Some(model),
-                            instructions: config
-                                .agent
-                                .default_provider_config()
-                                .and_then(|p| p.instructions.clone()),
-                            permissions: config
-                                .agent
-                                .default_provider_config()
-                                .map(|p| p.permissions.clone())
-                                .unwrap_or_default(),
-                            readonly_tools: config
-                                .agent
-                                .default_provider_config()
-                                .map(|p| p.readonly_tools.clone())
-                                .unwrap_or_default(),
-                            skip_permissions: config
-                                .agent
-                                .default_provider_config()
-                                .map(|p| p.skip_permissions)
-                                .unwrap_or(false),
-                            binary: config
-                                .agent
-                                .default_provider_config()
-                                .and_then(|p| p.binary.clone())
-                                .unwrap_or_else(|| "claude".to_string()),
-                            env: config
-                                .agent
-                                .default_provider_config()
-                                .map(|p| p.env.clone())
-                                .unwrap_or_default(),
-                        },
-                        tracker.clone(),
-                    );
-                    InstrumentedRunner::wrap(Arc::new(runner)) as Arc<dyn AgentRunner>
-                });
+            let provider = config.agent.default_provider_config();
+            let classification_agent = claudear::build_purpose_runner(
+                &config,
+                tracker.clone(),
+                provider.and_then(|p| p.classification_model.clone()),
+            );
+            let repo_classification_agent = claudear::build_purpose_runner(
+                &config,
+                tracker.clone(),
+                provider.and_then(|p| p.repo_model.clone()),
+            );
+            let qa_agent = claudear::build_purpose_runner(
+                &config,
+                tracker.clone(),
+                provider.and_then(|p| p.qa_model.clone()),
+            );
 
             let tracker_for_api = tracker.clone();
             let vector_store_embeddings = inferrer.as_ref().map(|i| i.embedding_count());
@@ -4385,6 +4269,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 user_registry: user_registry.clone(),
                 agent,
                 classification_agent,
+                repo_classification_agent,
+                qa_agent,
                 dry_run,
                 llm_engine,
             }));
