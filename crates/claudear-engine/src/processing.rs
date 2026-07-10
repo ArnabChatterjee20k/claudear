@@ -2233,34 +2233,57 @@ impl IssueProcessor {
             }
         }
 
-        // (2) Opt-in LLM relevance judge.
+        // (2) Opt-in relevance judge. Backend follows the global agent-runner
+        // choice (`agent.use_llm`): the local LLM when set, otherwise the coding
+        // agent via schema-constrained structured output.
         if !self.config.retrieval_eval.enabled || retrieved_items.is_empty() {
             return;
         }
-        let Some(analyzer) = self.llm_analyzer.clone() else {
-            return;
-        };
         let issue_summary = format!(
             "{}\n{}",
             issue.title,
             issue.description.clone().unwrap_or_default()
         );
-        let items = retrieved_items.to_vec();
-        let tracker = self.tracker.clone();
-        // Local LLM inference is blocking; run it off the async executor.
-        let handle = tokio::task::spawn_blocking(move || {
-            for (kind, chunk_ref, text) in &items {
-                if let Some(score) = analyzer.score_chunk_relevance(&issue_summary, text) {
+
+        if self.config.agent.use_llm {
+            // Local LLM inference is blocking; run it off the async executor.
+            let Some(analyzer) = self.llm_analyzer.clone() else {
+                return;
+            };
+            let items = retrieved_items.to_vec();
+            let tracker = self.tracker.clone();
+            let handle = tokio::task::spawn_blocking(move || {
+                for (kind, chunk_ref, text) in &items {
+                    if let Some(score) = analyzer.score_chunk_relevance(&issue_summary, text) {
+                        if let Err(e) =
+                            tracker.set_retrieval_quality(attempt_id, kind, chunk_ref, score)
+                        {
+                            tracing::warn!(error = %e, "Failed to persist retrieval quality score");
+                        }
+                    }
+                }
+            });
+            if let Err(e) = handle.await {
+                tracing::warn!(error = %e, "Retrieval relevance judge task failed");
+            }
+        } else {
+            // Agent-based judge (external provider) via structured output.
+            for (kind, chunk_ref, text) in retrieved_items {
+                if let Some(score) = crate::agent_classifier::score_chunk_relevance_via_agent(
+                    self.agent.as_ref(),
+                    &issue_summary,
+                    text,
+                )
+                .await
+                {
                     if let Err(e) =
-                        tracker.set_retrieval_quality(attempt_id, kind, chunk_ref, score)
+                        self.tracker
+                            .set_retrieval_quality(attempt_id, kind, chunk_ref, score)
                     {
                         tracing::warn!(error = %e, "Failed to persist retrieval quality score");
                     }
                 }
             }
-        });
-        if let Err(e) = handle.await {
-            tracing::warn!(error = %e, "Retrieval relevance judge task failed");
         }
     }
 
