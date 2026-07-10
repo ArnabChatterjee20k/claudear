@@ -4,9 +4,11 @@ import {
   fetchAttempts,
   fetchAttemptDetail,
   fetchAttemptExecutionLog,
+  fetchAttemptRetrieval,
   type AttemptsResponse,
   type AttemptDetailResponse,
   type AttemptExecutionLogResponse,
+  type AttemptRetrievalResponse,
 } from '../lib/api'
 import { PageHeader } from '../components/layout/page-header'
 import { Select } from '../components/ui/select'
@@ -16,6 +18,8 @@ import { BlockSkeleton, TableRowsSkeleton } from '../components/shared/page-skel
 import { DataTable, type Column } from '../components/shared/data-table'
 import { StatusBadge } from '../components/shared/status-badge'
 import { TimeAgo } from '../components/shared/time-ago'
+import { Modal } from '../components/shared/modal'
+import { RetrievalModalContent } from '../components/attempts/retrieval-modal'
 import { ExternalLink, ChevronLeft, ChevronRight } from 'lucide-react'
 
 const statusOptions = [
@@ -57,6 +61,7 @@ export default function AttemptsPage() {
   const [sourceFilter, setSourceFilter] = useState('')
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [selectedLog, setSelectedLog] = useState<SelectedExecutionLog | null>(null)
+  const [retrievalId, setRetrievalId] = useState<number | null>(null)
 
   const { data, error, isLoading } = useSWR<AttemptsResponse>(
     ['attempts', page, statusFilter, sourceFilter],
@@ -73,6 +78,11 @@ export default function AttemptsPage() {
   const { data: detail, isLoading: detailLoading } = useSWR<AttemptDetailResponse>(
     selectedId ? ['attempt-detail', selectedId] : null,
     () => fetchAttemptDetail(selectedId!),
+  )
+
+  const { data: retrieval, isLoading: retrievalLoading } = useSWR<AttemptRetrievalResponse>(
+    retrievalId ? ['attempt-retrieval', retrievalId] : null,
+    () => fetchAttemptRetrieval(retrievalId!),
   )
 
   const {
@@ -102,7 +112,8 @@ export default function AttemptsPage() {
       header: 'ID',
       render: row => (
         <button
-          onClick={() => {
+          onClick={e => {
+            e.stopPropagation()
             setSelectedId(row.id === selectedId ? null : row.id)
             setSelectedLog(null)
           }}
@@ -126,6 +137,7 @@ export default function AttemptsPage() {
             href={row.pr_url}
             target="_blank"
             rel="noopener noreferrer"
+            onClick={e => e.stopPropagation()}
             className="text-primary hover:text-primary/80 inline-flex items-center gap-1"
           >
             <ExternalLink className="h-3.5 w-3.5" />
@@ -195,6 +207,7 @@ export default function AttemptsPage() {
                 keyFn={row => row.id}
                 emptyMessage="No attempts found"
                 pageSize={0}
+                onRowClick={row => setRetrievalId(row.id)}
               />
             </CardContent>
           </Card>
@@ -502,6 +515,17 @@ export default function AttemptsPage() {
           )}
         </div>
       )}
+
+      <Modal
+        open={retrievalId !== null}
+        onClose={() => setRetrievalId(null)}
+        title="Retrieved Context & Quality"
+      >
+        <RetrievalModalContent
+          rows={retrieval?.rows ?? []}
+          loading={retrievalLoading}
+        />
+      </Modal>
     </div>
   )
 }

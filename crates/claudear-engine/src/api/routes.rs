@@ -112,6 +112,10 @@ pub fn create_api_router_full(
             "/api/attempts/{id}/logs/{execution_id}/{stream}",
             get(attempt_execution_log_handler),
         )
+        .route(
+            "/api/attempts/{id}/retrieval",
+            get(attempt_retrieval_handler),
+        )
         .route("/api/sources", get(sources_handler))
         .route("/api/retries", get(retries_handler))
         .route("/api/activity", get(activity_handler))
@@ -946,6 +950,12 @@ struct AttemptExecutionLogResponse {
     truncated: bool,
 }
 
+#[derive(Serialize)]
+struct AttemptRetrievalResponse {
+    attempt_id: i64,
+    rows: Vec<claudear_core::types::RetrievalUsageRecord>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct TelemetryWindowMetric {
     window: String,
@@ -1160,6 +1170,24 @@ async fn attempt_full_detail_handler(
         executions,
         reviews,
         feedback,
+    }))
+}
+
+/// Retrieval-quality assessment for an attempt: every chunk pulled from each RAG
+/// source, with score/rank/injected/used/quality_score.
+async fn attempt_retrieval_handler(
+    _user: AuthUser,
+    State(state): State<ApiState>,
+    Path(id): Path<i64>,
+) -> Result<Json<AttemptRetrievalResponse>, StatusCode> {
+    let rows = state.tracker.get_retrieval_usage(id).map_err(|e| {
+        tracing::error!(error = %e, "Internal server error");
+        sentry::capture_error(&e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok(Json(AttemptRetrievalResponse {
+        attempt_id: id,
+        rows,
     }))
 }
 
@@ -2791,6 +2819,7 @@ mod tests {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            retrieval_eval: Default::default(),
             evaluation: claudear_config::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: claudear_config::config::DashboardConfig::default(),

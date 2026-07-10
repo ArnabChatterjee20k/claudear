@@ -223,6 +223,25 @@ export interface AttemptExecutionLogResponse {
   truncated: boolean;
 }
 
+export interface RetrievalUsageRecord {
+  id: number | null;
+  attempt_id: number;
+  source_kind: string; // 'code_chunk' | 'similar_issue' | 'discord_chunk' | 'qa'
+  chunk_ref: string;
+  file_path: string | null;
+  rank: number;
+  similarity_score: number;
+  injected: boolean;
+  char_len: number | null;
+  used: boolean | null;
+  quality_score: number | null;
+}
+
+export interface AttemptRetrievalResponse {
+  attempt_id: number;
+  rows: RetrievalUsageRecord[];
+}
+
 export interface AnalyticsSummary {
   success_rate: number;
   total_processed: number;
@@ -847,6 +866,12 @@ export async function fetchIssueTimeline(
 
 export async function fetchAttemptDetail(attemptId: number): Promise<AttemptDetailResponse> {
   return fetchJson(`${API_BASE}/attempts/${attemptId}/detail`);
+}
+
+export async function fetchAttemptRetrieval(
+  attemptId: number,
+): Promise<AttemptRetrievalResponse> {
+  return fetchJson(`${API_BASE}/attempts/${attemptId}/retrieval`);
 }
 
 export async function fetchAttemptExecutionLog(
