@@ -4090,11 +4090,10 @@ Create a PR with your changes.{custom_instructions}"#,
         let meridiem = if let Some(rest) = tail.strip_prefix("am") {
             tail = rest;
             "am"
-        } else if let Some(rest) = tail.strip_prefix("pm") {
+        } else {
+            let rest = tail.strip_prefix("pm")?;
             tail = rest;
             "pm"
-        } else {
-            return None;
         };
 
         tail = tail.trim_start();
