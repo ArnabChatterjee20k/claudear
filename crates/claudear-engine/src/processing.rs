@@ -18,7 +18,7 @@ use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
     ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
-    QaKnowledgeEntry, ReplyKind, TimelineEventStatus, VerifyResult,
+    QaKnowledgeEntry, ReplyKind, RetrievalUsageRecord, TimelineEventStatus, VerifyResult,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
@@ -775,6 +775,10 @@ impl IssueProcessor {
             issue.set_metadata("target_repo_name", name.to_string());
         }
 
+        // Collected retrieved chunks (source_kind, chunk_ref, text) for the
+        // opt-in post-fix relevance judge. Only populated when tracking an attempt.
+        let mut retrieved_items: Vec<(String, String, String)> = Vec::new();
+
         // Find similar issues for context
         let similar_issues_context =
             if let Some(ref embedding_service) = self.issue_embedding_service {
@@ -792,6 +796,33 @@ impl IssueProcessor {
                             let metric = ProcessingMetric::new("similar_issues_context_added", 1.0)
                                 .with_source(source_name.to_string());
                             self.tracker.record_metric(&metric).ok();
+                            if let Some(id) = attempt_id {
+                                let rows: Vec<RetrievalUsageRecord> = similar
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(rank, s)| {
+                                        retrieved_items.push((
+                                            "similar_issue".to_string(),
+                                            s.embedding.issue_id.clone(),
+                                            format!(
+                                                "{}\n{}",
+                                                s.embedding.title.clone().unwrap_or_default(),
+                                                s.embedding.description.clone().unwrap_or_default()
+                                            ),
+                                        ));
+                                        RetrievalUsageRecord::new(
+                                            id,
+                                            "similar_issue",
+                                            s.embedding.issue_id.clone(),
+                                            s.embedding.url.clone(),
+                                            rank as i64,
+                                            s.similarity,
+                                            None,
+                                        )
+                                    })
+                                    .collect();
+                                self.tracker.record_retrieval_usage(&rows).ok();
+                            }
                             format_similar_issues_context(&similar)
                         }
                     }
@@ -819,6 +850,34 @@ impl IssueProcessor {
                         let metric = ProcessingMetric::new("code_search_context_added", 1.0)
                             .with_source(source_name.to_string());
                         self.tracker.record_metric(&metric).ok();
+                        if let Some(id) = attempt_id {
+                            let rows: Vec<RetrievalUsageRecord> = results
+                                .iter()
+                                .enumerate()
+                                .map(|(rank, r)| {
+                                    let chunk_ref = r
+                                        .chunk
+                                        .id
+                                        .map(|i| i.to_string())
+                                        .unwrap_or_else(|| r.chunk.file_path.clone());
+                                    retrieved_items.push((
+                                        "code_chunk".to_string(),
+                                        chunk_ref.clone(),
+                                        r.chunk.chunk_text.clone(),
+                                    ));
+                                    RetrievalUsageRecord::new(
+                                        id,
+                                        "code_chunk",
+                                        chunk_ref,
+                                        Some(r.chunk.file_path.clone()),
+                                        rank as i64,
+                                        r.score,
+                                        Some(r.chunk.chunk_text.len() as i64),
+                                    )
+                                })
+                                .collect();
+                            self.tracker.record_retrieval_usage(&rows).ok();
+                        }
                         context = format!(
                             "{}\n{}",
                             context,
@@ -833,7 +892,7 @@ impl IssueProcessor {
         }
 
         // Enrich context with indexed Discord discussions (independent of code index).
-        let discord_ctx = self.discord_grounding_context(issue, 5).await;
+        let discord_ctx = self.discord_grounding_context(issue, 5, attempt_id).await;
         if !discord_ctx.is_empty() {
             let metric = ProcessingMetric::new("discord_search_context_added", 1.0)
                 .with_source(source_name.to_string());
@@ -877,14 +936,31 @@ impl IssueProcessor {
                 Ok(matches) if !matches.is_empty() => {
                     context = format!("{}\n\n{}", context, format_reuse_context(&matches));
                     if let Some(id) = attempt_id {
-                        for m in &matches {
+                        let mut rows: Vec<RetrievalUsageRecord> =
+                            Vec::with_capacity(matches.len());
+                        for (rank, m) in matches.iter().enumerate() {
                             let _ = self.tracker.record_qa_usage(
                                 id,
                                 m.entry.id,
                                 "reused",
                                 m.final_score,
                             );
+                            retrieved_items.push((
+                                "qa".to_string(),
+                                m.entry.id.to_string(),
+                                format!("{}\n{}", m.entry.question_text, m.entry.answer_text),
+                            ));
+                            rows.push(RetrievalUsageRecord::new(
+                                id,
+                                "qa",
+                                m.entry.id.to_string(),
+                                None,
+                                rank as i64,
+                                m.final_score,
+                                None,
+                            ));
                         }
+                        self.tracker.record_retrieval_usage(&rows).ok();
                     }
                     used_qa_ids.extend(matches.into_iter().map(|m| m.entry.id));
                 }
@@ -1287,6 +1363,16 @@ impl IssueProcessor {
                 self.notifier.notify_success(issue, pr_url).await?;
                 if let Some(id) = attempt_id {
                     let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, true);
+                    // Attribute which retrieved code chunks the fix actually touched,
+                    // and (opt-in) score chunk relevance for retrieval-quality assessment.
+                    self.assess_retrieval(
+                        id,
+                        issue,
+                        effective_project_dir,
+                        resolution.default_branch(),
+                        &retrieved_items,
+                    )
+                    .await;
                 }
 
                 // Record metric for PR creation
@@ -1600,7 +1686,7 @@ impl IssueProcessor {
             String::new()
         };
         let discord_ctx = self
-            .discord_grounding_context(issue, self.config.qa.max_context_chunks)
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks, None)
             .await;
         if !discord_ctx.is_empty() {
             context = if context.is_empty() {
@@ -2110,7 +2196,7 @@ impl IssueProcessor {
             }
         }
         let discord_ctx = self
-            .discord_grounding_context(issue, self.config.qa.max_context_chunks)
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks, None)
             .await;
         if !discord_ctx.is_empty() {
             context = if context.is_empty() {
@@ -2122,15 +2208,155 @@ impl IssueProcessor {
         context
     }
 
+    /// Post-fix retrieval-quality assessment for a successful attempt:
+    ///   1. Attribute which retrieved code chunks the fix touched (`used` flag),
+    ///      by matching recorded `file_path`s against the worktree diff.
+    ///   2. When `retrieval_eval.enabled`, run the local LLM relevance judge over
+    ///      the retrieved chunks and persist a `quality_score`.
+    /// Best-effort: all failures are logged and swallowed.
+    async fn assess_retrieval(
+        &self,
+        attempt_id: i64,
+        issue: &Issue,
+        project_dir: &std::path::Path,
+        base_branch: Option<&str>,
+        retrieved_items: &[(String, String, String)],
+    ) {
+        // (1) "used" attribution for code chunks.
+        let changed = Self::worktree_changed_files(project_dir, base_branch).await;
+        if !changed.is_empty() {
+            if let Err(e) =
+                self.tracker
+                    .mark_retrieval_used(attempt_id, "code_chunk", &changed)
+            {
+                tracing::warn!(error = %e, "Failed to attribute used retrieval chunks");
+            }
+        }
+
+        // (2) Opt-in LLM relevance judge.
+        if !self.config.retrieval_eval.enabled || retrieved_items.is_empty() {
+            return;
+        }
+        let Some(analyzer) = self.llm_analyzer.clone() else {
+            return;
+        };
+        let issue_summary = format!(
+            "{}\n{}",
+            issue.title,
+            issue.description.clone().unwrap_or_default()
+        );
+        let items = retrieved_items.to_vec();
+        let tracker = self.tracker.clone();
+        // Local LLM inference is blocking; run it off the async executor.
+        let handle = tokio::task::spawn_blocking(move || {
+            for (kind, chunk_ref, text) in &items {
+                if let Some(score) = analyzer.score_chunk_relevance(&issue_summary, text) {
+                    if let Err(e) =
+                        tracker.set_retrieval_quality(attempt_id, kind, chunk_ref, score)
+                    {
+                        tracing::warn!(error = %e, "Failed to persist retrieval quality score");
+                    }
+                }
+            }
+        });
+        if let Err(e) = handle.await {
+            tracing::warn!(error = %e, "Retrieval relevance judge task failed");
+        }
+    }
+
+    /// Best-effort set of files changed by the fix in the worktree: uncommitted
+    /// working-tree changes plus anything committed on the branch relative to the
+    /// base branch. Returns paths relative to the repo root.
+    async fn worktree_changed_files(
+        project_dir: &std::path::Path,
+        base_branch: Option<&str>,
+    ) -> Vec<String> {
+        use std::collections::BTreeSet;
+        let mut files: BTreeSet<String> = BTreeSet::new();
+        let run = |args: Vec<String>| {
+            let dir = project_dir.to_path_buf();
+            async move {
+                tokio::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(&dir)
+                    .output()
+                    .await
+                    .ok()
+            }
+        };
+        // Uncommitted changes (working tree + index vs HEAD).
+        if let Some(out) = run(vec![
+            "diff".to_string(),
+            "--name-only".to_string(),
+            "HEAD".to_string(),
+        ])
+        .await
+        {
+            for l in String::from_utf8_lossy(&out.stdout).lines() {
+                let l = l.trim();
+                if !l.is_empty() {
+                    files.insert(l.to_string());
+                }
+            }
+        }
+        // Committed-on-branch changes vs the base branch.
+        if let Some(base) = base_branch {
+            if let Some(out) = run(vec![
+                "diff".to_string(),
+                "--name-only".to_string(),
+                format!("{base}...HEAD"),
+            ])
+            .await
+            {
+                if out.status.success() {
+                    for l in String::from_utf8_lossy(&out.stdout).lines() {
+                        let l = l.trim();
+                        if !l.is_empty() {
+                            files.insert(l.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        files.into_iter().collect()
+    }
+
     /// Retrieve grounding context from the indexed Discord knowledge source.
     /// Empty string when the source is disabled or yields no results.
-    async fn discord_grounding_context(&self, issue: &Issue, limit: usize) -> String {
+    /// When `attempt_id` is set, records the retrieved chunks for quality assessment.
+    async fn discord_grounding_context(
+        &self,
+        issue: &Issue,
+        limit: usize,
+        attempt_id: Option<i64>,
+    ) -> String {
         let Some(ref discord_search) = self.discord_search_service else {
             return String::new();
         };
         let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
         match discord_search.search(&query, None, limit).await {
             Ok(results) if !results.is_empty() => {
+                if let Some(id) = attempt_id {
+                    let rows: Vec<RetrievalUsageRecord> = results
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, r)| {
+                            RetrievalUsageRecord::new(
+                                id,
+                                "discord_chunk",
+                                r.chunk
+                                    .id
+                                    .map(|i| i.to_string())
+                                    .unwrap_or_else(|| r.chunk.channel_id.clone()),
+                                Some(r.chunk.channel_id.clone()),
+                                rank as i64,
+                                r.score,
+                                Some(r.chunk.chunk_text.len() as i64),
+                            )
+                        })
+                        .collect();
+                    self.tracker.record_retrieval_usage(&rows).ok();
+                }
                 claudear_analysis::knowledgebase::format_discord_search_context(&results)
             }
             _ => String::new(),
