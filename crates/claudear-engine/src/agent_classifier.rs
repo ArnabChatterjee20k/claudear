@@ -121,9 +121,13 @@ fn build_repo_schema(candidates: &[&str]) -> String {
 
 /// Extract the chosen repo from a schema-constrained structured response.
 ///
-/// Returns `None` for a missing/empty field or an explicit `"NONE"`. The value
-/// is mapped back to the canonical candidate string (exact, then
-/// case-insensitive) so callers get the name exactly as it appears in the index.
+/// Returns `None` only for a missing/empty field or an explicit `"NONE"` — the
+/// cases where the model deliberately declined. For any other value we reuse the
+/// freeform matcher [`parse_response`], which recovers a present-but-imperfect
+/// value in place (exact → 1.0, case-insensitive → 0.9, contains → 0.7) without
+/// needing a second, expensive agent round-trip. This means a provider that
+/// doesn't perfectly honour the enum (e.g. a backtick-wrapped or verbose `repo`
+/// field) still gets classified rather than silently dropped.
 fn parse_structured_response(
     value: &serde_json::Value,
     candidates: &[&str],
@@ -132,16 +136,7 @@ fn parse_structured_response(
     if repo.is_empty() || repo.eq_ignore_ascii_case("none") {
         return None;
     }
-    // Exact enum match: the model honoured the schema constraint → full confidence.
-    if let Some(c) = candidates.iter().find(|c| **c == repo) {
-        return Some((c.to_string(), 1.0));
-    }
-    // Case-insensitive match: the value didn't match any enum entry verbatim, so
-    // the constraint wasn't perfectly respected — mirror parse_response's 0.9.
-    candidates
-        .iter()
-        .find(|c| c.eq_ignore_ascii_case(repo))
-        .map(|c| (c.to_string(), 0.9))
+    parse_response(repo, candidates)
 }
 
 /// Build the classification prompt (plain text, no model-specific tokens).
@@ -523,6 +518,13 @@ mod tests {
         assert_eq!(
             parse_structured_response(&v, &candidates),
             Some(("appwrite/cloud".to_string(), 0.9))
+        );
+        // Present-but-imperfect value (enum not honoured verbatim) is recovered
+        // in place via the contains-match tier rather than dropped.
+        let v = serde_json::json!({ "repo": "`utopia-php/database`" });
+        assert_eq!(
+            parse_structured_response(&v, &candidates),
+            Some(("utopia-php/database".to_string(), 0.7))
         );
         // Explicit NONE and missing field → no match.
         assert_eq!(
