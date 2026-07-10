@@ -377,6 +377,8 @@ fn create_harness(tasks: Vec<Issue>) -> E2eHarness {
         user_registry: UserRegistry::new(HashMap::new()),
         agent,
         classification_agent: None,
+        repo_classification_agent: None,
+        qa_agent: None,
         dry_run: false,
         llm_engine: None,
     });

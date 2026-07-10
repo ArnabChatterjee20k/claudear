@@ -3387,6 +3387,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let code_search_service_clone = deps.code_search_service.clone();
         let discord_search_service_clone = deps.discord_search_service.clone();
         let agent_clone = deps.agent.clone();
+        let qa_agent_clone = deps.qa_agent.clone();
         let http_future = async move {
             if enable_webhooks {
                 let handlers = create_webhook_handlers(&config);
@@ -3407,6 +3408,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     github_webhook_handler_for_http,
                     agent_clone,
                 );
+                server.set_qa_agent(qa_agent_clone);
                 server.set_embedding_client(embedding_client_clone);
                 server.set_issue_embedding_service(issue_embedding_service_clone);
                 server.set_code_search_service(code_search_service_clone);
@@ -4047,6 +4049,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 github_webhook_handler,
                 deps.agent,
             );
+            server.set_qa_agent(deps.qa_agent.clone());
             server.set_embedding_client(deps.embedding_client.clone());
             server.set_issue_embedding_service(deps.issue_embedding_service);
             server.set_code_search_service(deps.code_search_service);

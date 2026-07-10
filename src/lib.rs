@@ -246,6 +246,16 @@ pub async fn build_app(
     let repo_model = provider.and_then(|p| p.repo_model.clone());
     let qa_model = provider.and_then(|p| p.qa_model.clone());
 
+    if let Some(ref m) = classification_model {
+        tracing::info!(model = %m, "Building agent runner for classification (intent + repo default)");
+    }
+    if let Some(ref m) = repo_model {
+        tracing::info!(model = %m, "Building agent runner for repo classification");
+    }
+    if let Some(ref m) = qa_model {
+        tracing::info!(model = %m, "Building agent runner for QA");
+    }
+
     let classification_agent = build_purpose_runner(&config, tracker.clone(), classification_model);
     let repo_classification_agent = build_purpose_runner(&config, tracker.clone(), repo_model);
     let qa_agent = build_purpose_runner(&config, tracker.clone(), qa_model);
