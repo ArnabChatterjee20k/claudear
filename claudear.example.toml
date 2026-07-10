@@ -92,9 +92,23 @@ use_llm = false
 # Options: sonnet, opus, haiku, or full model ID (e.g., claude-sonnet-4-5-20250929)
 model = "sonnet"
 
-# Model to use for repo classification (optional, falls back to model above)
-# Use a cheaper/faster model for classification to reduce costs
-# classification_model = "haiku"
+# Per-purpose model overrides. Each is optional; when unset it falls back to a
+# broader model, so you only set what you want to differ from `model` above.
+# Use a cheaper/faster model (e.g. "haiku") for classification/QA to cut cost
+# and latency — repo classification in particular runs per issue during
+# inference, so a slow model there stalls the pipeline.
+
+# Classification tasks: repo classification AND intent (QA-vs-fix) routing.
+# Falls back to `model`.
+classification_model = "haiku"
+
+# Repository classification during issue inference, specifically.
+# Falls back to `classification_model`, then `model`. Set this to split repo
+# classification off from intent routing.
+repo_model = "haiku"
+
+# Answering questions (QA). Falls back to `model`.
+qa_model = "sonnet"
 
 # Custom instructions appended to Claude's system prompt
 instructions = "Always write tests. Follow existing code style."
