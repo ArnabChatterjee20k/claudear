@@ -2560,6 +2560,61 @@ pub struct CodeSearchResult {
     pub score: f64,
 }
 
+/// One retrieved chunk recorded against a fix attempt, for retrieval-quality
+/// assessment. Mirrors a row of the `retrieval_usage` table. Covers all four
+/// RAG sources via `source_kind`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalUsageRecord {
+    /// Set when read back from the DB; ignored on insert.
+    pub id: Option<i64>,
+    pub attempt_id: i64,
+    /// One of: `code_chunk`, `similar_issue`, `discord_chunk`, `qa`.
+    pub source_kind: String,
+    /// Identifier of the retrieved item within its source (stringified).
+    pub chunk_ref: String,
+    /// Code: file path; Discord: channel id; issue: url.
+    pub file_path: Option<String>,
+    /// 0-based retrieval order.
+    pub rank: i64,
+    /// Cosine similarity in [0,1] as returned by the retriever.
+    pub similarity_score: f64,
+    /// Whether the chunk made it into the final prompt context.
+    pub injected: bool,
+    /// Rendered length contributed to the prompt, if known.
+    pub char_len: Option<i64>,
+    /// Whether the fix actually used the chunk (post-fix attribution); `None` until computed.
+    pub used: Option<bool>,
+    /// Relevance quality score in [0,1]; `None` until the judge runs.
+    pub quality_score: Option<f64>,
+}
+
+impl RetrievalUsageRecord {
+    /// Build a record for insertion (id/used/quality_score unset).
+    pub fn new(
+        attempt_id: i64,
+        source_kind: impl Into<String>,
+        chunk_ref: impl Into<String>,
+        file_path: Option<String>,
+        rank: i64,
+        similarity_score: f64,
+        char_len: Option<i64>,
+    ) -> Self {
+        Self {
+            id: None,
+            attempt_id,
+            source_kind: source_kind.into(),
+            chunk_ref: chunk_ref.into(),
+            file_path,
+            rank,
+            similarity_score,
+            injected: true,
+            char_len,
+            used: None,
+            quality_score: None,
+        }
+    }
+}
+
 /// A range-based Discord message chunk for embedding (a span of consecutive
 /// messages in a channel or thread). Mirrors the `discord_message_chunks` table.
 /// `channel_id` is the channel *or* thread id (a thread is itself a channel in
