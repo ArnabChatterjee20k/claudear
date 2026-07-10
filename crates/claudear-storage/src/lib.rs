@@ -721,6 +721,43 @@ pub trait KnowledgeStore: Send + Sync {
         Ok(0)
     }
 
+    /// Record the chunks retrieved for an attempt (retrieval-quality assessment).
+    fn record_retrieval_usage(
+        &self,
+        _rows: &[claudear_core::types::RetrievalUsageRecord],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Mark retrieved chunks of a given source as used by the fix (post-fix attribution).
+    fn mark_retrieval_used(
+        &self,
+        _attempt_id: i64,
+        _source_kind: &str,
+        _chunk_refs: &[String],
+    ) -> Result<u64> {
+        Ok(0)
+    }
+
+    /// Attach a relevance quality score to a retrieved chunk.
+    fn set_retrieval_quality(
+        &self,
+        _attempt_id: i64,
+        _source_kind: &str,
+        _chunk_ref: &str,
+        _quality_score: f64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Read all retrieval-usage rows for an attempt (for surfacing/inspection).
+    fn get_retrieval_usage(
+        &self,
+        _attempt_id: i64,
+    ) -> Result<Vec<claudear_core::types::RetrievalUsageRecord>> {
+        Ok(Vec::new())
+    }
+
     /// Update success/failure counters for a Q&A entry.
     fn update_qa_outcome_stats(&self, _qa_id: i64, _success: bool) -> Result<()> {
         Ok(())
