@@ -154,6 +154,54 @@ pub struct AppComponents {
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
     pub agent: Arc<dyn runner::AgentRunner>,
     pub classification_agent: Option<Arc<dyn runner::AgentRunner>>,
+    /// Optional runner for repository classification (uses `repo_model`).
+    /// Falls back to `classification_agent`, then `agent`, when not set.
+    pub repo_classification_agent: Option<Arc<dyn runner::AgentRunner>>,
+    /// Optional runner for answering questions (uses `qa_model`).
+    /// Falls back to `agent` when not set.
+    pub qa_agent: Option<Arc<dyn runner::AgentRunner>>,
+}
+
+/// Build a Claude agent runner for the default provider, optionally overriding
+/// the model. When `model_override` is `None`, the provider's configured `model`
+/// is used. All other settings (timeout, instructions, permissions, binary,
+/// env) come from the default provider config.
+pub fn build_provider_runner(
+    config: &Config,
+    tracker: Arc<dyn storage::FixAttemptTracker>,
+    model_override: Option<String>,
+) -> Arc<dyn runner::AgentRunner> {
+    let provider = config.agent.default_provider_config();
+    let model = model_override.or_else(|| provider.and_then(|p| p.model.clone()));
+    let runner = runner::ClaudeAgentRunner::new(
+        runner::ClaudeRunnerConfig {
+            timeout_secs: config.agent.timeout_secs,
+            model,
+            instructions: provider.and_then(|p| p.instructions.clone()),
+            permissions: provider.map(|p| p.permissions.clone()).unwrap_or_default(),
+            readonly_tools: provider
+                .map(|p| p.readonly_tools.clone())
+                .unwrap_or_default(),
+            skip_permissions: provider.map(|p| p.skip_permissions).unwrap_or(false),
+            binary: provider
+                .and_then(|p| p.binary.clone())
+                .unwrap_or_else(|| "claude".to_string()),
+            env: provider.map(|p| p.env.clone()).unwrap_or_default(),
+        },
+        tracker,
+    );
+    telemetry::InstrumentedRunner::wrap(Arc::new(runner))
+}
+
+/// Build an optional purpose-specific runner. Returns `None` when
+/// `purpose_model` is unset, signalling the caller to fall back to a broader
+/// runner (e.g. the main agent).
+pub fn build_purpose_runner(
+    config: &Config,
+    tracker: Arc<dyn storage::FixAttemptTracker>,
+    purpose_model: Option<String>,
+) -> Option<Arc<dyn runner::AgentRunner>> {
+    purpose_model.map(|model| build_provider_runner(config, tracker, Some(model)))
 }
 
 /// Build all non-storage components.
@@ -188,92 +236,19 @@ pub async fn build_app(
     // Issue embedding service (reuse shared embedding client)
     let issue_embedding_service = build_embedding_service(&tracker, embedding_client.as_ref());
 
-    // Agent runner
-    let agent: Arc<dyn runner::AgentRunner> =
-        telemetry::InstrumentedRunner::wrap(Arc::new(runner::ClaudeAgentRunner::new(
-            runner::ClaudeRunnerConfig {
-                timeout_secs: config.agent.timeout_secs,
-                model: config
-                    .agent
-                    .default_provider_config()
-                    .and_then(|p| p.model.clone()),
-                instructions: config
-                    .agent
-                    .default_provider_config()
-                    .and_then(|p| p.instructions.clone()),
-                permissions: config
-                    .agent
-                    .default_provider_config()
-                    .map(|p| p.permissions.clone())
-                    .unwrap_or_default(),
-                readonly_tools: config
-                    .agent
-                    .default_provider_config()
-                    .map(|p| p.readonly_tools.clone())
-                    .unwrap_or_default(),
-                skip_permissions: config
-                    .agent
-                    .default_provider_config()
-                    .map(|p| p.skip_permissions)
-                    .unwrap_or(false),
-                binary: config
-                    .agent
-                    .default_provider_config()
-                    .and_then(|p| p.binary.clone())
-                    .unwrap_or_else(|| "claude".to_string()),
-                env: config
-                    .agent
-                    .default_provider_config()
-                    .map(|p| p.env.clone())
-                    .unwrap_or_default(),
-            },
-            tracker.clone(),
-        )));
+    // Agent runner (uses the provider's default model)
+    let agent: Arc<dyn runner::AgentRunner> = build_provider_runner(&config, tracker.clone(), None);
 
-    // Build a separate agent runner for classification if configured
-    let classification_agent: Option<Arc<dyn runner::AgentRunner>> = config
-        .agent
-        .default_provider_config()
-        .and_then(|p| p.classification_model.clone())
-        .map(|model| {
-            let r = runner::ClaudeAgentRunner::new(
-                runner::ClaudeRunnerConfig {
-                    timeout_secs: config.agent.timeout_secs,
-                    model: Some(model),
-                    instructions: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.instructions.clone()),
-                    permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.permissions.clone())
-                        .unwrap_or_default(),
-                    readonly_tools: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.readonly_tools.clone())
-                        .unwrap_or_default(),
-                    skip_permissions: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.skip_permissions)
-                        .unwrap_or(false),
-                    binary: config
-                        .agent
-                        .default_provider_config()
-                        .and_then(|p| p.binary.clone())
-                        .unwrap_or_else(|| "claude".to_string()),
-                    env: config
-                        .agent
-                        .default_provider_config()
-                        .map(|p| p.env.clone())
-                        .unwrap_or_default(),
-                },
-                tracker.clone(),
-            );
-            telemetry::InstrumentedRunner::wrap(Arc::new(r)) as Arc<dyn runner::AgentRunner>
-        });
+    // Purpose-specific runners. Each falls back to a broader runner at the point
+    // of use when its model is unset (see AppComponents field docs).
+    let provider = config.agent.default_provider_config();
+    let classification_model = provider.and_then(|p| p.classification_model.clone());
+    let repo_model = provider.and_then(|p| p.repo_model.clone());
+    let qa_model = provider.and_then(|p| p.qa_model.clone());
+
+    let classification_agent = build_purpose_runner(&config, tracker.clone(), classification_model);
+    let repo_classification_agent = build_purpose_runner(&config, tracker.clone(), repo_model);
+    let qa_agent = build_purpose_runner(&config, tracker.clone(), qa_model);
 
     Ok(AppComponents {
         config,
@@ -287,6 +262,8 @@ pub async fn build_app(
         issue_embedding_service,
         agent,
         classification_agent,
+        repo_classification_agent,
+        qa_agent,
     })
 }
 
