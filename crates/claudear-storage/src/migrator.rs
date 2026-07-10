@@ -46,6 +46,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "support_discord_knowledgebase",
         sql: include_str!("../../../migrations/V6__support_discord_knowledgebase.sql"),
     },
+    Migration {
+        version: 7,
+        name: "retrieval_usage",
+        sql: include_str!("../../../migrations/V7__retrieval_usage.sql"),
+    },
 ];
 
 /// Run all pending migrations against the given connection.
@@ -106,7 +111,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         // Verify a table from V1 exists
         let count: u32 = conn
@@ -131,7 +136,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -190,6 +195,7 @@ mod tests {
             "action_runs",
             "support_reply_ratings",
             "issue_recurrence",
+            "retrieval_usage",
         ];
 
         for table in expected_tables {
