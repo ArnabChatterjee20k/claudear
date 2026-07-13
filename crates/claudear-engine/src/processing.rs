@@ -30,6 +30,10 @@ use std::sync::Arc;
 
 use crate::intent::{Intent, IntentClassifier};
 
+/// Max concurrent agent calls when scoring retrieved chunks with the (opt-in)
+/// relevance judge — each call spawns an agent process, so keep the fan-out small.
+const RETRIEVAL_JUDGE_CONCURRENCY: usize = 4;
+
 /// Trait for building issue context. Both `IssueSource` and `WebhookHandler` satisfy this.
 #[async_trait]
 pub trait ContextProvider: Send + Sync {
@@ -797,30 +801,28 @@ impl IssueProcessor {
                                 .with_source(source_name.to_string());
                             self.tracker.record_metric(&metric).ok();
                             if let Some(id) = attempt_id {
-                                let rows: Vec<RetrievalUsageRecord> = similar
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(rank, s)| {
-                                        retrieved_items.push((
-                                            "similar_issue".to_string(),
-                                            s.embedding.issue_id.clone(),
-                                            format!(
-                                                "{}\n{}",
-                                                s.embedding.title.clone().unwrap_or_default(),
-                                                s.embedding.description.clone().unwrap_or_default()
-                                            ),
-                                        ));
-                                        RetrievalUsageRecord::new(
-                                            id,
-                                            "similar_issue",
-                                            s.embedding.issue_id.clone(),
-                                            s.embedding.url.clone(),
-                                            rank as i64,
-                                            s.similarity,
-                                            None,
-                                        )
-                                    })
-                                    .collect();
+                                let mut rows: Vec<RetrievalUsageRecord> =
+                                    Vec::with_capacity(similar.len());
+                                for (rank, s) in similar.iter().enumerate() {
+                                    retrieved_items.push((
+                                        "similar_issue".to_string(),
+                                        s.embedding.issue_id.clone(),
+                                        format!(
+                                            "{}\n{}",
+                                            s.embedding.title.clone().unwrap_or_default(),
+                                            s.embedding.description.clone().unwrap_or_default()
+                                        ),
+                                    ));
+                                    rows.push(RetrievalUsageRecord::new(
+                                        id,
+                                        "similar_issue",
+                                        s.embedding.issue_id.clone(),
+                                        s.embedding.url.clone(),
+                                        rank as i64,
+                                        s.similarity,
+                                        None,
+                                    ));
+                                }
                                 self.tracker.record_retrieval_usage(&rows).ok();
                             }
                             format_similar_issues_context(&similar)
@@ -851,31 +853,29 @@ impl IssueProcessor {
                             .with_source(source_name.to_string());
                         self.tracker.record_metric(&metric).ok();
                         if let Some(id) = attempt_id {
-                            let rows: Vec<RetrievalUsageRecord> = results
-                                .iter()
-                                .enumerate()
-                                .map(|(rank, r)| {
-                                    let chunk_ref = r
-                                        .chunk
-                                        .id
-                                        .map(|i| i.to_string())
-                                        .unwrap_or_else(|| r.chunk.file_path.clone());
-                                    retrieved_items.push((
-                                        "code_chunk".to_string(),
-                                        chunk_ref.clone(),
-                                        r.chunk.chunk_text.clone(),
-                                    ));
-                                    RetrievalUsageRecord::new(
-                                        id,
-                                        "code_chunk",
-                                        chunk_ref,
-                                        Some(r.chunk.file_path.clone()),
-                                        rank as i64,
-                                        r.score,
-                                        Some(r.chunk.chunk_text.len() as i64),
-                                    )
-                                })
-                                .collect();
+                            let mut rows: Vec<RetrievalUsageRecord> =
+                                Vec::with_capacity(results.len());
+                            for (rank, r) in results.iter().enumerate() {
+                                let chunk_ref = r
+                                    .chunk
+                                    .id
+                                    .map(|i| i.to_string())
+                                    .unwrap_or_else(|| r.chunk.file_path.clone());
+                                retrieved_items.push((
+                                    "code_chunk".to_string(),
+                                    chunk_ref.clone(),
+                                    r.chunk.chunk_text.clone(),
+                                ));
+                                rows.push(RetrievalUsageRecord::new(
+                                    id,
+                                    "code_chunk",
+                                    chunk_ref,
+                                    Some(r.chunk.file_path.clone()),
+                                    rank as i64,
+                                    r.score,
+                                    Some(r.chunk.chunk_text.len() as i64),
+                                ));
+                            }
                             self.tracker.record_retrieval_usage(&rows).ok();
                         }
                         context = format!(
@@ -2213,10 +2213,12 @@ impl IssueProcessor {
     }
 
     /// Post-fix retrieval-quality assessment for a successful attempt:
-    ///   1. Attribute which retrieved code chunks the fix touched (`used` flag),
-    ///      by matching recorded `file_path`s against the worktree diff.
-    ///   2. When `retrieval_eval.enabled`, run the local LLM relevance judge over
-    ///      the retrieved chunks and persist a `quality_score`.
+    ///
+    /// 1. Attribute which retrieved code chunks the fix touched (`used` flag), by
+    ///    matching recorded `file_path`s against the worktree diff.
+    /// 2. When `retrieval_eval.enabled`, run the relevance judge over the
+    ///    retrieved chunks and persist a `quality_score`.
+    ///
     /// Best-effort: all failures are logged and swallowed.
     async fn assess_retrieval(
         &self,
@@ -2271,23 +2273,35 @@ impl IssueProcessor {
                 tracing::warn!(error = %e, "Retrieval relevance judge task failed");
             }
         } else {
-            // Agent-based judge (external provider) via structured output.
-            for (kind, chunk_ref, text) in retrieved_items {
-                if let Some(score) = crate::agent_classifier::score_chunk_relevance_via_agent(
-                    self.agent.as_ref(),
-                    &issue_summary,
-                    text,
+            // Agent-based judge (external provider) via structured output. Each
+            // call spawns an agent process, so score chunks with a bounded
+            // concurrent fan-out rather than sequentially.
+            use futures::StreamExt;
+            let issue_summary = &issue_summary;
+            futures::stream::iter(retrieved_items.iter())
+                .for_each_concurrent(
+                    RETRIEVAL_JUDGE_CONCURRENCY,
+                    |(kind, chunk_ref, text)| async move {
+                        if let Some(score) =
+                            crate::agent_classifier::score_chunk_relevance_via_agent(
+                                self.agent.as_ref(),
+                                issue_summary,
+                                text,
+                            )
+                            .await
+                        {
+                            if let Err(e) = self.tracker.set_retrieval_quality(
+                                attempt_id,
+                                kind,
+                                chunk_ref,
+                                score,
+                            ) {
+                                tracing::warn!(error = %e, "Failed to persist retrieval quality score");
+                            }
+                        }
+                    },
                 )
-                .await
-                {
-                    if let Err(e) = self
-                        .tracker
-                        .set_retrieval_quality(attempt_id, kind, chunk_ref, score)
-                    {
-                        tracing::warn!(error = %e, "Failed to persist retrieval quality score");
-                    }
-                }
-            }
+                .await;
         }
     }
 
@@ -2380,9 +2394,9 @@ impl IssueProcessor {
                         chunk_ref.clone(),
                         r.chunk.chunk_text.clone(),
                     ));
-                    if attempt_id.is_some() {
+                    if let Some(id) = attempt_id {
                         rows.push(RetrievalUsageRecord::new(
-                            attempt_id.unwrap(),
+                            id,
                             "discord_chunk",
                             chunk_ref,
                             Some(r.chunk.channel_id.clone()),

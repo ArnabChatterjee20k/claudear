@@ -5378,10 +5378,7 @@ impl SqliteTracker {
             return Ok(0);
         }
         let conn = self.acquire_lock()?;
-        let placeholders = std::iter::repeat("?")
-            .take(file_paths.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders = vec!["?"; file_paths.len()].join(", ");
         let sql = format!(
             "UPDATE retrieval_usage SET used = 1 \
              WHERE attempt_id = ?1 AND source_kind = ?2 AND file_path IN ({placeholders})"
