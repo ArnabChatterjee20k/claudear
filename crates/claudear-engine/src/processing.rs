@@ -880,7 +880,7 @@ impl IssueProcessor {
                                     Some(r.chunk.file_path.clone()),
                                     rank as i64,
                                     r.score,
-                                    Some(r.chunk.chunk_text.len() as i64),
+                                    Some(r.chunk.chunk_text.chars().count() as i64),
                                 ));
                             }
                             self.tracker.record_retrieval_usage(&rows).ok();
@@ -2329,7 +2329,7 @@ impl IssueProcessor {
                             Some(r.chunk.channel_id.clone()),
                             rank as i64,
                             r.score,
-                            Some(r.chunk.chunk_text.len() as i64),
+                            Some(r.chunk.chunk_text.chars().count() as i64),
                         ));
                     }
                 }
