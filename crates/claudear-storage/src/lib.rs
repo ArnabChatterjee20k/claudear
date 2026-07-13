@@ -729,12 +729,13 @@ pub trait KnowledgeStore: Send + Sync {
         Ok(())
     }
 
-    /// Mark retrieved chunks of a given source as used by the fix (post-fix attribution).
+    /// Mark retrieved chunks of a given source as used by the fix (post-fix
+    /// attribution), matching `file_paths` against the stored `file_path`.
     fn mark_retrieval_used(
         &self,
         _attempt_id: i64,
         _source_kind: &str,
-        _chunk_refs: &[String],
+        _file_paths: &[String],
     ) -> Result<u64> {
         Ok(0)
     }

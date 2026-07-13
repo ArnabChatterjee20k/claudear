@@ -2847,9 +2847,9 @@ impl KnowledgeStore for SqliteTracker {
         &self,
         attempt_id: i64,
         source_kind: &str,
-        chunk_refs: &[String],
+        file_paths: &[String],
     ) -> Result<u64> {
-        SqliteTracker::mark_retrieval_used(self, attempt_id, source_kind, chunk_refs)
+        SqliteTracker::mark_retrieval_used(self, attempt_id, source_kind, file_paths)
     }
 
     fn set_retrieval_quality(
@@ -2859,7 +2859,13 @@ impl KnowledgeStore for SqliteTracker {
         chunk_ref: &str,
         quality_score: f64,
     ) -> Result<()> {
-        SqliteTracker::set_retrieval_quality(self, attempt_id, source_kind, chunk_ref, quality_score)
+        SqliteTracker::set_retrieval_quality(
+            self,
+            attempt_id,
+            source_kind,
+            chunk_ref,
+            quality_score,
+        )
     }
 
     fn get_retrieval_usage(&self, attempt_id: i64) -> Result<Vec<RetrievalUsageRecord>> {
@@ -5359,31 +5365,32 @@ impl SqliteTracker {
         Ok(())
     }
 
-    /// Mark retrieved chunks of a source as used by the fix, matching on
-    /// `file_path` (used for code chunks whose file appears in the diff).
+    /// Mark retrieved chunks of a source as used by the fix, matching each
+    /// entry in `file_paths` against the `file_path` column (used for code
+    /// chunks whose file appears in the diff).
     pub fn mark_retrieval_used(
         &self,
         attempt_id: i64,
         source_kind: &str,
-        chunk_refs: &[String],
+        file_paths: &[String],
     ) -> Result<u64> {
-        if chunk_refs.is_empty() {
+        if file_paths.is_empty() {
             return Ok(0);
         }
         let conn = self.acquire_lock()?;
         let placeholders = std::iter::repeat("?")
-            .take(chunk_refs.len())
+            .take(file_paths.len())
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
             "UPDATE retrieval_usage SET used = 1 \
              WHERE attempt_id = ?1 AND source_kind = ?2 AND file_path IN ({placeholders})"
         );
-        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk_refs.len() + 2);
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(file_paths.len() + 2);
         params.push(&attempt_id);
         params.push(&source_kind);
-        for r in chunk_refs {
-            params.push(r);
+        for p in file_paths {
+            params.push(p);
         }
         let updated = conn.execute(&sql, params.as_slice())?;
         Ok(updated as u64)
@@ -12463,14 +12470,8 @@ mod tests {
             .unwrap();
 
         let fetched = tracker.get_retrieval_usage(attempt.id).unwrap();
-        let foo = fetched
-            .iter()
-            .find(|r| r.chunk_ref == "101")
-            .unwrap();
-        let bar = fetched
-            .iter()
-            .find(|r| r.chunk_ref == "102")
-            .unwrap();
+        let foo = fetched.iter().find(|r| r.chunk_ref == "101").unwrap();
+        let bar = fetched.iter().find(|r| r.chunk_ref == "102").unwrap();
         assert_eq!(foo.used, Some(true));
         assert_eq!(bar.used, None);
         assert_eq!(bar.quality_score, Some(0.65));
@@ -12490,7 +12491,11 @@ mod tests {
         assert_eq!(fetched.len(), 3, "upsert must not duplicate rows");
         let foo = fetched.iter().find(|r| r.chunk_ref == "101").unwrap();
         assert!((foo.similarity_score - 0.99).abs() < 1e-9);
-        assert_eq!(foo.used, Some(true), "upsert must preserve used attribution");
+        assert_eq!(
+            foo.used,
+            Some(true),
+            "upsert must preserve used attribution"
+        );
     }
 
     #[test]

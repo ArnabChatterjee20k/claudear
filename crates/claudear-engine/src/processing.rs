@@ -936,8 +936,7 @@ impl IssueProcessor {
                 Ok(matches) if !matches.is_empty() => {
                     context = format!("{}\n\n{}", context, format_reuse_context(&matches));
                     if let Some(id) = attempt_id {
-                        let mut rows: Vec<RetrievalUsageRecord> =
-                            Vec::with_capacity(matches.len());
+                        let mut rows: Vec<RetrievalUsageRecord> = Vec::with_capacity(matches.len());
                         for (rank, m) in matches.iter().enumerate() {
                             let _ = self.tracker.record_qa_usage(
                                 id,
@@ -2225,9 +2224,9 @@ impl IssueProcessor {
         // (1) "used" attribution for code chunks.
         let changed = Self::worktree_changed_files(project_dir, base_branch).await;
         if !changed.is_empty() {
-            if let Err(e) =
-                self.tracker
-                    .mark_retrieval_used(attempt_id, "code_chunk", &changed)
+            if let Err(e) = self
+                .tracker
+                .mark_retrieval_used(attempt_id, "code_chunk", &changed)
             {
                 tracing::warn!(error = %e, "Failed to attribute used retrieval chunks");
             }
@@ -2276,9 +2275,9 @@ impl IssueProcessor {
                 )
                 .await
                 {
-                    if let Err(e) =
-                        self.tracker
-                            .set_retrieval_quality(attempt_id, kind, chunk_ref, score)
+                    if let Err(e) = self
+                        .tracker
+                        .set_retrieval_quality(attempt_id, kind, chunk_ref, score)
                     {
                         tracing::warn!(error = %e, "Failed to persist retrieval quality score");
                     }
@@ -2315,10 +2314,12 @@ impl IssueProcessor {
         ])
         .await
         {
-            for l in String::from_utf8_lossy(&out.stdout).lines() {
-                let l = l.trim();
-                if !l.is_empty() {
-                    files.insert(l.to_string());
+            if out.status.success() {
+                for l in String::from_utf8_lossy(&out.stdout).lines() {
+                    let l = l.trim();
+                    if !l.is_empty() {
+                        files.insert(l.to_string());
+                    }
                 }
             }
         }
