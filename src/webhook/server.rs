@@ -1212,6 +1212,7 @@ mod tests {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            retrieval_eval: Default::default(),
             evaluation: crate::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: crate::config::DashboardConfig::default(),
