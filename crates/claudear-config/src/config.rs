@@ -987,17 +987,11 @@ impl Default for CodeIndexConfig {
 /// Retrieval-quality assessment configuration. Retrieved chunks are always
 /// recorded per attempt; this gates the optional LLM relevance judge that
 /// attaches a `quality_score` (extra LLM cost).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RetrievalEvalConfig {
     /// Enable the LLM relevance judge over retrieved chunks (opt-in).
     pub enabled: bool,
-}
-
-impl Default for RetrievalEvalConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 /// Self-evaluation configuration.
