@@ -2566,6 +2566,28 @@ fn restore_redacted(incoming: &mut toml::Value, current: &toml::Value) {
     }
 }
 
+fn find_redacted(value: &toml::Value, path: &str, out: &mut Vec<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (k, v) in table {
+                let child = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
+                find_redacted(v, &child, out);
+            }
+        }
+        toml::Value::Array(items) => {
+            for (i, v) in items.iter().enumerate() {
+                find_redacted(v, &format!("{path}[{i}]"), out);
+            }
+        }
+        toml::Value::String(s) if s == REDACTED => out.push(path.to_string()),
+        _ => {}
+    }
+}
+
 /// GET /api/config — return the raw TOML config file content with secrets redacted.
 async fn get_config_handler(
     _user: AdminUser,
@@ -2626,6 +2648,23 @@ async fn put_config_handler(
     // Replace any [REDACTED] sentinels in the submitted config with the real
     // values from the on-disk config before validating and saving.
     restore_redacted(&mut incoming, &current);
+
+    // Reject any sentinel that could not be restored — writing the literal
+    // "[REDACTED]" would silently corrupt the secret on the next restart.
+    let mut unrestored = Vec::new();
+    find_redacted(&incoming, "", &mut unrestored);
+    if !unrestored.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Config still contains redacted placeholders for: {}. \
+                     Provide the actual value(s) for these fields.",
+                    unrestored.join(", ")
+                )
+            })),
+        ));
+    }
 
     let parsed: Config = incoming.try_into().map_err(|e| {
         (
@@ -5212,10 +5251,46 @@ mod tests {
 
     #[test]
     fn test_restore_redacted_missing_on_disk_key_keeps_sentinel() {
-        // Documents the known edge case: a secret that was never set on disk
-        // cannot be restored, so the literal sentinel survives the merge.
+        // A secret that was never set on disk cannot be restored, so the literal
+        // sentinel survives the merge. find_redacted is what catches this and the
+        // handler rejects it before writing (see tests below).
         let merged = merge_redacted("api_token = \"[REDACTED]\"", "other = \"x\"");
         assert_eq!(merged["api_token"].as_str(), Some("[REDACTED]"));
+    }
+
+    fn redacted_paths(content: &str) -> Vec<String> {
+        let value: toml::Value = toml::from_str(content).expect("valid toml");
+        let mut out = Vec::new();
+        find_redacted(&value, "", &mut out);
+        out
+    }
+
+    #[test]
+    fn test_find_redacted_none_when_fully_restored() {
+        let merged = merge_redacted("api_token = \"[REDACTED]\"", "api_token = \"sk-real\"");
+        let mut out = Vec::new();
+        find_redacted(&merged, "", &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_find_redacted_reports_top_level_key() {
+        assert_eq!(
+            redacted_paths("api_token = \"[REDACTED]\""),
+            vec!["api_token"]
+        );
+    }
+
+    #[test]
+    fn test_find_redacted_reports_nested_path() {
+        let paths = redacted_paths("[notifiers.helpscout]\napi_key = \"[REDACTED]\"");
+        assert_eq!(paths, vec!["notifiers.helpscout.api_key"]);
+    }
+
+    #[test]
+    fn test_find_redacted_reports_array_index() {
+        let paths = redacted_paths("tokens = [\"ok\", \"[REDACTED]\"]");
+        assert_eq!(paths, vec!["tokens[1]"]);
     }
 
     #[test]
