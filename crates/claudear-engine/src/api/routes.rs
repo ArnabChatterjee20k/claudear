@@ -2540,6 +2540,32 @@ fn redact_secrets(content: &str) -> String {
     re.replace_all(content, r#"${1}"[REDACTED]""#).into_owned()
 }
 
+/// Restore [REDACTED] to actual values before saving to disk
+const REDACTED: &str = "[REDACTED]";
+fn restore_redacted(incoming: &mut toml::Value, current: &toml::Value) {
+    match (incoming, current) {
+        (toml::Value::Table(inc), toml::Value::Table(cur)) => {
+            for (k, v) in inc.iter_mut() {
+                if let Some(cur_val) = cur.get(k) {
+                    restore_redacted(v, cur_val);
+                }
+            }
+        }
+
+        (toml::Value::Array(inc), toml::Value::Array(cur)) => {
+            for (inc_val, cur_val) in inc.iter_mut().zip(cur.iter()) {
+                restore_redacted(inc_val, cur_val);
+            }
+        }
+
+        (inc @ toml::Value::String(_), cur) if inc.as_str() == Some(REDACTED) => {
+            *inc = cur.clone();
+        }
+
+        _ => {}
+    }
+}
+
 /// GET /api/config — return the raw TOML config file content with secrets redacted.
 async fn get_config_handler(
     _user: AdminUser,
@@ -2572,7 +2598,36 @@ async fn put_config_handler(
         ));
     }
 
-    let parsed = toml::from_str::<Config>(&body.content).map_err(|e| {
+    let mut incoming: toml::Value = toml::from_str(&body.content).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("Invalid TOML config: {}", e) })),
+        )
+    })?;
+
+    let on_disk_config_str = tokio::fs::read_to_string(&state.config_path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "error": format!("Failed to read on-disk config: {}", e) }),
+                ),
+            )
+        })?;
+
+    let current: toml::Value = toml::from_str(&on_disk_config_str).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Invalid on-disk config: {}", e) })),
+        )
+    })?;
+
+    // Replace any [REDACTED] sentinels in the submitted config with the real
+    // values from the on-disk config before validating and saving.
+    restore_redacted(&mut incoming, &current);
+
+    let parsed: Config = incoming.try_into().map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": format!("Invalid TOML config: {}", e) })),
@@ -5094,6 +5149,73 @@ mod tests {
         let redacted = redact_secrets(content);
         assert!(redacted.contains("[REDACTED]"));
         assert!(!redacted.contains("key-abc123"));
+    }
+
+    /// Parse TOML, run restore_redacted against the on-disk version, return merged value.
+    fn merge_redacted(incoming: &str, current: &str) -> toml::Value {
+        let mut incoming: toml::Value = toml::from_str(incoming).expect("valid incoming toml");
+        let current: toml::Value = toml::from_str(current).expect("valid current toml");
+        restore_redacted(&mut incoming, &current);
+        incoming
+    }
+
+    #[test]
+    fn test_restore_redacted_replaces_sentinel() {
+        let merged = merge_redacted("api_token = \"[REDACTED]\"", "api_token = \"sk-real\"");
+        assert_eq!(merged["api_token"].as_str(), Some("sk-real"));
+    }
+
+    #[test]
+    fn test_restore_redacted_keeps_edited_value() {
+        // User typed a new secret — it must not be overwritten by the on-disk value.
+        let merged = merge_redacted("api_token = \"sk-new\"", "api_token = \"sk-old\"");
+        assert_eq!(merged["api_token"].as_str(), Some("sk-new"));
+    }
+
+    #[test]
+    fn test_restore_redacted_leaves_non_secret_values_untouched() {
+        let merged = merge_redacted(
+            "workspace = \"/tmp/repos\"\npoll_interval_ms = 300000",
+            "workspace = \"/other\"\npoll_interval_ms = 1",
+        );
+        assert_eq!(merged["workspace"].as_str(), Some("/tmp/repos"));
+        assert_eq!(merged["poll_interval_ms"].as_integer(), Some(300000));
+    }
+
+    #[test]
+    fn test_restore_redacted_nested_table() {
+        let merged = merge_redacted(
+            "[notifiers.helpscout]\napi_key = \"[REDACTED]\"\nmailbox = \"support\"",
+            "[notifiers.helpscout]\napi_key = \"hs-real\"\nmailbox = \"old\"",
+        );
+        assert_eq!(
+            merged["notifiers"]["helpscout"]["api_key"].as_str(),
+            Some("hs-real")
+        );
+        // Non-secret edit in the same table is preserved.
+        assert_eq!(
+            merged["notifiers"]["helpscout"]["mailbox"].as_str(),
+            Some("support")
+        );
+    }
+
+    #[test]
+    fn test_restore_redacted_array_by_index() {
+        let merged = merge_redacted(
+            "tokens = [\"[REDACTED]\", \"keep\"]",
+            "tokens = [\"real-0\", \"stale-1\"]",
+        );
+        let arr = merged["tokens"].as_array().expect("array");
+        assert_eq!(arr[0].as_str(), Some("real-0"));
+        assert_eq!(arr[1].as_str(), Some("keep"));
+    }
+
+    #[test]
+    fn test_restore_redacted_missing_on_disk_key_keeps_sentinel() {
+        // Documents the known edge case: a secret that was never set on disk
+        // cannot be restored, so the literal sentinel survives the merge.
+        let merged = merge_redacted("api_token = \"[REDACTED]\"", "other = \"x\"");
+        assert_eq!(merged["api_token"].as_str(), Some("[REDACTED]"));
     }
 
     #[test]
