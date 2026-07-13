@@ -2249,10 +2249,7 @@ impl IssueProcessor {
         let items = retrieved_items.to_vec();
         let tracker = self.tracker.clone();
         let analyzer = self.llm_analyzer.clone();
-        let agent = self
-            .qa_agent
-            .clone()
-            .unwrap_or_else(|| self.agent.clone());
+        let agent = self.qa_agent.clone().unwrap_or_else(|| self.agent.clone());
         // Issue identity captured for the detached task's timeline events.
         let issue_id = issue.id.clone();
         let short_id = issue.short_id.clone();
