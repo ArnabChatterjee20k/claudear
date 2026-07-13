@@ -892,12 +892,17 @@ impl IssueProcessor {
         }
 
         // Enrich context with indexed Discord discussions (independent of code index).
-        let discord_ctx = self.discord_grounding_context(issue, 5, attempt_id).await;
+        let (discord_ctx, discord_items) =
+            self.discord_grounding_context(issue, 5, attempt_id).await;
         if !discord_ctx.is_empty() {
             let metric = ProcessingMetric::new("discord_search_context_added", 1.0)
                 .with_source(source_name.to_string());
             self.tracker.record_metric(&metric).ok();
             context = format!("{}\n{}", context, discord_ctx);
+            // Forward Discord chunks so the relevance judge scores them too.
+            if attempt_id.is_some() {
+                retrieved_items.extend(discord_items);
+            }
         }
 
         // Append PR review feedback context for review-driven reruns
@@ -1684,7 +1689,7 @@ impl IssueProcessor {
         } else {
             String::new()
         };
-        let discord_ctx = self
+        let (discord_ctx, _) = self
             .discord_grounding_context(issue, self.config.qa.max_context_chunks, None)
             .await;
         if !discord_ctx.is_empty() {
@@ -2194,7 +2199,7 @@ impl IssueProcessor {
                 }
             }
         }
-        let discord_ctx = self
+        let (discord_ctx, _) = self
             .discord_grounding_context(issue, self.config.qa.max_context_chunks, None)
             .await;
         if !discord_ctx.is_empty() {
@@ -2346,44 +2351,55 @@ impl IssueProcessor {
     }
 
     /// Retrieve grounding context from the indexed Discord knowledge source.
-    /// Empty string when the source is disabled or yields no results.
-    /// When `attempt_id` is set, records the retrieved chunks for quality assessment.
+    /// Returns the formatted context (empty when the source is disabled or yields
+    /// no results) plus the retrieved chunks as `(source_kind, chunk_ref, text)`
+    /// tuples so the caller can feed them to the relevance judge. When
+    /// `attempt_id` is set, also records the retrieved chunks for quality assessment.
     async fn discord_grounding_context(
         &self,
         issue: &Issue,
         limit: usize,
         attempt_id: Option<i64>,
-    ) -> String {
+    ) -> (String, Vec<(String, String, String)>) {
         let Some(ref discord_search) = self.discord_search_service else {
-            return String::new();
+            return (String::new(), Vec::new());
         };
         let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
         match discord_search.search(&query, None, limit).await {
             Ok(results) if !results.is_empty() => {
-                if let Some(id) = attempt_id {
-                    let rows: Vec<RetrievalUsageRecord> = results
-                        .iter()
-                        .enumerate()
-                        .map(|(rank, r)| {
-                            RetrievalUsageRecord::new(
-                                id,
-                                "discord_chunk",
-                                r.chunk
-                                    .id
-                                    .map(|i| i.to_string())
-                                    .unwrap_or_else(|| r.chunk.channel_id.clone()),
-                                Some(r.chunk.channel_id.clone()),
-                                rank as i64,
-                                r.score,
-                                Some(r.chunk.chunk_text.len() as i64),
-                            )
-                        })
-                        .collect();
+                let mut items: Vec<(String, String, String)> = Vec::with_capacity(results.len());
+                let mut rows: Vec<RetrievalUsageRecord> = Vec::with_capacity(results.len());
+                for (rank, r) in results.iter().enumerate() {
+                    let chunk_ref = r
+                        .chunk
+                        .id
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| r.chunk.channel_id.clone());
+                    items.push((
+                        "discord_chunk".to_string(),
+                        chunk_ref.clone(),
+                        r.chunk.chunk_text.clone(),
+                    ));
+                    if attempt_id.is_some() {
+                        rows.push(RetrievalUsageRecord::new(
+                            attempt_id.unwrap(),
+                            "discord_chunk",
+                            chunk_ref,
+                            Some(r.chunk.channel_id.clone()),
+                            rank as i64,
+                            r.score,
+                            Some(r.chunk.chunk_text.len() as i64),
+                        ));
+                    }
+                }
+                if !rows.is_empty() {
                     self.tracker.record_retrieval_usage(&rows).ok();
                 }
-                claudear_analysis::knowledgebase::format_discord_search_context(&results)
+                let context =
+                    claudear_analysis::knowledgebase::format_discord_search_context(&results);
+                (context, items)
             }
-            _ => String::new(),
+            _ => (String::new(), Vec::new()),
         }
     }
 
