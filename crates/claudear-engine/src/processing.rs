@@ -1302,11 +1302,8 @@ impl IssueProcessor {
             });
         }
 
-        // Score retrieval quality for this attempt regardless of outcome — the
-        // chunks were recorded at retrieval time, so failed and no-PR attempts are
-        // just as worth assessing (arguably more).
         if let Some(id) = attempt_id {
-            self.assess_retrieval(id, issue, &retrieved_items).await;
+            self.spawn_retrieval_judge(id, issue, &retrieved_items);
         }
 
         // Handle result
@@ -2221,13 +2218,8 @@ impl IssueProcessor {
         context
     }
 
-    /// Opt-in retrieval-quality judge: when `retrieval_eval.enabled`, score how
-    /// relevant each retrieved chunk was to the issue and persist a
-    /// `quality_score`. Backend follows the global agent-runner choice
-    /// (`agent.use_llm`): the local LLM when set, otherwise the coding agent via
-    /// schema-constrained structured output. Best-effort — failures are logged
-    /// and swallowed.
-    async fn assess_retrieval(
+    /// Opt-in retrieval-quality judge: when `retrieval_eval.enabled`
+    fn spawn_retrieval_judge(
         &self,
         attempt_id: i64,
         issue: &Issue,
@@ -2236,64 +2228,138 @@ impl IssueProcessor {
         if !self.config.retrieval_eval.enabled || retrieved_items.is_empty() {
             return;
         }
+        let use_llm = self.config.agent.use_llm;
+        let backend = if use_llm { "llm" } else { "agent" };
+        let total = retrieved_items.len();
+
+        // Timeline: record that scoring was spawned (synchronously, so it lands
+        // before the detached task's completed/failed event).
+        self.record_timeline_event(
+            issue,
+            TimelineEventStatus::RetrievalScoringStarted,
+            format!("Scoring {total} retrieved chunk(s) for {}", issue.short_id),
+            json!({ "backend": backend, "chunk_count": total }),
+        );
+
         let issue_summary = format!(
             "{}\n{}",
             issue.title,
             issue.description.clone().unwrap_or_default()
         );
+        let items = retrieved_items.to_vec();
+        let tracker = self.tracker.clone();
+        let analyzer = self.llm_analyzer.clone();
+        let agent = self
+            .qa_agent
+            .clone()
+            .unwrap_or_else(|| self.agent.clone());
+        // Issue identity captured for the detached task's timeline events.
+        let issue_id = issue.id.clone();
+        let short_id = issue.short_id.clone();
+        let source = issue.source.clone();
 
-        if self.config.agent.use_llm {
-            // Local LLM inference is blocking; run it off the async executor.
-            let Some(analyzer) = self.llm_analyzer.clone() else {
-                return;
-            };
-            let items = retrieved_items.to_vec();
-            let tracker = self.tracker.clone();
-            let handle = tokio::task::spawn_blocking(move || {
-                for item in &items {
-                    if let Some(score) = analyzer.score_chunk_relevance(&issue_summary, &item.text)
-                    {
-                        if let Err(e) = tracker.set_retrieval_quality(
-                            attempt_id,
-                            &item.source_kind,
-                            &item.chunk_ref,
-                            score,
-                        ) {
-                            tracing::warn!(error = %e, "Failed to persist retrieval quality score");
+        tokio::spawn(async move {
+            let scored: usize = if use_llm {
+                // Local LLM inference is blocking; run it off the async executor.
+                let Some(analyzer) = analyzer else {
+                    record_scoring_event(
+                        &tracker,
+                        &source,
+                        &issue_id,
+                        &short_id,
+                        TimelineEventStatus::RetrievalScoringFailed,
+                        format!("Retrieval scoring skipped for {short_id}: local LLM unavailable"),
+                        json!({ "backend": backend, "reason": "llm_unavailable" }),
+                    );
+                    return;
+                };
+                let tracker_s = tracker.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let mut n = 0usize;
+                    for item in &items {
+                        if let Some(score) =
+                            analyzer.score_chunk_relevance(&issue_summary, &item.text)
+                        {
+                            match tracker_s.set_retrieval_quality(
+                                attempt_id,
+                                &item.source_kind,
+                                &item.chunk_ref,
+                                score,
+                            ) {
+                                Ok(()) => n += 1,
+                                Err(e) => tracing::warn!(error = %e, "Failed to persist retrieval quality score"),
+                            }
                         }
+                    }
+                    n
+                })
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Retrieval relevance judge task failed");
+                        record_scoring_event(
+                            &tracker,
+                            &source,
+                            &issue_id,
+                            &short_id,
+                            TimelineEventStatus::RetrievalScoringFailed,
+                            format!("Retrieval scoring failed for {short_id}"),
+                            json!({ "backend": backend, "reason": "join_error" }),
+                        );
+                        return;
                     }
                 }
-            });
-            if let Err(e) = handle.await {
-                tracing::warn!(error = %e, "Retrieval relevance judge task failed");
-            }
-        } else {
-            // Agent-based judge (external provider) via structured output. Each
-            // call spawns an agent process, so score chunks with a bounded
-            // concurrent fan-out rather than sequentially.
-            use futures::StreamExt;
-            let issue_summary = &issue_summary;
-            futures::stream::iter(retrieved_items.iter())
-                .for_each_concurrent(RETRIEVAL_JUDGE_CONCURRENCY, |item| async move {
-                    if let Some(score) = crate::agent_classifier::score_chunk_relevance_via_agent(
-                        self.agent.as_ref(),
-                        issue_summary,
-                        &item.text,
-                    )
-                    .await
-                    {
-                        if let Err(e) = self.tracker.set_retrieval_quality(
-                            attempt_id,
-                            &item.source_kind,
-                            &item.chunk_ref,
-                            score,
-                        ) {
-                            tracing::warn!(error = %e, "Failed to persist retrieval quality score");
-                        }
-                    }
-                })
-                .await;
-        }
+            } else {
+                // Agent-based judge (external provider) via structured output. Each
+                // call spawns an agent process, so score chunks with a bounded
+                // concurrent fan-out rather than sequentially.
+                use futures::StreamExt;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                let scored = AtomicUsize::new(0);
+                {
+                    let issue_summary = &issue_summary;
+                    let tracker = &tracker;
+                    let agent = agent.as_ref();
+                    let scored = &scored;
+                    futures::stream::iter(items.iter())
+                        .for_each_concurrent(RETRIEVAL_JUDGE_CONCURRENCY, |item| async move {
+                            if let Some(score) =
+                                crate::agent_classifier::score_chunk_relevance_via_agent(
+                                    agent,
+                                    issue_summary,
+                                    &item.text,
+                                )
+                                .await
+                            {
+                                match tracker.set_retrieval_quality(
+                                    attempt_id,
+                                    &item.source_kind,
+                                    &item.chunk_ref,
+                                    score,
+                                ) {
+                                    Ok(()) => {
+                                        scored.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(e) => tracing::warn!(error = %e, "Failed to persist retrieval quality score"),
+                                }
+                            }
+                        })
+                        .await;
+                }
+                scored.into_inner()
+            };
+
+            record_scoring_event(
+                &tracker,
+                &source,
+                &issue_id,
+                &short_id,
+                TimelineEventStatus::RetrievalScoringCompleted,
+                format!("Scored {scored}/{total} retrieved chunk(s) for {short_id}"),
+                json!({ "backend": backend, "scored": scored, "total": total }),
+            );
+        });
     }
 
     /// Retrieve grounding context from the indexed Discord knowledge source.
@@ -2514,6 +2580,24 @@ pub fn enhance_prompt_with_learning(
     }
 
     format!("{}\n---\n\n{}", extra_context, base_prompt)
+}
+
+/// Record a retrieval-scoring timeline event from a detached task (where `self`
+/// and the `Issue` are no longer available — only the captured identity fields).
+fn record_scoring_event(
+    tracker: &Arc<dyn FixAttemptTracker>,
+    source: &str,
+    issue_id: &str,
+    short_id: &str,
+    event: TimelineEventStatus,
+    message: String,
+    context: serde_json::Value,
+) {
+    let activity = ActivityLogEntry::new(event.as_str(), message)
+        .with_source(source.to_string())
+        .with_issue(issue_id.to_string(), short_id.to_string())
+        .with_metadata(context);
+    tracker.record_activity(&activity).ok();
 }
 
 /// Record error pattern for analytics.
