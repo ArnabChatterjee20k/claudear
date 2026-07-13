@@ -631,8 +631,11 @@ The PR title should include the issue ID: {}
             args.push("--allowedTools".to_string());
             args.push(perm.clone());
         }
+        // Deliver the prompt via stdin, not as a CLI argument. Large prompts
+        // (e.g. the repo classifier's all-candidates prompt) otherwise overflow
+        // the OS argv limit and fail to spawn with E2BIG ("Argument list too
+        // long"). `--print` with no positional prompt reads the prompt from stdin.
         args.push("--print".to_string());
-        args.push(prompt.to_string());
 
         let (env, _label) = self.prepare_env_and_label(None);
 
@@ -641,6 +644,7 @@ The PR title should include the issue ID: {}
             .current_dir(project_dir)
             .envs(env)
             .env_remove("CLAUDECODE")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Discard stderr: this lean path never reads it, and leaving it piped
             // would let `--verbose` diagnostics fill the OS buffer and block the
@@ -648,6 +652,16 @@ The PR title should include the issue ID: {}
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| Error::runner(format!("Failed to spawn {}: {}", self.config.binary, e)))?;
+
+        // Write the prompt to stdin concurrently with reading stdout to avoid a
+        // pipe-buffer deadlock when the prompt is large.
+        if let Some(mut child_stdin) = child.stdin.take() {
+            let prompt_bytes = prompt.to_string();
+            tokio::spawn(async move {
+                let _ = child_stdin.write_all(prompt_bytes.as_bytes()).await;
+                let _ = child_stdin.shutdown().await;
+            });
+        }
 
         let stdout = child
             .stdout
@@ -818,8 +832,10 @@ The PR title should include the issue ID: {}
                 args.push(perm.clone());
             }
         }
+        // Prompt is delivered via stdin (see spawn below), not as a CLI argument,
+        // to avoid the OS argv size limit (E2BIG) on large prompts. `--print`
+        // with no positional prompt reads it from stdin.
         args.push("--print".to_string());
-        args.push(prompt.to_string());
 
         let log_files = Self::create_execution_log_files(label);
         if let Some(ref files) = log_files {
@@ -859,11 +875,9 @@ The PR title should include the issue ID: {}
                 None => None,
             };
 
-        let cli_args_without_prompt: Vec<String> = args
-            .iter()
-            .take(args.len().saturating_sub(1))
-            .cloned()
-            .collect();
+        // The prompt is no longer part of argv (it's piped via stdin), so all
+        // remaining args are safe to log.
+        let cli_args_without_prompt: Vec<String> = args.clone();
         Self::append_execution_event(
             &event_writer,
             label,
@@ -886,6 +900,7 @@ The PR title should include the issue ID: {}
             .current_dir(project_dir)
             .envs(env)
             .env_remove("CLAUDECODE")
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -907,6 +922,16 @@ The PR title should include the issue ID: {}
                 )));
             }
         };
+
+        // Write the prompt to stdin concurrently with reading stdout/stderr so a
+        // large prompt cannot deadlock against the child's output pipes.
+        if let Some(mut child_stdin) = child.stdin.take() {
+            let prompt_bytes = prompt.to_string();
+            tokio::spawn(async move {
+                let _ = child_stdin.write_all(prompt_bytes.as_bytes()).await;
+                let _ = child_stdin.shutdown().await;
+            });
+        }
 
         Self::append_execution_event(
             &event_writer,
