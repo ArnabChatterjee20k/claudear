@@ -20,7 +20,7 @@ import { StatusBadge } from '../components/shared/status-badge'
 import { TimeAgo } from '../components/shared/time-ago'
 import { Modal } from '../components/shared/modal'
 import { RetrievalModalContent } from '../components/attempts/retrieval-modal'
-import { ExternalLink, ChevronLeft, ChevronRight } from 'lucide-react'
+import { ExternalLink, ChevronLeft, ChevronRight, Layers } from 'lucide-react'
 
 const statusOptions = [
   { value: 'pending', label: 'Pending' },
@@ -112,8 +112,7 @@ export default function AttemptsPage() {
       header: 'ID',
       render: row => (
         <button
-          onClick={e => {
-            e.stopPropagation()
+          onClick={() => {
             setSelectedId(row.id === selectedId ? null : row.id)
             setSelectedLog(null)
           }}
@@ -137,7 +136,6 @@ export default function AttemptsPage() {
             href={row.pr_url}
             target="_blank"
             rel="noopener noreferrer"
-            onClick={e => e.stopPropagation()}
             className="text-primary hover:text-primary/80 inline-flex items-center gap-1"
           >
             <ExternalLink className="h-3.5 w-3.5" />
@@ -157,6 +155,20 @@ export default function AttemptsPage() {
       key: 'retry_count',
       header: 'Retries',
       render: row => <span>{row.retry_count}</span>,
+    },
+    {
+      key: 'retrieval',
+      header: 'Context',
+      render: row => (
+        <button
+          onClick={() => setRetrievalId(row.id)}
+          title="View retrieved context & quality"
+          className="text-muted-foreground hover:text-primary inline-flex items-center gap-1"
+        >
+          <Layers className="h-3.5 w-3.5" />
+          View
+        </button>
+      ),
     },
   ]
 
@@ -207,7 +219,6 @@ export default function AttemptsPage() {
                 keyFn={row => row.id}
                 emptyMessage="No attempts found"
                 pageSize={0}
-                onRowClick={row => setRetrievalId(row.id)}
               />
             </CardContent>
           </Card>

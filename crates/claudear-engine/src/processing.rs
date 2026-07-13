@@ -1292,6 +1292,22 @@ impl IssueProcessor {
             });
         }
 
+        // Assess retrieval quality for this attempt regardless of outcome — the
+        // chunks were recorded at retrieval time, so failed and no-PR attempts are
+        // just as worth assessing (arguably more). Attributes "used" from the
+        // worktree diff (still intact; cleanup happens after we return) and, when
+        // opted in, scores chunk relevance.
+        if let Some(id) = attempt_id {
+            self.assess_retrieval(
+                id,
+                issue,
+                effective_project_dir,
+                resolution.default_branch(),
+                &retrieved_items,
+            )
+            .await;
+        }
+
         // Handle result
         if claude_result.success {
             // For review reruns, resolve the effective PR URL
@@ -1367,16 +1383,6 @@ impl IssueProcessor {
                 self.notifier.notify_success(issue, pr_url).await?;
                 if let Some(id) = attempt_id {
                     let _ = self.tracker.update_qa_outcome_stats_for_attempt(id, true);
-                    // Attribute which retrieved code chunks the fix actually touched,
-                    // and (opt-in) score chunk relevance for retrieval-quality assessment.
-                    self.assess_retrieval(
-                        id,
-                        issue,
-                        effective_project_dir,
-                        resolution.default_branch(),
-                        &retrieved_items,
-                    )
-                    .await;
                 }
 
                 // Record metric for PR creation
