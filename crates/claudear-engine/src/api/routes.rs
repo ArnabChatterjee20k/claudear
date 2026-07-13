@@ -5238,14 +5238,23 @@ mod tests {
     }
 
     #[test]
-    fn test_restore_redacted_array_by_index() {
+    fn test_restore_redacted_leaves_arrays_untouched() {
+        // Arrays are intentionally not traversed during restore (the system never
+        // stores secrets in arrays). A sentinel inside an array is therefore left
+        // as-is by restore_redacted; find_redacted catches it and the handler
+        // rejects the save with a 400.
         let merged = merge_redacted(
             "tokens = [\"[REDACTED]\", \"keep\"]",
             "tokens = [\"real-0\", \"stale-1\"]",
         );
         let arr = merged["tokens"].as_array().expect("array");
-        assert_eq!(arr[0].as_str(), Some("real-0"));
+        assert_eq!(arr[0].as_str(), Some("[REDACTED]"));
         assert_eq!(arr[1].as_str(), Some("keep"));
+
+        // The unrestored sentinel is surfaced for rejection.
+        let mut out = Vec::new();
+        find_redacted(&merged, "", &mut out);
+        assert_eq!(out, vec!["tokens[0]"]);
     }
 
     #[test]
