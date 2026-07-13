@@ -2551,13 +2551,12 @@ fn restore_redacted(incoming: &mut toml::Value, current: &toml::Value) {
                 }
             }
         }
-
-        (toml::Value::Array(inc), toml::Value::Array(cur)) => {
-            for (inc_val, cur_val) in inc.iter_mut().zip(cur.iter()) {
-                restore_redacted(inc_val, cur_val);
-            }
-        }
-
+        // Skipping arrays intentionally as secrets will not be stored in the arrays due to ordering issue
+        // (toml::Value::Array(inc), toml::Value::Array(cur)) => {
+        //     for (inc_val, cur_val) in inc.iter_mut().zip(cur.iter()) {
+        //         restore_redacted(inc_val, cur_val);
+        //     }
+        // }
         (inc @ toml::Value::String(_), cur) if inc.as_str() == Some(REDACTED) => {
             *inc = cur.clone();
         }
