@@ -55,6 +55,9 @@ struct AppState {
     review_watcher: Option<Arc<ReviewWatcher>>,
     user_registry: UserRegistry,
     agent: Arc<dyn AgentRunner>,
+    /// Optional runner for answering questions (uses `qa_model`).
+    /// Falls back to `agent` when not set.
+    qa_agent: Option<Arc<dyn AgentRunner>>,
     github_handler: Option<GitHubWebhookHandler>,
     suppression_regex_cache: Option<crate::prioritisation::suppression::RegexCache>,
     /// Tracks currently processing webhooks with timestamps for TTL-based cleanup.
@@ -87,6 +90,8 @@ pub struct WebhookServer {
     review_watcher: Option<Arc<ReviewWatcher>>,
     github_handler: Option<GitHubWebhookHandler>,
     agent: Arc<dyn AgentRunner>,
+    /// Optional runner for answering questions (uses `qa_model`); falls back to `agent`.
+    qa_agent: Option<Arc<dyn AgentRunner>>,
     port: u16,
     /// When set, the dashboard API routes are merged into the webhook server.
     dashboard_config_path: Option<std::path::PathBuf>,
@@ -142,9 +147,16 @@ impl WebhookServer {
             review_watcher: None,
             github_handler,
             agent,
+            qa_agent: None,
             port,
             dashboard_config_path: None,
         }
+    }
+
+    /// Set a dedicated runner for answering questions (uses `qa_model`).
+    /// When unset, question answering falls back to the main agent.
+    pub fn set_qa_agent(&mut self, qa_agent: Option<Arc<dyn AgentRunner>>) {
+        self.qa_agent = qa_agent;
     }
 
     /// Set the issue embedding service for semantic dedup and context enrichment.
@@ -242,6 +254,7 @@ impl WebhookServer {
             user_registry,
             github_handler: self.github_handler,
             suppression_regex_cache,
+            qa_agent: self.qa_agent,
             processing: RwLock::new(HashMap::new()),
         });
 
@@ -995,6 +1008,7 @@ async fn process_issue(
         tracker: state.tracker.clone(),
         notifier: state.notifier.clone(),
         agent: state.agent.clone(),
+        qa_agent: state.qa_agent.clone(),
         inferrer: state.inferrer.clone(),
         embedding_client: state.embedding_client.clone(),
         issue_embedding_service: state.issue_embedding_service.clone(),
@@ -1503,6 +1517,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1545,6 +1560,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(processing_set),
             suppression_regex_cache: None,
         });
@@ -1585,6 +1601,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1659,6 +1676,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1708,6 +1726,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1779,6 +1798,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1860,6 +1880,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1913,6 +1934,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -1967,6 +1989,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(processing),
             suppression_regex_cache: None,
         });
@@ -2017,6 +2040,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -2089,6 +2113,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -2216,6 +2241,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -2329,6 +2355,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         }
@@ -2414,6 +2441,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -2449,6 +2477,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -2482,6 +2511,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         })
@@ -2512,6 +2542,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(processing),
             suppression_regex_cache: None,
         })
@@ -2541,6 +2572,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         })
@@ -2811,6 +2843,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: Some(cache),
         });
@@ -3568,6 +3601,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -3608,6 +3642,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -3649,6 +3684,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -3802,6 +3838,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: Some(github_handler),
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -4098,6 +4135,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -4229,6 +4267,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -4282,6 +4321,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -4422,6 +4462,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: Some(github_handler),
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -4515,6 +4556,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -4551,6 +4593,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -4999,6 +5042,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         });
@@ -5179,6 +5223,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5220,6 +5265,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5260,6 +5306,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5300,6 +5347,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5340,6 +5388,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5380,6 +5429,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5420,6 +5470,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5464,6 +5515,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5507,6 +5559,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5557,6 +5610,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5646,6 +5700,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5677,6 +5732,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -5813,6 +5869,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: Some(cache),
         });
@@ -5871,6 +5928,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: Some(cache),
         });
@@ -6245,6 +6303,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: Some(cache),
         });
@@ -6420,6 +6479,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(processing),
             suppression_regex_cache: None,
         });
@@ -6450,6 +6510,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -6648,6 +6709,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         };
@@ -6919,6 +6981,7 @@ mod tests {
             review_watcher: None,
             user_registry: UserRegistry::new(HashMap::new()),
             github_handler: None,
+            qa_agent: None,
             processing: RwLock::new(HashMap::new()),
             suppression_regex_cache: None,
         })

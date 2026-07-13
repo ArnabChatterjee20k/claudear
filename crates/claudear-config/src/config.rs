@@ -128,8 +128,15 @@ impl AgentConfig {
 pub struct ProviderConfig {
     /// Model to use (e.g., sonnet, opus, haiku, or full model ID).
     pub model: Option<String>,
-    /// Model to use for repo classification (optional, falls back to `model`).
+    /// Model to use for classification tasks — repo classification and intent
+    /// (QA-vs-fix) routing. Optional; falls back to `model` when unset.
     pub classification_model: Option<String>,
+    /// Model to use specifically for repository classification during issue
+    /// inference. Optional; falls back to `classification_model`, then `model`.
+    /// Set this to a cheap/fast model (e.g. "haiku") so inference doesn't stall.
+    pub repo_model: Option<String>,
+    /// Model to use for answering questions (QA). Optional; falls back to `model`.
+    pub qa_model: Option<String>,
     /// Custom instructions appended to the agent's system prompt.
     pub instructions: Option<String>,
     /// Path to a file containing custom instructions.
