@@ -2843,15 +2843,6 @@ impl KnowledgeStore for SqliteTracker {
         SqliteTracker::record_retrieval_usage(self, rows)
     }
 
-    fn mark_retrieval_used(
-        &self,
-        attempt_id: i64,
-        source_kind: &str,
-        file_paths: &[String],
-    ) -> Result<u64> {
-        SqliteTracker::mark_retrieval_used(self, attempt_id, source_kind, file_paths)
-    }
-
     fn set_retrieval_quality(
         &self,
         attempt_id: i64,
@@ -5365,34 +5356,6 @@ impl SqliteTracker {
         Ok(())
     }
 
-    /// Mark retrieved chunks of a source as used by the fix, matching each
-    /// entry in `file_paths` against the `file_path` column (used for code
-    /// chunks whose file appears in the diff).
-    pub fn mark_retrieval_used(
-        &self,
-        attempt_id: i64,
-        source_kind: &str,
-        file_paths: &[String],
-    ) -> Result<u64> {
-        if file_paths.is_empty() {
-            return Ok(0);
-        }
-        let conn = self.acquire_lock()?;
-        let placeholders = vec!["?"; file_paths.len()].join(", ");
-        let sql = format!(
-            "UPDATE retrieval_usage SET used = 1 \
-             WHERE attempt_id = ?1 AND source_kind = ?2 AND file_path IN ({placeholders})"
-        );
-        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(file_paths.len() + 2);
-        params.push(&attempt_id);
-        params.push(&source_kind);
-        for p in file_paths {
-            params.push(p);
-        }
-        let updated = conn.execute(&sql, params.as_slice())?;
-        Ok(updated as u64)
-    }
-
     /// Attach a relevance quality score to a specific retrieved chunk.
     pub fn set_retrieval_quality(
         &self,
@@ -5416,7 +5379,7 @@ impl SqliteTracker {
         let mut stmt = conn.prepare(
             r#"
             SELECT id, attempt_id, source_kind, chunk_ref, file_path, rank,
-                   similarity_score, injected, char_len, used, quality_score
+                   similarity_score, injected, char_len, quality_score
             FROM retrieval_usage
             WHERE attempt_id = ?1
             ORDER BY source_kind, rank
@@ -5434,8 +5397,7 @@ impl SqliteTracker {
                     similarity_score: row.get(6)?,
                     injected: row.get::<_, i64>(7)? != 0,
                     char_len: row.get(8)?,
-                    used: row.get::<_, Option<i64>>(9)?.map(|v| v != 0),
-                    quality_score: row.get(10)?,
+                    quality_score: row.get(9)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -12452,14 +12414,7 @@ mod tests {
         assert_eq!(fetched[0].source_kind, "code_chunk");
         assert_eq!(fetched[0].rank, 0);
         assert!(fetched[0].injected);
-        assert!(fetched[0].used.is_none());
         assert!(fetched[0].quality_score.is_none());
-
-        // Attribute usage by changed file path (only src/foo.rs was touched).
-        let updated = tracker
-            .mark_retrieval_used(attempt.id, "code_chunk", &["src/foo.rs".to_string()])
-            .unwrap();
-        assert_eq!(updated, 1);
 
         // Attach a quality score to a specific chunk.
         tracker
@@ -12467,10 +12422,7 @@ mod tests {
             .unwrap();
 
         let fetched = tracker.get_retrieval_usage(attempt.id).unwrap();
-        let foo = fetched.iter().find(|r| r.chunk_ref == "101").unwrap();
         let bar = fetched.iter().find(|r| r.chunk_ref == "102").unwrap();
-        assert_eq!(foo.used, Some(true));
-        assert_eq!(bar.used, None);
         assert_eq!(bar.quality_score, Some(0.65));
 
         // Upsert preserves the row identity (no duplicate) and refreshes score.
@@ -12488,11 +12440,6 @@ mod tests {
         assert_eq!(fetched.len(), 3, "upsert must not duplicate rows");
         let foo = fetched.iter().find(|r| r.chunk_ref == "101").unwrap();
         assert!((foo.similarity_score - 0.99).abs() < 1e-9);
-        assert_eq!(
-            foo.used,
-            Some(true),
-            "upsert must preserve used attribution"
-        );
     }
 
     #[test]

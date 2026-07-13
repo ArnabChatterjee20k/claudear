@@ -1,7 +1,7 @@
 -- Per-attempt record of every chunk retrieved from each RAG source, so that
 -- retrieval quality (which chunks were pulled, their scores/ranks, whether they
--- were injected into the prompt, whether the fix used them, and a relevance
--- quality score) can be assessed. Generalizes the existing `qa_usage` table to
+-- were injected into the prompt, and a relevance quality score) can be
+-- assessed. Generalizes the existing `qa_usage` table to
 -- all four retrieval sources (code chunks, similar issues, Discord, Q&A).
 CREATE TABLE IF NOT EXISTS retrieval_usage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -13,7 +13,6 @@ CREATE TABLE IF NOT EXISTS retrieval_usage (
     similarity_score REAL NOT NULL,      -- cosine similarity [0,1] as returned
     injected INTEGER NOT NULL DEFAULT 1, -- made it into the final context string
     char_len INTEGER,                    -- rendered length contributed to the prompt
-    used INTEGER,                        -- NULL until post-fix attribution
     quality_score REAL,                  -- NULL until relevance judge runs
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(attempt_id, source_kind, chunk_ref)

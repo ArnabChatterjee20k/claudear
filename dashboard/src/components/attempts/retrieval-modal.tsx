@@ -46,9 +46,9 @@ export function RetrievalModalContent({ rows, loading }: Props) {
       <p className="text-xs text-muted-foreground">
         Every chunk pulled from each retrieval source for this fix attempt.
         <span className="font-medium"> Sim</span> = cosine similarity at
-        retrieval, <span className="font-medium">Used</span> = the fix touched
-        this chunk's file, <span className="font-medium">Quality</span> = LLM
-        relevance judge (when enabled).
+        retrieval, <span className="font-medium">Injected</span> = included in
+        the agent's prompt, <span className="font-medium">Quality</span> =
+        relevance judge score (when enabled).
       </p>
 
       {grouped.map(group => (
@@ -67,7 +67,6 @@ export function RetrievalModalContent({ rows, loading }: Props) {
                   <th className="py-1 pr-2 font-medium">Ref / File</th>
                   <th className="py-1 pr-2 font-medium text-right">Sim</th>
                   <th className="py-1 pr-2 font-medium text-center">Injected</th>
-                  <th className="py-1 pr-2 font-medium text-center">Used</th>
                   <th className="py-1 font-medium text-right">Quality</th>
                 </tr>
               </thead>
@@ -88,13 +87,6 @@ export function RetrievalModalContent({ rows, loading }: Props) {
                     </td>
                     <td className="py-1 pr-2 text-center">
                       {r.injected ? '✓' : '—'}
-                    </td>
-                    <td className="py-1 pr-2 text-center">
-                      {r.used === null
-                        ? '—'
-                        : r.used
-                          ? '✓'
-                          : '✗'}
                     </td>
                     <td className="py-1 text-right tabular-nums">
                       {pct(r.quality_score)}

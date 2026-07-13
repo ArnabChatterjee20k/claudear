@@ -34,6 +34,13 @@ use crate::intent::{Intent, IntentClassifier};
 /// relevance judge — each call spawns an agent process, so keep the fan-out small.
 const RETRIEVAL_JUDGE_CONCURRENCY: usize = 4;
 
+#[derive(Debug, Clone)]
+struct RetrievedItem {
+    source_kind: String,
+    chunk_ref: String,
+    text: String,
+}
+
 /// Trait for building issue context. Both `IssueSource` and `WebhookHandler` satisfy this.
 #[async_trait]
 pub trait ContextProvider: Send + Sync {
@@ -781,7 +788,7 @@ impl IssueProcessor {
 
         // Collected retrieved chunks (source_kind, chunk_ref, text) for the
         // opt-in post-fix relevance judge. Only populated when tracking an attempt.
-        let mut retrieved_items: Vec<(String, String, String)> = Vec::new();
+        let mut retrieved_items: Vec<RetrievedItem> = Vec::new();
 
         // Find similar issues for context
         let similar_issues_context =
@@ -804,15 +811,15 @@ impl IssueProcessor {
                                 let mut rows: Vec<RetrievalUsageRecord> =
                                     Vec::with_capacity(similar.len());
                                 for (rank, s) in similar.iter().enumerate() {
-                                    retrieved_items.push((
-                                        "similar_issue".to_string(),
-                                        s.embedding.issue_id.clone(),
-                                        format!(
+                                    retrieved_items.push(RetrievedItem {
+                                        source_kind: "similar_issue".to_string(),
+                                        chunk_ref: s.embedding.issue_id.clone(),
+                                        text: format!(
                                             "{}\n{}",
                                             s.embedding.title.clone().unwrap_or_default(),
                                             s.embedding.description.clone().unwrap_or_default()
                                         ),
-                                    ));
+                                    });
                                     rows.push(RetrievalUsageRecord::new(
                                         id,
                                         "similar_issue",
@@ -861,11 +868,11 @@ impl IssueProcessor {
                                     .id
                                     .map(|i| i.to_string())
                                     .unwrap_or_else(|| r.chunk.file_path.clone());
-                                retrieved_items.push((
-                                    "code_chunk".to_string(),
-                                    chunk_ref.clone(),
-                                    r.chunk.chunk_text.clone(),
-                                ));
+                                retrieved_items.push(RetrievedItem {
+                                    source_kind: "code_chunk".to_string(),
+                                    chunk_ref: chunk_ref.clone(),
+                                    text: r.chunk.chunk_text.clone(),
+                                });
                                 rows.push(RetrievalUsageRecord::new(
                                     id,
                                     "code_chunk",
@@ -949,11 +956,11 @@ impl IssueProcessor {
                                 "reused",
                                 m.final_score,
                             );
-                            retrieved_items.push((
-                                "qa".to_string(),
-                                m.entry.id.to_string(),
-                                format!("{}\n{}", m.entry.question_text, m.entry.answer_text),
-                            ));
+                            retrieved_items.push(RetrievedItem {
+                                source_kind: "qa".to_string(),
+                                chunk_ref: m.entry.id.to_string(),
+                                text: format!("{}\n{}", m.entry.question_text, m.entry.answer_text),
+                            });
                             rows.push(RetrievalUsageRecord::new(
                                 id,
                                 "qa",
@@ -1292,20 +1299,11 @@ impl IssueProcessor {
             });
         }
 
-        // Assess retrieval quality for this attempt regardless of outcome — the
+        // Score retrieval quality for this attempt regardless of outcome — the
         // chunks were recorded at retrieval time, so failed and no-PR attempts are
-        // just as worth assessing (arguably more). Attributes "used" from the
-        // worktree diff (still intact; cleanup happens after we return) and, when
-        // opted in, scores chunk relevance.
+        // just as worth assessing (arguably more).
         if let Some(id) = attempt_id {
-            self.assess_retrieval(
-                id,
-                issue,
-                effective_project_dir,
-                resolution.default_branch(),
-                &retrieved_items,
-            )
-            .await;
+            self.assess_retrieval(id, issue, &retrieved_items).await;
         }
 
         // Handle result
@@ -2218,36 +2216,18 @@ impl IssueProcessor {
         context
     }
 
-    /// Post-fix retrieval-quality assessment for a successful attempt:
-    ///
-    /// 1. Attribute which retrieved code chunks the fix touched (`used` flag), by
-    ///    matching recorded `file_path`s against the worktree diff.
-    /// 2. When `retrieval_eval.enabled`, run the relevance judge over the
-    ///    retrieved chunks and persist a `quality_score`.
-    ///
-    /// Best-effort: all failures are logged and swallowed.
+    /// Opt-in retrieval-quality judge: when `retrieval_eval.enabled`, score how
+    /// relevant each retrieved chunk was to the issue and persist a
+    /// `quality_score`. Backend follows the global agent-runner choice
+    /// (`agent.use_llm`): the local LLM when set, otherwise the coding agent via
+    /// schema-constrained structured output. Best-effort — failures are logged
+    /// and swallowed.
     async fn assess_retrieval(
         &self,
         attempt_id: i64,
         issue: &Issue,
-        project_dir: &std::path::Path,
-        base_branch: Option<&str>,
-        retrieved_items: &[(String, String, String)],
+        retrieved_items: &[RetrievedItem],
     ) {
-        // (1) "used" attribution for code chunks.
-        let changed = Self::worktree_changed_files(project_dir, base_branch).await;
-        if !changed.is_empty() {
-            if let Err(e) = self
-                .tracker
-                .mark_retrieval_used(attempt_id, "code_chunk", &changed)
-            {
-                tracing::warn!(error = %e, "Failed to attribute used retrieval chunks");
-            }
-        }
-
-        // (2) Opt-in relevance judge. Backend follows the global agent-runner
-        // choice (`agent.use_llm`): the local LLM when set, otherwise the coding
-        // agent via schema-constrained structured output.
         if !self.config.retrieval_eval.enabled || retrieved_items.is_empty() {
             return;
         }
@@ -2265,11 +2245,15 @@ impl IssueProcessor {
             let items = retrieved_items.to_vec();
             let tracker = self.tracker.clone();
             let handle = tokio::task::spawn_blocking(move || {
-                for (kind, chunk_ref, text) in &items {
-                    if let Some(score) = analyzer.score_chunk_relevance(&issue_summary, text) {
-                        if let Err(e) =
-                            tracker.set_retrieval_quality(attempt_id, kind, chunk_ref, score)
-                        {
+                for item in &items {
+                    if let Some(score) = analyzer.score_chunk_relevance(&issue_summary, &item.text)
+                    {
+                        if let Err(e) = tracker.set_retrieval_quality(
+                            attempt_id,
+                            &item.source_kind,
+                            &item.chunk_ref,
+                            score,
+                        ) {
                             tracing::warn!(error = %e, "Failed to persist retrieval quality score");
                         }
                     }
@@ -2285,109 +2269,46 @@ impl IssueProcessor {
             use futures::StreamExt;
             let issue_summary = &issue_summary;
             futures::stream::iter(retrieved_items.iter())
-                .for_each_concurrent(
-                    RETRIEVAL_JUDGE_CONCURRENCY,
-                    |(kind, chunk_ref, text)| async move {
-                        if let Some(score) =
-                            crate::agent_classifier::score_chunk_relevance_via_agent(
-                                self.agent.as_ref(),
-                                issue_summary,
-                                text,
-                            )
-                            .await
-                        {
-                            if let Err(e) = self.tracker.set_retrieval_quality(
-                                attempt_id,
-                                kind,
-                                chunk_ref,
-                                score,
-                            ) {
-                                tracing::warn!(error = %e, "Failed to persist retrieval quality score");
-                            }
+                .for_each_concurrent(RETRIEVAL_JUDGE_CONCURRENCY, |item| async move {
+                    if let Some(score) = crate::agent_classifier::score_chunk_relevance_via_agent(
+                        self.agent.as_ref(),
+                        issue_summary,
+                        &item.text,
+                    )
+                    .await
+                    {
+                        if let Err(e) = self.tracker.set_retrieval_quality(
+                            attempt_id,
+                            &item.source_kind,
+                            &item.chunk_ref,
+                            score,
+                        ) {
+                            tracing::warn!(error = %e, "Failed to persist retrieval quality score");
                         }
-                    },
-                )
+                    }
+                })
                 .await;
         }
     }
 
-    /// Best-effort set of files changed by the fix in the worktree: uncommitted
-    /// working-tree changes plus anything committed on the branch relative to the
-    /// base branch. Returns paths relative to the repo root.
-    async fn worktree_changed_files(
-        project_dir: &std::path::Path,
-        base_branch: Option<&str>,
-    ) -> Vec<String> {
-        use std::collections::BTreeSet;
-        let mut files: BTreeSet<String> = BTreeSet::new();
-        let run = |args: Vec<String>| {
-            let dir = project_dir.to_path_buf();
-            async move {
-                tokio::process::Command::new("git")
-                    .args(&args)
-                    .current_dir(&dir)
-                    .output()
-                    .await
-                    .ok()
-            }
-        };
-        // Uncommitted changes (working tree + index vs HEAD).
-        if let Some(out) = run(vec![
-            "diff".to_string(),
-            "--name-only".to_string(),
-            "HEAD".to_string(),
-        ])
-        .await
-        {
-            if out.status.success() {
-                for l in String::from_utf8_lossy(&out.stdout).lines() {
-                    let l = l.trim();
-                    if !l.is_empty() {
-                        files.insert(l.to_string());
-                    }
-                }
-            }
-        }
-        // Committed-on-branch changes vs the base branch.
-        if let Some(base) = base_branch {
-            if let Some(out) = run(vec![
-                "diff".to_string(),
-                "--name-only".to_string(),
-                format!("{base}...HEAD"),
-            ])
-            .await
-            {
-                if out.status.success() {
-                    for l in String::from_utf8_lossy(&out.stdout).lines() {
-                        let l = l.trim();
-                        if !l.is_empty() {
-                            files.insert(l.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        files.into_iter().collect()
-    }
-
     /// Retrieve grounding context from the indexed Discord knowledge source.
     /// Returns the formatted context (empty when the source is disabled or yields
-    /// no results) plus the retrieved chunks as `(source_kind, chunk_ref, text)`
-    /// tuples so the caller can feed them to the relevance judge. When
-    /// `attempt_id` is set, also records the retrieved chunks for quality assessment.
+    /// no results) plus the retrieved chunks as [`RetrievedItem`]s so the caller
+    /// can feed them to the relevance judge. When `attempt_id` is set, also
+    /// records the retrieved chunks for quality assessment.
     async fn discord_grounding_context(
         &self,
         issue: &Issue,
         limit: usize,
         attempt_id: Option<i64>,
-    ) -> (String, Vec<(String, String, String)>) {
+    ) -> (String, Vec<RetrievedItem>) {
         let Some(ref discord_search) = self.discord_search_service else {
             return (String::new(), Vec::new());
         };
         let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
         match discord_search.search(&query, None, limit).await {
             Ok(results) if !results.is_empty() => {
-                let mut items: Vec<(String, String, String)> = Vec::with_capacity(results.len());
+                let mut items: Vec<RetrievedItem> = Vec::with_capacity(results.len());
                 let mut rows: Vec<RetrievalUsageRecord> = Vec::with_capacity(results.len());
                 for (rank, r) in results.iter().enumerate() {
                     let chunk_ref = r
@@ -2395,11 +2316,11 @@ impl IssueProcessor {
                         .id
                         .map(|i| i.to_string())
                         .unwrap_or_else(|| r.chunk.channel_id.clone());
-                    items.push((
-                        "discord_chunk".to_string(),
-                        chunk_ref.clone(),
-                        r.chunk.chunk_text.clone(),
-                    ));
+                    items.push(RetrievedItem {
+                        source_kind: "discord_chunk".to_string(),
+                        chunk_ref: chunk_ref.clone(),
+                        text: r.chunk.chunk_text.clone(),
+                    });
                     if let Some(id) = attempt_id {
                         rows.push(RetrievalUsageRecord::new(
                             id,

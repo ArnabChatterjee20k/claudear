@@ -233,7 +233,6 @@ export interface RetrievalUsageRecord {
   similarity_score: number;
   injected: boolean;
   char_len: number | null;
-  used: boolean | null;
   quality_score: number | null;
 }
 

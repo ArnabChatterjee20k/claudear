@@ -2582,14 +2582,12 @@ pub struct RetrievalUsageRecord {
     pub injected: bool,
     /// Rendered length contributed to the prompt, if known.
     pub char_len: Option<i64>,
-    /// Whether the fix actually used the chunk (post-fix attribution); `None` until computed.
-    pub used: Option<bool>,
     /// Relevance quality score in [0,1]; `None` until the judge runs.
     pub quality_score: Option<f64>,
 }
 
 impl RetrievalUsageRecord {
-    /// Build a record for insertion (id/used/quality_score unset).
+    /// Build a record for insertion (id/quality_score unset).
     pub fn new(
         attempt_id: i64,
         source_kind: impl Into<String>,
@@ -2609,7 +2607,6 @@ impl RetrievalUsageRecord {
             similarity_score,
             injected: true,
             char_len,
-            used: None,
             quality_score: None,
         }
     }
