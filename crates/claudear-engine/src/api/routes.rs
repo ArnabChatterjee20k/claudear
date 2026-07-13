@@ -2626,23 +2626,25 @@ async fn put_config_handler(
         )
     })?;
 
-    let on_disk_config_str = tokio::fs::read_to_string(&state.config_path)
-        .await
-        .map_err(|e| {
+    let current: toml::Value = match tokio::fs::read_to_string(&state.config_path).await {
+        Ok(s) => toml::from_str(&s).map_err(|e| {
             (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Invalid on-disk config: {}", e) })),
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::Table::new())
+        }
+        Err(e) => {
+            return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(
                     serde_json::json!({ "error": format!("Failed to read on-disk config: {}", e) }),
                 ),
-            )
-        })?;
-
-    let current: toml::Value = toml::from_str(&on_disk_config_str).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Invalid on-disk config: {}", e) })),
-        )
-    })?;
+            ));
+        }
+    };
 
     // Replace any [REDACTED] sentinels in the submitted config with the real
     // values from the on-disk config before validating and saving.
