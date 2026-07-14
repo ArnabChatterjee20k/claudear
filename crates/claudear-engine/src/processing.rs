@@ -18,7 +18,7 @@ use claudear_config::users::UserRegistry;
 use claudear_core::error::Result;
 use claudear_core::types::{
     ActionKind, ActivityLogEntry, AskRequest, ErrorPattern, Issue, ProcessingMetric,
-    QaKnowledgeEntry, ReplyKind, TimelineEventStatus, VerifyResult,
+    QaKnowledgeEntry, ReplyKind, RetrievalUsageRecord, TimelineEventStatus, VerifyResult,
 };
 use claudear_integrations::github::GitHubClient;
 use claudear_integrations::notifier::{send_to_all_and_wait_first_reply, Notifier};
@@ -29,6 +29,17 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::intent::{Intent, IntentClassifier};
+
+/// Max concurrent agent calls when scoring retrieved chunks with the (opt-in)
+/// relevance judge — each call spawns an agent process, so keep the fan-out small.
+const RETRIEVAL_JUDGE_CONCURRENCY: usize = 4;
+
+#[derive(Debug, Clone)]
+struct RetrievedItem {
+    source_kind: String,
+    chunk_ref: String,
+    text: String,
+}
 
 /// Trait for building issue context. Both `IssueSource` and `WebhookHandler` satisfy this.
 #[async_trait]
@@ -778,6 +789,10 @@ impl IssueProcessor {
             issue.set_metadata("target_repo_name", name.to_string());
         }
 
+        // Collected retrieved chunks (source_kind, chunk_ref, text) for the
+        // opt-in post-fix relevance judge. Only populated when tracking an attempt.
+        let mut retrieved_items: Vec<RetrievedItem> = Vec::new();
+
         // Find similar issues for context
         let similar_issues_context =
             if let Some(ref embedding_service) = self.issue_embedding_service {
@@ -795,6 +810,31 @@ impl IssueProcessor {
                             let metric = ProcessingMetric::new("similar_issues_context_added", 1.0)
                                 .with_source(source_name.to_string());
                             self.tracker.record_metric(&metric).ok();
+                            if let Some(id) = attempt_id {
+                                let mut rows: Vec<RetrievalUsageRecord> =
+                                    Vec::with_capacity(similar.len());
+                                for (rank, s) in similar.iter().enumerate() {
+                                    retrieved_items.push(RetrievedItem {
+                                        source_kind: "similar_issue".to_string(),
+                                        chunk_ref: s.embedding.issue_id.clone(),
+                                        text: format!(
+                                            "{}\n{}",
+                                            s.embedding.title.clone().unwrap_or_default(),
+                                            s.embedding.description.clone().unwrap_or_default()
+                                        ),
+                                    });
+                                    rows.push(RetrievalUsageRecord::new(
+                                        id,
+                                        "similar_issue",
+                                        s.embedding.issue_id.clone(),
+                                        s.embedding.url.clone(),
+                                        rank as i64,
+                                        s.similarity,
+                                        None,
+                                    ));
+                                }
+                                self.tracker.record_retrieval_usage(&rows).ok();
+                            }
                             format_similar_issues_context(&similar)
                         }
                     }
@@ -822,6 +862,32 @@ impl IssueProcessor {
                         let metric = ProcessingMetric::new("code_search_context_added", 1.0)
                             .with_source(source_name.to_string());
                         self.tracker.record_metric(&metric).ok();
+                        if let Some(id) = attempt_id {
+                            let mut rows: Vec<RetrievalUsageRecord> =
+                                Vec::with_capacity(results.len());
+                            for (rank, r) in results.iter().enumerate() {
+                                let chunk_ref = r
+                                    .chunk
+                                    .id
+                                    .map(|i| i.to_string())
+                                    .unwrap_or_else(|| r.chunk.file_path.clone());
+                                retrieved_items.push(RetrievedItem {
+                                    source_kind: "code_chunk".to_string(),
+                                    chunk_ref: chunk_ref.clone(),
+                                    text: r.chunk.chunk_text.clone(),
+                                });
+                                rows.push(RetrievalUsageRecord::new(
+                                    id,
+                                    "code_chunk",
+                                    chunk_ref,
+                                    Some(r.chunk.file_path.clone()),
+                                    rank as i64,
+                                    r.score,
+                                    Some(r.chunk.chunk_text.chars().count() as i64),
+                                ));
+                            }
+                            self.tracker.record_retrieval_usage(&rows).ok();
+                        }
                         context = format!(
                             "{}\n{}",
                             context,
@@ -836,12 +902,17 @@ impl IssueProcessor {
         }
 
         // Enrich context with indexed Discord discussions (independent of code index).
-        let discord_ctx = self.discord_grounding_context(issue, 5).await;
+        let (discord_ctx, discord_items) =
+            self.discord_grounding_context(issue, 5, attempt_id).await;
         if !discord_ctx.is_empty() {
             let metric = ProcessingMetric::new("discord_search_context_added", 1.0)
                 .with_source(source_name.to_string());
             self.tracker.record_metric(&metric).ok();
             context = format!("{}\n{}", context, discord_ctx);
+            // Forward Discord chunks so the relevance judge scores them too.
+            if attempt_id.is_some() {
+                retrieved_items.extend(discord_items);
+            }
         }
 
         // Append PR review feedback context for review-driven reruns
@@ -880,14 +951,30 @@ impl IssueProcessor {
                 Ok(matches) if !matches.is_empty() => {
                     context = format!("{}\n\n{}", context, format_reuse_context(&matches));
                     if let Some(id) = attempt_id {
-                        for m in &matches {
+                        let mut rows: Vec<RetrievalUsageRecord> = Vec::with_capacity(matches.len());
+                        for (rank, m) in matches.iter().enumerate() {
                             let _ = self.tracker.record_qa_usage(
                                 id,
                                 m.entry.id,
                                 "reused",
                                 m.final_score,
                             );
+                            retrieved_items.push(RetrievedItem {
+                                source_kind: "qa".to_string(),
+                                chunk_ref: m.entry.id.to_string(),
+                                text: format!("{}\n{}", m.entry.question_text, m.entry.answer_text),
+                            });
+                            rows.push(RetrievalUsageRecord::new(
+                                id,
+                                "qa",
+                                m.entry.id.to_string(),
+                                None,
+                                rank as i64,
+                                m.final_score,
+                                None,
+                            ));
                         }
+                        self.tracker.record_retrieval_usage(&rows).ok();
                     }
                     used_qa_ids.extend(matches.into_iter().map(|m| m.entry.id));
                 }
@@ -1213,6 +1300,13 @@ impl IssueProcessor {
                 suggested_repo: Some(suggested.clone()),
                 original_repo,
             });
+        }
+
+        // Score retrieval quality for this attempt regardless of outcome — the
+        // chunks were recorded at retrieval time, so failed and no-PR attempts are
+        // just as worth assessing (arguably more).
+        if let Some(id) = attempt_id {
+            self.assess_retrieval(id, issue, &retrieved_items).await;
         }
 
         // Handle result
@@ -1602,8 +1696,8 @@ impl IssueProcessor {
         } else {
             String::new()
         };
-        let discord_ctx = self
-            .discord_grounding_context(issue, self.config.qa.max_context_chunks)
+        let (discord_ctx, _) = self
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks, None)
             .await;
         if !discord_ctx.is_empty() {
             context = if context.is_empty() {
@@ -2114,8 +2208,8 @@ impl IssueProcessor {
                 }
             }
         }
-        let discord_ctx = self
-            .discord_grounding_context(issue, self.config.qa.max_context_chunks)
+        let (discord_ctx, _) = self
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks, None)
             .await;
         if !discord_ctx.is_empty() {
             context = if context.is_empty() {
@@ -2127,18 +2221,131 @@ impl IssueProcessor {
         context
     }
 
+    /// Opt-in retrieval-quality judge: when `retrieval_eval.enabled`, score how
+    /// relevant each retrieved chunk was to the issue and persist a
+    /// `quality_score`. Backend follows the global agent-runner choice
+    /// (`agent.use_llm`): the local LLM when set, otherwise the coding agent via
+    /// schema-constrained structured output. Best-effort — failures are logged
+    /// and swallowed.
+    async fn assess_retrieval(
+        &self,
+        attempt_id: i64,
+        issue: &Issue,
+        retrieved_items: &[RetrievedItem],
+    ) {
+        if !self.config.retrieval_eval.enabled || retrieved_items.is_empty() {
+            return;
+        }
+        let issue_summary = format!(
+            "{}\n{}",
+            issue.title,
+            issue.description.clone().unwrap_or_default()
+        );
+
+        if self.config.agent.use_llm {
+            // Local LLM inference is blocking; run it off the async executor.
+            let Some(analyzer) = self.llm_analyzer.clone() else {
+                return;
+            };
+            let items = retrieved_items.to_vec();
+            let tracker = self.tracker.clone();
+            let handle = tokio::task::spawn_blocking(move || {
+                for item in &items {
+                    if let Some(score) = analyzer.score_chunk_relevance(&issue_summary, &item.text)
+                    {
+                        if let Err(e) = tracker.set_retrieval_quality(
+                            attempt_id,
+                            &item.source_kind,
+                            &item.chunk_ref,
+                            score,
+                        ) {
+                            tracing::warn!(error = %e, "Failed to persist retrieval quality score");
+                        }
+                    }
+                }
+            });
+            if let Err(e) = handle.await {
+                tracing::warn!(error = %e, "Retrieval relevance judge task failed");
+            }
+        } else {
+            // Agent-based judge (external provider) via structured output. Each
+            // call spawns an agent process, so score chunks with a bounded
+            // concurrent fan-out rather than sequentially.
+            use futures::StreamExt;
+            let issue_summary = &issue_summary;
+            futures::stream::iter(retrieved_items.iter())
+                .for_each_concurrent(RETRIEVAL_JUDGE_CONCURRENCY, |item| async move {
+                    if let Some(score) = crate::agent_classifier::score_chunk_relevance_via_agent(
+                        self.agent.as_ref(),
+                        issue_summary,
+                        &item.text,
+                    )
+                    .await
+                    {
+                        if let Err(e) = self.tracker.set_retrieval_quality(
+                            attempt_id,
+                            &item.source_kind,
+                            &item.chunk_ref,
+                            score,
+                        ) {
+                            tracing::warn!(error = %e, "Failed to persist retrieval quality score");
+                        }
+                    }
+                })
+                .await;
+        }
+    }
+
     /// Retrieve grounding context from the indexed Discord knowledge source.
-    /// Empty string when the source is disabled or yields no results.
-    async fn discord_grounding_context(&self, issue: &Issue, limit: usize) -> String {
+    /// Returns the formatted context (empty when the source is disabled or yields
+    /// no results) plus the retrieved chunks as [`RetrievedItem`]s so the caller
+    /// can feed them to the relevance judge. When `attempt_id` is set, also
+    /// records the retrieved chunks for quality assessment.
+    async fn discord_grounding_context(
+        &self,
+        issue: &Issue,
+        limit: usize,
+        attempt_id: Option<i64>,
+    ) -> (String, Vec<RetrievedItem>) {
         let Some(ref discord_search) = self.discord_search_service else {
-            return String::new();
+            return (String::new(), Vec::new());
         };
         let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
         match discord_search.search(&query, None, limit).await {
             Ok(results) if !results.is_empty() => {
-                claudear_analysis::knowledgebase::format_discord_search_context(&results)
+                let mut items: Vec<RetrievedItem> = Vec::with_capacity(results.len());
+                let mut rows: Vec<RetrievalUsageRecord> = Vec::with_capacity(results.len());
+                for (rank, r) in results.iter().enumerate() {
+                    let chunk_ref = r
+                        .chunk
+                        .id
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| r.chunk.channel_id.clone());
+                    items.push(RetrievedItem {
+                        source_kind: "discord_chunk".to_string(),
+                        chunk_ref: chunk_ref.clone(),
+                        text: r.chunk.chunk_text.clone(),
+                    });
+                    if let Some(id) = attempt_id {
+                        rows.push(RetrievalUsageRecord::new(
+                            id,
+                            "discord_chunk",
+                            chunk_ref,
+                            Some(r.chunk.channel_id.clone()),
+                            rank as i64,
+                            r.score,
+                            Some(r.chunk.chunk_text.chars().count() as i64),
+                        ));
+                    }
+                }
+                if !rows.is_empty() {
+                    self.tracker.record_retrieval_usage(&rows).ok();
+                }
+                let context =
+                    claudear_analysis::knowledgebase::format_discord_search_context(&results);
+                (context, items)
             }
-            _ => String::new(),
+            _ => (String::new(), Vec::new()),
         }
     }
 

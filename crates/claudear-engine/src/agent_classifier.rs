@@ -318,6 +318,68 @@ impl IntentClassifier for AgentIntentClassifier {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Retrieval-quality relevance judge (agent backend)
+// ---------------------------------------------------------------------------
+
+/// JSON schema constraining the agent's relevance judgment to a single number.
+const RELEVANCE_SCHEMA: &str = r#"{
+    "type": "object",
+    "required": ["relevance"],
+    "additionalProperties": false,
+    "properties": {
+        "relevance": {
+            "type": "number",
+            "description": "How relevant the snippet is for resolving the issue, from 0.0 (irrelevant) to 1.0 (directly relevant)"
+        }
+    }
+}"#;
+
+/// Build the shared ISSUE/SNIPPET context block for the retrieval-quality
+/// relevance judge, clipped to keep prompts bounded. Shared by both the
+/// agent backend ([`score_chunk_relevance_via_agent`]) and the local-LLM
+/// backend ([`crate::llm_analyzer::LlmAnalyzerImpl::score_chunk_relevance`]).
+pub fn build_relevance_context(issue_summary: &str, chunk_text: &str) -> String {
+    fn clip(s: &str, n: usize) -> String {
+        s.chars().take(n).collect()
+    }
+    format!(
+        "Rate how relevant the SNIPPET is for resolving the ISSUE, from 0.0 \
+         (irrelevant) to 1.0 (directly relevant).\nISSUE:\n{}\n\nSNIPPET:\n{}",
+        clip(issue_summary, 1200),
+        clip(chunk_text, 1500)
+    )
+}
+
+/// Score chunk relevance (0.0-1.0) via the **coding agent** (external provider)
+/// using schema-constrained structured output. Used by the opt-in
+/// retrieval-quality judge when `agent.use_llm` is false. Returns `None` if the
+/// provider doesn't support structured output or the call fails.
+pub async fn score_chunk_relevance_via_agent(
+    agent: &dyn AgentRunner,
+    issue_summary: &str,
+    chunk_text: &str,
+) -> Option<f64> {
+    let prompt = format!(
+        "{}\n\nSet `relevance` to a number between 0.0 and 1.0.",
+        build_relevance_context(issue_summary, chunk_text)
+    );
+    let temp_dir = std::env::temp_dir();
+    match agent
+        .structured_query(&prompt, RELEVANCE_SCHEMA, &temp_dir)
+        .await
+    {
+        Ok(value) => value
+            .get("relevance")
+            .and_then(|v| v.as_f64())
+            .map(|v| v.clamp(0.0, 1.0)),
+        Err(e) => {
+            tracing::warn!(error = %e, "Agent retrieval relevance judge failed");
+            None
+        }
+    }
+}
+
 /// Build the intent-classification prompt for the coding agent (plain text; the
 /// `--json-schema` result shape is enforced by constrained decoding, not prose).
 fn build_intent_prompt(issue: &Issue) -> String {
@@ -653,5 +715,53 @@ mod tests {
         }));
         let issue = intent_issue("anything", None);
         assert_eq!(classifier.classify_intent(&issue).await, None);
+    }
+
+    // --- Retrieval relevance judge (agent backend) ---
+
+    #[test]
+    fn test_relevance_schema_is_valid_json_with_number() {
+        let schema: serde_json::Value = serde_json::from_str(RELEVANCE_SCHEMA).unwrap();
+        assert_eq!(schema["properties"]["relevance"]["type"], "number");
+    }
+
+    #[test]
+    fn test_build_relevance_context_labels_and_clips() {
+        let ctx = build_relevance_context("the issue", "the snippet");
+        assert!(ctx.contains("ISSUE:\nthe issue"));
+        assert!(ctx.contains("SNIPPET:\nthe snippet"));
+        let long = "x".repeat(5000);
+        let ctx = build_relevance_context(&long, &long);
+        // issue clipped to 1200, snippet to 1500 (+ labels/prose)
+        assert!(ctx.len() < 3200);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_score_chunk_relevance_via_agent() {
+        let agent = StructuredMock {
+            response: Ok(serde_json::json!({ "relevance": 0.73 })),
+        };
+        assert_eq!(
+            score_chunk_relevance_via_agent(&agent, "issue", "snippet").await,
+            Some(0.73)
+        );
+
+        // Out-of-range values are clamped.
+        let agent = StructuredMock {
+            response: Ok(serde_json::json!({ "relevance": 2.0 })),
+        };
+        assert_eq!(
+            score_chunk_relevance_via_agent(&agent, "i", "s").await,
+            Some(1.0)
+        );
+
+        // Provider without structured output -> None (caller leaves score unset).
+        let agent = StructuredMock {
+            response: Err("not supported".to_string()),
+        };
+        assert_eq!(
+            score_chunk_relevance_via_agent(&agent, "i", "s").await,
+            None
+        );
     }
 }

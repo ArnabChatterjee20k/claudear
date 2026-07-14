@@ -4975,6 +4975,7 @@ mod tests {
             learning: claudear_config::config::LearningConfig::default(),
             prioritisation: claudear_config::config::PrioritisationConfig::default(),
             code_index: claudear_config::config::CodeIndexConfig::default(),
+            retrieval_eval: Default::default(),
             evaluation: claudear_config::config::EvaluationConfig::default(),
             storage_dir: "/tmp/claudear-storage".into(),
             dashboard: claudear_config::config::DashboardConfig::default(),

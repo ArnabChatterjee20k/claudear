@@ -974,6 +974,23 @@ batch_size = 32
 reindex_interval_hours = 6.0
 
 # ============================================
+# Retrieval-Quality Assessment
+# ============================================
+# Every fix attempt pulls context from four retrieval sources (code chunks,
+# similar past issues, indexed Discord discussions, reusable Q&A). Claudear always
+# records which chunks were retrieved per attempt — their source, similarity score,
+# rank, whether they were injected into the prompt, and (for code chunks) whether
+# the fix touched that file — viewable in the Attempts page modal. This section
+# gates only the optional LLM relevance judge that attaches a quality_score to
+# each chunk (extra local-LLM inference cost; requires [llm] enabled).
+
+[retrieval_eval]
+# Enable the LLM relevance judge over retrieved chunks (default: false).
+# When false, quality_score stays empty and no extra inference runs; retrieval
+# recording and file-based "used" attribution still happen.
+enabled = false
+
+# ============================================
 # Self-Evaluation
 # ============================================
 # Runs before/after comparisons (tests, lint, static analysis, coverage)

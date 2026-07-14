@@ -413,6 +413,9 @@ pub struct Config {
     /// Code indexing configuration.
     #[serde(default)]
     pub code_index: CodeIndexConfig,
+    /// Retrieval-quality assessment configuration.
+    #[serde(default)]
+    pub retrieval_eval: RetrievalEvalConfig,
     /// Self-evaluation configuration.
     #[serde(default)]
     pub evaluation: EvaluationConfig,
@@ -626,6 +629,7 @@ impl Default for Config {
             learning: LearningConfig::default(),
             prioritisation: PrioritisationConfig::default(),
             code_index: CodeIndexConfig::default(),
+            retrieval_eval: RetrievalEvalConfig::default(),
             evaluation: EvaluationConfig::default(),
             storage_dir: default_storage_dir(),
             dashboard: DashboardConfig::default(),
@@ -985,6 +989,16 @@ impl Default for CodeIndexConfig {
             reindex_interval_hours: 6.0,
         }
     }
+}
+
+/// Retrieval-quality assessment configuration. Retrieved chunks are always
+/// recorded per attempt; this gates the optional LLM relevance judge that
+/// attaches a `quality_score` (extra LLM cost).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetrievalEvalConfig {
+    /// Enable the LLM relevance judge over retrieved chunks (opt-in).
+    pub enabled: bool,
 }
 
 /// Self-evaluation configuration.

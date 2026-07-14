@@ -16,7 +16,7 @@ use claudear_core::types::{
     ActivityLogEntry, AgentExecution, AnalyticsSummary, CrossRepoCorrelation, ErrorPattern,
     ExperimentProviderStats, FixAttempt, FixAttemptStats, FixAttemptStatus, FixOutcome,
     IssueEmbedding, IssueTimeline, Outcome, PrReviewRecord, ProcessingMetric, PromptExperiment,
-    QaKnowledgeEntry, QaMatch, SimilarIssue, SourceStats, TimelineEvent,
+    QaKnowledgeEntry, QaMatch, RetrievalUsageRecord, SimilarIssue, SourceStats, TimelineEvent,
 };
 use rand::RngExt;
 use rusqlite::OptionalExtension;
@@ -2839,6 +2839,30 @@ impl KnowledgeStore for SqliteTracker {
         SqliteTracker::record_qa_usage(self, attempt_id, qa_id, usage_type, similarity_score)
     }
 
+    fn record_retrieval_usage(&self, rows: &[RetrievalUsageRecord]) -> Result<()> {
+        SqliteTracker::record_retrieval_usage(self, rows)
+    }
+
+    fn set_retrieval_quality(
+        &self,
+        attempt_id: i64,
+        source_kind: &str,
+        chunk_ref: &str,
+        quality_score: f64,
+    ) -> Result<()> {
+        SqliteTracker::set_retrieval_quality(
+            self,
+            attempt_id,
+            source_kind,
+            chunk_ref,
+            quality_score,
+        )
+    }
+
+    fn get_retrieval_usage(&self, attempt_id: i64) -> Result<Vec<RetrievalUsageRecord>> {
+        SqliteTracker::get_retrieval_usage(self, attempt_id)
+    }
+
     fn update_qa_outcome_stats(&self, qa_id: i64, success: bool) -> Result<()> {
         SqliteTracker::update_qa_outcome_stats(self, qa_id, success)
     }
@@ -5289,6 +5313,95 @@ impl SqliteTracker {
             params![attempt_id, qa_id, usage_type, similarity_score],
         )?;
         Ok(conn.last_insert_rowid())
+    }
+
+    /// Record the chunks retrieved for an attempt across all RAG sources.
+    /// Upserts on `(attempt_id, source_kind, chunk_ref)`; preserves any
+    /// already-computed `used` / `quality_score` on conflict.
+    pub fn record_retrieval_usage(&self, rows: &[RetrievalUsageRecord]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.acquire_lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO retrieval_usage
+                    (attempt_id, source_kind, chunk_ref, file_path, rank,
+                     similarity_score, injected, char_len, created_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))
+                ON CONFLICT(attempt_id, source_kind, chunk_ref) DO UPDATE SET
+                    file_path = excluded.file_path,
+                    rank = excluded.rank,
+                    similarity_score = excluded.similarity_score,
+                    injected = excluded.injected,
+                    char_len = excluded.char_len
+                "#,
+            )?;
+            for r in rows {
+                stmt.execute(params![
+                    r.attempt_id,
+                    r.source_kind,
+                    r.chunk_ref,
+                    r.file_path,
+                    r.rank,
+                    r.similarity_score,
+                    r.injected as i64,
+                    r.char_len,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Attach a relevance quality score to a specific retrieved chunk.
+    pub fn set_retrieval_quality(
+        &self,
+        attempt_id: i64,
+        source_kind: &str,
+        chunk_ref: &str,
+        quality_score: f64,
+    ) -> Result<()> {
+        let conn = self.acquire_lock()?;
+        conn.execute(
+            "UPDATE retrieval_usage SET quality_score = ?4 \
+             WHERE attempt_id = ?1 AND source_kind = ?2 AND chunk_ref = ?3",
+            params![attempt_id, source_kind, chunk_ref, quality_score],
+        )?;
+        Ok(())
+    }
+
+    /// Read all retrieval-usage rows for an attempt, ordered by source then rank.
+    pub fn get_retrieval_usage(&self, attempt_id: i64) -> Result<Vec<RetrievalUsageRecord>> {
+        let conn = self.acquire_lock()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, attempt_id, source_kind, chunk_ref, file_path, rank,
+                   similarity_score, injected, char_len, quality_score
+            FROM retrieval_usage
+            WHERE attempt_id = ?1
+            ORDER BY source_kind, rank
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![attempt_id], |row| {
+                Ok(RetrievalUsageRecord {
+                    id: Some(row.get(0)?),
+                    attempt_id: row.get(1)?,
+                    source_kind: row.get(2)?,
+                    chunk_ref: row.get(3)?,
+                    file_path: row.get(4)?,
+                    rank: row.get(5)?,
+                    similarity_score: row.get(6)?,
+                    injected: row.get::<_, i64>(7)? != 0,
+                    char_len: row.get(8)?,
+                    quality_score: row.get(9)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Update success/failure counters for a Q&A entry.
@@ -12262,6 +12375,71 @@ mod tests {
             .unwrap();
         assert_eq!(sc, 2);
         assert_eq!(fc, 1);
+    }
+
+    #[test]
+    fn test_retrieval_usage_lifecycle() {
+        let tracker = SqliteTracker::in_memory().unwrap();
+        tracker
+            .record_attempt("linear", "issue-r", "LIN-R")
+            .unwrap();
+        let attempt = tracker.get_attempt("linear", "issue-r").unwrap().unwrap();
+
+        let rows = vec![
+            RetrievalUsageRecord::new(
+                attempt.id,
+                "code_chunk",
+                "101",
+                Some("src/foo.rs".to_string()),
+                0,
+                0.91,
+                Some(420),
+            ),
+            RetrievalUsageRecord::new(
+                attempt.id,
+                "code_chunk",
+                "102",
+                Some("src/bar.rs".to_string()),
+                1,
+                0.72,
+                Some(88),
+            ),
+            RetrievalUsageRecord::new(attempt.id, "qa", "7", None, 0, 0.8, None),
+        ];
+        tracker.record_retrieval_usage(&rows).unwrap();
+
+        // Read back: ordered by source_kind then rank.
+        let fetched = tracker.get_retrieval_usage(attempt.id).unwrap();
+        assert_eq!(fetched.len(), 3);
+        assert_eq!(fetched[0].source_kind, "code_chunk");
+        assert_eq!(fetched[0].rank, 0);
+        assert!(fetched[0].injected);
+        assert!(fetched[0].quality_score.is_none());
+
+        // Attach a quality score to a specific chunk.
+        tracker
+            .set_retrieval_quality(attempt.id, "code_chunk", "102", 0.65)
+            .unwrap();
+
+        let fetched = tracker.get_retrieval_usage(attempt.id).unwrap();
+        let bar = fetched.iter().find(|r| r.chunk_ref == "102").unwrap();
+        assert_eq!(bar.quality_score, Some(0.65));
+
+        // Upsert preserves the row identity (no duplicate) and refreshes score.
+        let again = vec![RetrievalUsageRecord::new(
+            attempt.id,
+            "code_chunk",
+            "101",
+            Some("src/foo.rs".to_string()),
+            0,
+            0.99,
+            Some(420),
+        )];
+        tracker.record_retrieval_usage(&again).unwrap();
+        let fetched = tracker.get_retrieval_usage(attempt.id).unwrap();
+        assert_eq!(fetched.len(), 3, "upsert must not duplicate rows");
+        let foo = fetched.iter().find(|r| r.chunk_ref == "101").unwrap();
+        assert!((foo.similarity_score - 0.99).abs() < 1e-9);
     }
 
     #[test]
