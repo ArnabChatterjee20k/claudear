@@ -257,7 +257,12 @@ impl IssueProcessor {
                 "Routing to read-only Q&A answer path"
             );
             return self
-                .answer_question_issue(&input.issue, &input.resolution, &input.source_name)
+                .answer_question_issue(
+                    &input.issue,
+                    &input.resolution,
+                    &input.source_name,
+                    input.attempt_id,
+                )
                 .await;
         }
         tracing::info!(
@@ -1657,6 +1662,7 @@ impl IssueProcessor {
         issue: &Issue,
         resolution: &RepoResolution,
         source_name: &str,
+        attempt_id: Option<i64>,
     ) -> ProcessingOutcome {
         // Timeline: QA run started.
         self.record_timeline_event(
@@ -1679,6 +1685,7 @@ impl IssueProcessor {
 
         // Retrieve grounding context from the code index across ALL repos, plus
         // any indexed Discord discussions.
+        let mut retrieved_items: Vec<RetrievedItem> = Vec::new();
         let mut context = if let Some(ref code_search) = self.code_search_service {
             let query = claudear_analysis::repo::code_index::build_code_search_query(issue);
             match code_search
@@ -1686,6 +1693,31 @@ impl IssueProcessor {
                 .await
             {
                 Ok(results) if !results.is_empty() => {
+                    if let Some(id) = attempt_id {
+                        let mut rows: Vec<RetrievalUsageRecord> = Vec::with_capacity(results.len());
+                        for (rank, r) in results.iter().enumerate() {
+                            let chunk_ref = r
+                                .chunk
+                                .id
+                                .map(|i| i.to_string())
+                                .unwrap_or_else(|| r.chunk.file_path.clone());
+                            retrieved_items.push(RetrievedItem {
+                                source_kind: "code_chunk".to_string(),
+                                chunk_ref: chunk_ref.clone(),
+                                text: r.chunk.chunk_text.clone(),
+                            });
+                            rows.push(RetrievalUsageRecord::new(
+                                id,
+                                "code_chunk",
+                                chunk_ref,
+                                Some(r.chunk.file_path.clone()),
+                                rank as i64,
+                                r.score,
+                                Some(r.chunk.chunk_text.chars().count() as i64),
+                            ));
+                        }
+                        self.tracker.record_retrieval_usage(&rows).ok();
+                    }
                     claudear_analysis::repo::code_index::format_code_search_context(&results)
                 }
                 _ => String::new(),
@@ -1693,8 +1725,8 @@ impl IssueProcessor {
         } else {
             String::new()
         };
-        let (discord_ctx, _) = self
-            .discord_grounding_context(issue, self.config.qa.max_context_chunks, None)
+        let (discord_ctx, discord_items) = self
+            .discord_grounding_context(issue, self.config.qa.max_context_chunks, attempt_id)
             .await;
         if !discord_ctx.is_empty() {
             context = if context.is_empty() {
@@ -1702,6 +1734,15 @@ impl IssueProcessor {
             } else {
                 format!("{}\n{}", context, discord_ctx)
             };
+            if attempt_id.is_some() {
+                retrieved_items.extend(discord_items);
+            }
+        }
+
+        // Score retrieval quality for this QA run (opt-in, detached — never blocks
+        // the answer). Mirrors the fix pipeline.
+        if let Some(id) = attempt_id {
+            self.spawn_retrieval_judge(id, issue, &retrieved_items);
         }
 
         self.record_issue_decision(
