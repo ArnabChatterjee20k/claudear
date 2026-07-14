@@ -3,8 +3,11 @@
 //! Uses the configured agent (claude/codex) for classification instead of the
 //! local LLM. Much faster but costs API credits. Provides [`AgentRepoClassifier`]
 //! (which repo an issue belongs to) and [`AgentIntentClassifier`] (bug/security
-//! vs question/fix routing). The intent classifier uses schema-constrained
-//! structured output (`--json-schema`) so the reply is a guaranteed enum value.
+//! vs question/fix routing). Both use schema-constrained structured output
+//! (`--json-schema`) so the reply is a guaranteed enum value — for the repo
+//! classifier the enum is built dynamically from the candidate repo names.
+//! Providers without structured-output support fall back to a freeform
+//! completion parsed leniently.
 
 use crate::intent::CATEGORY_RULES;
 use crate::intent::{intent_body, intent_title, parse_intent, Intent, IntentClassifier};
@@ -31,13 +34,45 @@ impl RepoClassifier for AgentRepoClassifier {
     fn classify(&self, request: &ClassificationRequest) -> Option<(String, f32)> {
         let prompt = build_prompt(request);
         let temp_dir = std::env::temp_dir();
+        let candidate_names: Vec<&str> =
+            request.candidates.iter().map(|(n, _)| n.as_str()).collect();
 
         let start = Instant::now();
 
-        // Bridge async agent call into sync context.
-        // Use block_in_place to avoid "cannot start a runtime from within a runtime" panic
-        // when the classifier is called from an async context (e.g., the watcher loop).
-        let result = tokio::task::block_in_place(|| {
+        // Preferred path: schema-constrained structured output. The reply is
+        // guaranteed to be one of the candidate repo names (or "NONE"), so no
+        // brittle text parsing is needed and we avoid spinning up a full
+        // fix-agent session. `block_in_place` bridges the async call into this
+        // sync trait method (avoids "runtime within a runtime" on the watcher).
+        let schema = build_repo_schema(&candidate_names);
+        let structured = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                self.agent
+                    .structured_query(&prompt, &schema, &temp_dir)
+                    .await
+            })
+        });
+
+        match structured {
+            Ok(value) => {
+                tracing::debug!(
+                    response = %value,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Agent classifier structured response"
+                );
+                return parse_structured_response(&value, &candidate_names);
+            }
+            Err(e) => {
+                // Providers without `--json-schema` support fall back to a
+                // freeform completion parsed leniently below.
+                tracing::debug!(
+                    error = %e,
+                    "structured_query unavailable, falling back to freeform classification"
+                );
+            }
+        }
+
+        let freeform = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 self.agent
                     .execute_with_attempt(&prompt, None, None, &temp_dir)
@@ -45,19 +80,14 @@ impl RepoClassifier for AgentRepoClassifier {
             })
         });
 
-        let elapsed = start.elapsed();
-
-        match result {
+        match freeform {
             Ok(agent_result) => {
                 let response = agent_result.output.trim().to_string();
                 tracing::debug!(
                     response = %response,
-                    elapsed_ms = elapsed.as_millis(),
-                    "Agent classifier response"
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Agent classifier freeform response"
                 );
-
-                let candidate_names: Vec<&str> =
-                    request.candidates.iter().map(|(n, _)| n.as_str()).collect();
                 parse_response(&response, &candidate_names)
             }
             Err(e) => {
@@ -66,6 +96,47 @@ impl RepoClassifier for AgentRepoClassifier {
             }
         }
     }
+}
+
+/// Build a JSON schema constraining the reply to exactly one of the candidate
+/// repo names, or `"NONE"`. Built via `serde_json` so repo names are escaped
+/// correctly.
+fn build_repo_schema(candidates: &[&str]) -> String {
+    let mut enum_values: Vec<String> = candidates.iter().map(|s| s.to_string()).collect();
+    enum_values.push("NONE".to_string());
+    serde_json::json!({
+        "type": "object",
+        "required": ["repo"],
+        "additionalProperties": false,
+        "properties": {
+            "repo": {
+                "type": "string",
+                "enum": enum_values,
+                "description": "The exact repository this issue belongs to, or \"NONE\" if no candidate matches."
+            }
+        }
+    })
+    .to_string()
+}
+
+/// Extract the chosen repo from a schema-constrained structured response.
+///
+/// Returns `None` only for a missing/empty field or an explicit `"NONE"` — the
+/// cases where the model deliberately declined. For any other value we reuse the
+/// freeform matcher [`parse_response`], which recovers a present-but-imperfect
+/// value in place (exact → 1.0, case-insensitive → 0.9, contains → 0.7) without
+/// needing a second, expensive agent round-trip. This means a provider that
+/// doesn't perfectly honour the enum (e.g. a backtick-wrapped or verbose `repo`
+/// field) still gets classified rather than silently dropped.
+fn parse_structured_response(
+    value: &serde_json::Value,
+    candidates: &[&str],
+) -> Option<(String, f32)> {
+    let repo = value.get("repo").and_then(|v| v.as_str())?.trim();
+    if repo.is_empty() || repo.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    parse_response(repo, candidates)
 }
 
 /// Build the classification prompt (plain text, no model-specific tokens).
@@ -417,6 +488,72 @@ mod tests {
         let request = sample_request();
         let result = classifier.classify(&request);
         assert_eq!(result, Some(("appwrite/cloud".to_string(), 1.0)));
+    }
+
+    #[test]
+    fn test_build_repo_schema_lists_candidates_and_none() {
+        let schema = build_repo_schema(&["appwrite/cloud", "utopia-php/database"]);
+        let parsed: serde_json::Value = serde_json::from_str(&schema).expect("valid JSON");
+        let enum_vals = parsed["properties"]["repo"]["enum"]
+            .as_array()
+            .expect("enum array");
+        let names: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"appwrite/cloud"));
+        assert!(names.contains(&"utopia-php/database"));
+        assert!(names.contains(&"NONE"));
+    }
+
+    #[test]
+    fn test_parse_structured_response_matches_and_rejects() {
+        let candidates = vec!["appwrite/cloud", "utopia-php/database"];
+        // Exact enum value → canonical name, full confidence.
+        let v = serde_json::json!({ "repo": "utopia-php/database" });
+        assert_eq!(
+            parse_structured_response(&v, &candidates),
+            Some(("utopia-php/database".to_string(), 1.0))
+        );
+        // Case-insensitive maps back to the canonical candidate at reduced
+        // confidence (the value didn't match the enum verbatim).
+        let v = serde_json::json!({ "repo": "Appwrite/Cloud" });
+        assert_eq!(
+            parse_structured_response(&v, &candidates),
+            Some(("appwrite/cloud".to_string(), 0.9))
+        );
+        // Present-but-imperfect value (enum not honoured verbatim) is recovered
+        // in place via the contains-match tier rather than dropped.
+        let v = serde_json::json!({ "repo": "`utopia-php/database`" });
+        assert_eq!(
+            parse_structured_response(&v, &candidates),
+            Some(("utopia-php/database".to_string(), 0.7))
+        );
+        // Explicit NONE and missing field → no match.
+        assert_eq!(
+            parse_structured_response(&serde_json::json!({ "repo": "NONE" }), &candidates),
+            None
+        );
+        assert_eq!(
+            parse_structured_response(&serde_json::json!({}), &candidates),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_agent_classifier_uses_structured_output() {
+        let mock = StructuredMock {
+            response: Ok(serde_json::json!({ "repo": "utopia-php/database" })),
+        };
+        let classifier = AgentRepoClassifier::new(Arc::new(mock));
+        let result = classifier.classify(&sample_request());
+        assert_eq!(result, Some(("utopia-php/database".to_string(), 1.0)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_agent_classifier_structured_none_returns_none() {
+        let mock = StructuredMock {
+            response: Ok(serde_json::json!({ "repo": "NONE" })),
+        };
+        let classifier = AgentRepoClassifier::new(Arc::new(mock));
+        assert!(classifier.classify(&sample_request()).is_none());
     }
 
     // --- Intent classifier ---
