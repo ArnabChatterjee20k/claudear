@@ -194,9 +194,15 @@ pub struct WatcherOptions {
     pub scm_provider: Option<Arc<dyn ScmProvider>>,
     pub user_registry: UserRegistry,
     pub agent: Arc<dyn AgentRunner>,
-    /// Optional separate agent runner for repo classification (uses a cheaper/faster model).
+    /// Optional separate agent runner for classification (intent + repo default).
     /// Falls back to `agent` if not set.
     pub classification_agent: Option<Arc<dyn AgentRunner>>,
+    /// Optional runner for repository classification specifically (uses `repo_model`).
+    /// Falls back to `classification_agent`, then `agent`, when not set.
+    pub repo_classification_agent: Option<Arc<dyn AgentRunner>>,
+    /// Optional runner for answering questions (uses `qa_model`).
+    /// Falls back to `agent` when not set.
+    pub qa_agent: Option<Arc<dyn AgentRunner>>,
     pub dry_run: bool,
     /// Optional pre-loaded LLM engine for repo classification.
     pub llm_engine: Option<Arc<claudear_integrations::chat::llm::LlmEngine>>,
@@ -220,6 +226,9 @@ pub struct Watcher {
     scm_provider: Option<Arc<dyn ScmProvider>>,
     user_registry: UserRegistry,
     agent: Arc<dyn AgentRunner>,
+    /// Optional runner for answering questions (uses `qa_model`).
+    /// Falls back to `agent` when not set.
+    qa_agent: Option<Arc<dyn AgentRunner>>,
     dry_run: bool,
     is_running: AtomicBool,
     processing: RwLock<ProcessingState>,
@@ -251,9 +260,12 @@ impl Watcher {
         let mut inferrer = options.inferrer;
         if options.config.llm.use_agent {
             if let Some(ref mut inf) = inferrer {
+                // Repo classification prefers its own model (`repo_model`), then
+                // the shared classification runner, then the main agent.
                 let classifier_runner = options
-                    .classification_agent
+                    .repo_classification_agent
                     .clone()
+                    .or_else(|| options.classification_agent.clone())
                     .unwrap_or_else(|| options.agent.clone());
                 let agent_classifier =
                     crate::agent_classifier::AgentRepoClassifier::new(classifier_runner);
@@ -294,6 +306,7 @@ impl Watcher {
 
         Self {
             agent: options.agent,
+            qa_agent: options.qa_agent,
             config: options.config,
             sources: options.sources,
             notifier: options.notifier,
@@ -3832,6 +3845,7 @@ Create a PR with your changes.{custom_instructions}"#,
             tracker: Arc::clone(&self.tracker),
             notifier: Arc::clone(&self.notifier),
             agent: Arc::clone(&self.agent),
+            qa_agent: self.qa_agent.clone(),
             inferrer: self.inferrer.clone(),
             embedding_client: self.embedding_client.clone(),
             issue_embedding_service: self.issue_embedding_service.clone(),
@@ -4529,6 +4543,7 @@ Create a PR with your changes.{custom_instructions}"#,
             tracker: Arc::clone(&self.tracker),
             notifier: Arc::clone(&self.notifier),
             agent: Arc::clone(&self.agent),
+            qa_agent: self.qa_agent.clone(),
             inferrer: self.inferrer.clone(),
             embedding_client: self.embedding_client.clone(),
             issue_embedding_service: self.issue_embedding_service.clone(),
@@ -5002,6 +5017,8 @@ mod tests {
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
             agent,
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run,
             llm_engine: None,
         }))
@@ -5309,6 +5326,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         };
@@ -5895,6 +5914,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -5952,6 +5973,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -6028,6 +6051,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -6096,6 +6121,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -6516,6 +6543,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -6605,6 +6634,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -6654,6 +6685,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7277,6 +7310,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7644,6 +7679,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7757,6 +7794,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7824,6 +7863,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7886,6 +7927,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -7953,6 +7996,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8134,6 +8179,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -8269,6 +8316,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8364,6 +8413,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -8450,6 +8501,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8567,6 +8620,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -8613,6 +8668,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8826,6 +8883,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8867,6 +8926,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8922,6 +8983,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -8964,6 +9027,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9005,6 +9070,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9045,6 +9112,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9084,6 +9153,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9144,6 +9215,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9205,6 +9278,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9266,6 +9341,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9327,6 +9404,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9382,6 +9461,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9438,6 +9519,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9569,6 +9652,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -9800,6 +9885,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -9852,6 +9939,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -9923,6 +10012,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10041,6 +10132,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10221,6 +10314,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
         }));
@@ -10300,6 +10395,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10365,6 +10462,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10477,6 +10576,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10512,6 +10613,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10689,6 +10792,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10737,6 +10842,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -10801,6 +10908,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }))
@@ -11164,6 +11273,8 @@ mod tests {
                 sqlite.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11291,6 +11402,8 @@ mod tests {
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
             agent: mock_agent,
@@ -11373,6 +11486,8 @@ mod tests {
             scm_provider: None,
             user_registry: UserRegistry::new(std::collections::HashMap::new()),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: true,
             llm_engine: None,
             agent,
@@ -11662,6 +11777,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11698,6 +11815,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11734,6 +11853,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11770,6 +11891,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -11807,6 +11930,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -12200,6 +12325,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -12244,6 +12371,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -12306,6 +12435,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -12344,6 +12475,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -12542,6 +12675,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         }));
@@ -13111,6 +13246,8 @@ mod tests {
                 tracker.clone(),
             )),
             classification_agent: None,
+            repo_classification_agent: None,
+            qa_agent: None,
             dry_run: false,
             llm_engine: None,
         })

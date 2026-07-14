@@ -164,6 +164,9 @@ pub struct IssueProcessor {
     pub tracker: Arc<dyn FixAttemptTracker>,
     pub notifier: Arc<dyn Notifier>,
     pub agent: Arc<dyn AgentRunner>,
+    /// Optional runner for answering questions (uses `qa_model`).
+    /// Falls back to `agent` when `None`.
+    pub qa_agent: Option<Arc<dyn AgentRunner>>,
     pub inferrer: Option<claudear_analysis::inference::RepoInferrer>,
     pub embedding_client: Option<Arc<EmbeddingClient>>,
     pub issue_embedding_service: Option<Arc<IssueEmbeddingService>>,
@@ -1618,9 +1621,11 @@ impl IssueProcessor {
         );
 
         let timeout = std::time::Duration::from_secs(self.config.qa.answer_timeout_secs.max(1));
+        // Answer with the QA-specific runner when configured, else the main agent.
+        let qa_agent = self.qa_agent.as_ref().unwrap_or(&self.agent);
         let answer_result = tokio::time::timeout(
             timeout,
-            self.agent.answer_question(issue, &context, &project_dir),
+            qa_agent.answer_question(issue, &context, &project_dir),
         )
         .await;
 
@@ -3568,6 +3573,7 @@ mod tests {
             tracker,
             notifier,
             agent,
+            qa_agent: None,
             inferrer: None,
             embedding_client: None,
             issue_embedding_service: None,
