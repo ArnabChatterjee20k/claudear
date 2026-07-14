@@ -839,6 +839,20 @@ impl IssueProcessor {
                                     ));
                                 }
                                 self.tracker.record_retrieval_usage(&rows).ok();
+                                tracing::info!(
+                                    attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
+                                    source =
+                                        rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
+                                    count = rows.len(),
+                                    "Recorded retrieval_usage chunks"
+                                );
+                                tracing::info!(
+                                    attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
+                                    source =
+                                        rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
+                                    count = rows.len(),
+                                    "Recorded retrieval_usage chunks"
+                                );
                             }
                             format_similar_issues_context(&similar)
                         }
@@ -892,6 +906,13 @@ impl IssueProcessor {
                                 ));
                             }
                             self.tracker.record_retrieval_usage(&rows).ok();
+                            tracing::info!(
+                                attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
+                                source =
+                                    rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
+                                count = rows.len(),
+                                "Recorded retrieval_usage chunks"
+                            );
                         }
                         context = format!(
                             "{}\n{}",
@@ -980,6 +1001,12 @@ impl IssueProcessor {
                             ));
                         }
                         self.tracker.record_retrieval_usage(&rows).ok();
+                        tracing::info!(
+                            attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
+                            source = rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
+                            count = rows.len(),
+                            "Recorded retrieval_usage chunks"
+                        );
                     }
                     used_qa_ids.extend(matches.into_iter().map(|m| m.entry.id));
                 }
@@ -1717,6 +1744,12 @@ impl IssueProcessor {
                             ));
                         }
                         self.tracker.record_retrieval_usage(&rows).ok();
+                        tracing::info!(
+                            attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
+                            source = rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
+                            count = rows.len(),
+                            "Recorded retrieval_usage chunks"
+                        );
                     }
                     claudear_analysis::repo::code_index::format_code_search_context(&results)
                 }
