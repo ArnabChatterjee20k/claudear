@@ -839,20 +839,7 @@ impl IssueProcessor {
                                     ));
                                 }
                                 self.tracker.record_retrieval_usage(&rows).ok();
-                                tracing::info!(
-                                    attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
-                                    source =
-                                        rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
-                                    count = rows.len(),
-                                    "Recorded retrieval_usage chunks"
-                                );
-                                tracing::info!(
-                                    attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
-                                    source =
-                                        rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
-                                    count = rows.len(),
-                                    "Recorded retrieval_usage chunks"
-                                );
+                                self.log_retrieval_recorded(&rows);
                             }
                             format_similar_issues_context(&similar)
                         }
@@ -906,13 +893,7 @@ impl IssueProcessor {
                                 ));
                             }
                             self.tracker.record_retrieval_usage(&rows).ok();
-                            tracing::info!(
-                                attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
-                                source =
-                                    rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
-                                count = rows.len(),
-                                "Recorded retrieval_usage chunks"
-                            );
+                            self.log_retrieval_recorded(&rows);
                         }
                         context = format!(
                             "{}\n{}",
@@ -1001,12 +982,7 @@ impl IssueProcessor {
                             ));
                         }
                         self.tracker.record_retrieval_usage(&rows).ok();
-                        tracing::info!(
-                            attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
-                            source = rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
-                            count = rows.len(),
-                            "Recorded retrieval_usage chunks"
-                        );
+                        self.log_retrieval_recorded(&rows);
                     }
                     used_qa_ids.extend(matches.into_iter().map(|m| m.entry.id));
                 }
@@ -1744,12 +1720,7 @@ impl IssueProcessor {
                             ));
                         }
                         self.tracker.record_retrieval_usage(&rows).ok();
-                        tracing::info!(
-                            attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
-                            source = rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
-                            count = rows.len(),
-                            "Recorded retrieval_usage chunks"
-                        );
+                        self.log_retrieval_recorded(&rows);
                     }
                     claudear_analysis::repo::code_index::format_code_search_context(&results)
                 }
@@ -2292,6 +2263,20 @@ impl IssueProcessor {
         context
     }
 
+    /// Debug-gated confirmation that retrieval rows were persisted. Only emitted
+    /// when `debug_logging` is set, so normal runs stay quiet.
+    fn log_retrieval_recorded(&self, rows: &[RetrievalUsageRecord]) {
+        if !self.config.debug_logging || rows.is_empty() {
+            return;
+        }
+        tracing::info!(
+            attempt_id = rows.first().map(|r| r.attempt_id).unwrap_or(-1),
+            source = rows.first().map(|r| r.source_kind.as_str()).unwrap_or("?"),
+            count = rows.len(),
+            "Recorded retrieval_usage chunks"
+        );
+    }
+
     /// Opt-in retrieval-quality judge: when `retrieval_eval.enabled`
     fn spawn_retrieval_judge(
         &self,
@@ -2477,6 +2462,7 @@ impl IssueProcessor {
                 }
                 if !rows.is_empty() {
                     self.tracker.record_retrieval_usage(&rows).ok();
+                    self.log_retrieval_recorded(&rows);
                 }
                 let context =
                     claudear_analysis::knowledgebase::format_discord_search_context(&results);
